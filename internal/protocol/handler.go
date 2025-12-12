@@ -16,6 +16,11 @@ const (
 	ApiKeyApiVersions = 18
 )
 
+const (
+	ErrNone               = 0
+	ErrUnsupportedVersion = 35
+)
+
 func HandleRequest(data []byte, store *storage.StorageEngine) ([]byte, error) {
 	dec := NewDecoder(data)
 
@@ -71,15 +76,34 @@ func HandleRequest(data []byte, store *storage.StorageEngine) ([]byte, error) {
 }
 
 func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
+	if version > 0 {
+		// We only support V0.
+		// If client asks for V1+, we return UnsupportedVersion.
+		// Problem: Client expects response format of V(requested).
+		// Sending V0 format might crash client.
+		// But for ApiVersions, if we return error, client should handle it.
+		// Let's try returning Error and empty/safe body.
+
+		enc.Int16(ErrUnsupportedVersion)
+		// If V3, it expects Throttle(32) + CompactArray.
+		// If we write 0 (Throttle) + 0 (ArrayLen), it might parse.
+		// But we don't know EXACTLY what version was requested easily without mapping every version.
+		// Let's just try sending V0 format with Error.
+
+		// V0: Error(16) + Array(32)
+		enc.Int32(0) // Empty array
+		return enc.Bytes(), nil
+	}
+
 	// ApiVersions Response V0:
 	// ErrorCode (int16)
 	// ApiKeys (Array)
 
-	enc.Int16(0) // No Error
+	enc.Int16(ErrNone) // No Error
 
-	// Array length: 3 (Produce, Fetch, Metadata, ApiVersions... wait, let's list them)
-	// Listing: Produce(0), Fetch(1), ListOffsets(2), Metadata(3), ApiVersions(18)
-	// We'll support V0 for all for now.
+	// Array length: 5
+	// Listing: Produce, Fetch, ListOffsets, Metadata, ApiVersions
+	// Supported: Produce(0-2), Fetch(0-2), ListOffsets(0-1), Metadata(0-2), ApiVersions(0)
 
 	numKeys := 5
 	enc.Int32(int32(numKeys)) // Array length is int32 usually?
@@ -136,14 +160,14 @@ func handleMetadata(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
 		enc.String("") // Rack (empty instead of null)
 	}
 
-	// ControllerID (int32) - Added in V1
-	if version >= 1 {
-		enc.Int32(1) // Controller is Node 1
-	}
-
 	// ClusterID (string) - Added in V2
 	if version >= 2 {
 		enc.String("warpstream-cluster")
+	}
+
+	// ControllerID (int32) - Added in V1
+	if version >= 1 {
+		enc.Int32(1) // Controller is Node 1
 	}
 
 	// 2. Topic Metadata
