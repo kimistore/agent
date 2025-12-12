@@ -110,16 +110,13 @@ We will target the **15 Core APIs** necessary for a functional streaming platfor
     -   Uploads strictly ordered segments to S3 key path: `s3://<bucket>/<topic>/<partition>/<start_offset>.log`.
 *   **Deliverable**: Internal Go API to `Append(topic, partition, batch)` and `Read(topic, partition, offset)`.
 
-### Phase 3: Producer & Consumer (Weeks 5-6)
-*   **Goal**: Connect Protocol layer to Storage Engine.
-*   **Produce Handling**:
-    -   Parse `ProduceRequest`.
-    -   Extract RecordBatches.
-    -   Call `Storage.Append()`.
-    -   Return offsets.
-*   **Fetch Handling**:
-    -   Parse `FetchRequest`.
-    -   Call `Storage.Read()`.
+### Phase 3: Producer & Consumer (Protocol Layer) (Week 5) - [DONE]
+*   **Goal**: Connect the Network Layer (Phase 1) with the Storage Engine (Phase 2).
+*   **Handler Implementation**:
+    -   Update `HandleRequest` to parse `Produce` and `Fetch` requests.
+    -   **Produce**: Parse batches -> `storage.Append()`.
+    -   **Fetch**: Parse offset -> `storage.Read()`.
+*   **Deliverable**: A working "echo" system where you can Produce to it and Fetch from it using a standard Kafka client (`kcat` or `kafka-console-producer`).
     -   Handle "Not Found" or "Offset Out of Range".
 *   **Deliverable**: Can produce messages via `kcat` and consume them back.
 

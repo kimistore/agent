@@ -53,12 +53,42 @@ func (d *Decoder) remaining() int {
 	return len(d.data) - d.off
 }
 
+func (d *Decoder) Int64() (int64, error) {
+	if d.remaining() < 8 {
+		return 0, errors.New("insufficient data for int64")
+	}
+	val := int64(binary.BigEndian.Uint64(d.data[d.off:]))
+	d.off += 8
+	return val, nil
+}
+
+func (d *Decoder) Bytes() ([]byte, error) {
+	lenVal, err := d.Int32()
+	if err != nil {
+		return nil, err
+	}
+	if lenVal == -1 {
+		return nil, nil // Null bytes
+	}
+	length := int(lenVal)
+	if d.remaining() < length {
+		return nil, errors.New("insufficient data for bytes")
+	}
+	b := d.data[d.off : d.off+length]
+	d.off += length
+	return b, nil
+}
+
 type Encoder struct {
 	data []byte
 }
 
 func NewEncoder() *Encoder {
 	return &Encoder{data: make([]byte, 0, 1024)}
+}
+
+func (e *Encoder) Int8(val int8) {
+	e.data = append(e.data, byte(val))
 }
 
 func (e *Encoder) Int16(val int16) {
@@ -73,9 +103,24 @@ func (e *Encoder) Int32(val int32) {
 	e.data = append(e.data, buf...)
 }
 
+func (e *Encoder) Int64(val int64) {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, uint64(val))
+	e.data = append(e.data, buf...)
+}
+
 func (e *Encoder) String(val string) {
 	e.Int16(int16(len(val)))
 	e.data = append(e.data, []byte(val)...)
+}
+
+func (e *Encoder) PutBytes(val []byte) {
+	if val == nil {
+		e.Int32(-1)
+		return
+	}
+	e.Int32(int32(len(val)))
+	e.data = append(e.data, val...)
 }
 
 func (e *Encoder) Bytes() []byte {

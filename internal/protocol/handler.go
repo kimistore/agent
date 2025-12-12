@@ -3,16 +3,20 @@ package protocol
 import (
 	"fmt"
 	"log"
+
+	"go-stream/internal/storage"
 )
 
+// ... constants ...
 const (
 	ApiKeyProduce     = 0
 	ApiKeyFetch       = 1
+	ApiKeyListOffsets = 2
 	ApiKeyMetadata    = 3
 	ApiKeyApiVersions = 18
 )
 
-func HandleRequest(data []byte) ([]byte, error) {
+func HandleRequest(data []byte, store *storage.StorageEngine) ([]byte, error) {
 	dec := NewDecoder(data)
 
 	// Parse Header
@@ -45,10 +49,16 @@ func HandleRequest(data []byte) ([]byte, error) {
 	enc.Int32(correlationID)
 
 	switch apiKey {
+	case ApiKeyProduce:
+		return handleProduce(dec, enc, store, apiVersion)
+	case ApiKeyFetch:
+		return handleFetch(dec, enc, store, apiVersion)
+	case ApiKeyListOffsets:
+		return handleListOffsets(dec, enc, store, apiVersion)
 	case ApiKeyApiVersions:
 		return handleApiVersions(enc, apiVersion)
 	case ApiKeyMetadata:
-		return handleMetadata(enc, apiVersion)
+		return handleMetadata(dec, enc, apiVersion)
 	default:
 		// Unsupported API?
 		// We should return some error code, but since formatting depends on API...
@@ -68,10 +78,10 @@ func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
 	enc.Int16(0) // No Error
 
 	// Array length: 3 (Produce, Fetch, Metadata, ApiVersions... wait, let's list them)
-	// Listing: Produce(0), Fetch(1), Metadata(3), ApiVersions(18)
+	// Listing: Produce(0), Fetch(1), ListOffsets(2), Metadata(3), ApiVersions(18)
 	// We'll support V0 for all for now.
 
-	numKeys := 4
+	numKeys := 5
 	enc.Int32(int32(numKeys)) // Array length is int32 usually?
 	// careful: Array length in V0 is int32.
 
@@ -82,30 +92,39 @@ func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
 		enc.Int16(maxV)
 	}
 
-	writeEntry(ApiKeyProduce, 0, 0)
-	writeEntry(ApiKeyFetch, 0, 0)
-	writeEntry(ApiKeyMetadata, 0, 1)
+	writeEntry(ApiKeyProduce, 0, 2)
+	writeEntry(ApiKeyFetch, 0, 2)
+	writeEntry(ApiKeyListOffsets, 0, 1)
+	writeEntry(ApiKeyMetadata, 0, 2)
 	writeEntry(ApiKeyApiVersions, 0, 0)
-
-	// ThrottleTimeMs (int32)? Only in V1+. If request was V0, we end here.
-	// But newer clients usually send V3.
-	// We should probably check the request version.
-	// If version >= 1, add ThrottleTimeMs
-	if version >= 1 {
-		enc.Int32(0) // ThrottleTimeMs
-	}
-	// Note: V3 uses compact arrays. This is naive V0-V2 support.
 
 	return enc.Bytes(), nil
 }
 
-func handleMetadata(enc *Encoder, version int16) ([]byte, error) {
-	// Metadata Response V0:
-	// Brokers Array
-	// Topic Metadata Array
+func handleMetadata(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
+	// Metadata Request V0+:
+	// Topics Array (String)
+
+	// We should decode the request body first.
+	// But wait, the `HandleRequest` called `handleMetadata` which takes `enc`.
+	// We need `dec` too!
+	// Existing signature was: func handleMetadata(enc *Encoder, version int16)
+	// I need to change it to accept `dec`.
+
+	count, err := dec.Int32()
+	requestedTopic := ""
+	if err == nil && count > 0 {
+		// Just read the first one for MVP
+		t, _ := dec.String()
+		requestedTopic = t
+	}
+	log.Println("Handling Metadata Request...")
+
+	if requestedTopic == "" {
+		requestedTopic = "my-topic" // Default for testing
+	}
 
 	// 1. Brokers
-	// Length (int32)
 	enc.Int32(1)
 
 	// Broker 0
@@ -114,7 +133,7 @@ func handleMetadata(enc *Encoder, version int16) ([]byte, error) {
 	enc.Int32(19092)        // Port
 
 	if version >= 1 {
-		enc.Int16(-1) // Rack (null)
+		enc.String("") // Rack (empty instead of null)
 	}
 
 	// ControllerID (int32) - Added in V1
@@ -122,9 +141,36 @@ func handleMetadata(enc *Encoder, version int16) ([]byte, error) {
 		enc.Int32(1) // Controller is Node 1
 	}
 
-	// 2. Topic Metadata
-	// Length (int32)
-	enc.Int32(0) // No topics yet
+	// ClusterID (string) - Added in V2
+	if version >= 2 {
+		enc.String("warpstream-cluster")
+	}
 
+	// 2. Topic Metadata
+	enc.Int32(1) // Return 1 topic
+
+	// Topic "my-topic" (or requested)
+	enc.Int16(0) // TopicErrorCode (0 = OK)
+	enc.String(requestedTopic)
+	if version >= 1 {
+		enc.Int8(0) // IsInternal (false)
+	}
+
+	// Partitions
+	enc.Int32(1) // 1 Partition (ID 0)
+
+	enc.Int16(0) // PartitionErrorCode
+	enc.Int32(0) // PartitionID
+	enc.Int32(1) // Leader
+
+	// Replicas (Array int32)
+	enc.Int32(1)
+	enc.Int32(1)
+
+	// Isr (Array int32)
+	enc.Int32(1)
+	enc.Int32(1)
+
+	log.Println("Metadata Response encoded.")
 	return enc.Bytes(), nil
 }

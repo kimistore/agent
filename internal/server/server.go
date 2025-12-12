@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"go-stream/internal/protocol"
+	"go-stream/internal/storage"
 )
 
 type Server struct {
@@ -15,12 +16,14 @@ type Server struct {
 	listener net.Listener
 	quit     chan struct{}
 	wg       sync.WaitGroup
+	storage  *storage.StorageEngine
 }
 
-func NewServer(addr string) *Server {
+func NewServer(addr string, storage *storage.StorageEngine) *Server {
 	return &Server{
-		addr: addr,
-		quit: make(chan struct{}),
+		addr:    addr,
+		quit:    make(chan struct{}),
+		storage: storage,
 	}
 }
 
@@ -83,11 +86,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 
 		// 3. Process Request
-		resp, err := protocol.HandleRequest(bodyBuf)
+		resp, err := protocol.HandleRequest(bodyBuf, s.storage)
 		if err != nil {
 			log.Printf("Protocol error: %v", err)
 			return // Or close connection on protocol error
 		}
+
+		log.Printf("Sending Response: Size=%d", len(resp))
+		// log.Printf("Response Hex: %x", resp)
 
 		// 4. Send Response
 		// Response format: Size (int32) | Body
