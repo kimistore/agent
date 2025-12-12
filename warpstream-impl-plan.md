@@ -98,7 +98,7 @@ We will target the **15 Core APIs** necessary for a functional streaming platfor
 *   **Tech**: Go `net` package, `github.com/segmentio/kafka-go` (for protocol structures) or custom decoding if needed for fine-grained control.
 *   **Deliverable**: A server that accepts connections and responds to `ApiVersions` and `Metadata` requests.
 
-### Phase 2: The Storage Engine (S3WAL) (Weeks 3-4)
+### Phase 2: The Storage Engine (S3WAL) (Weeks 3-4) - [DONE]
 *   **Goal**: Implement the WAL writing and S3 uploading.
 *   **WAL Implementation**:
     -   Create a directory structure: `/data/wal/<topic>/<partition>/`.
