@@ -120,15 +120,15 @@ We will target the **15 Core APIs** necessary for a functional streaming platfor
     -   Handle "Not Found" or "Offset Out of Range".
 *   **Deliverable**: Can produce messages via `kcat` and consume them back.
 
-### Phase 4: Metadata & Coordination (Weeks 7-8)
-*   **Goal**: Manage topic state and Consumer Groups.
-*   **Metadata Store**:
-    -   For MVP: Use an embedded KV store (e.g., **BadgerDB**) or a simple JSON file if single-node.
-    -   For Production: Interface with **etcd**.
-*   **Consumer Groups**:
-    -   Implement the Group Coordinator logic (Join/Sync/Heartbeat).
-    -   Store committed offsets in a special internal topic `__consumer_offsets` (or just in the Metadata KV for simplicity initally).
-*   **Deliverable**: Full support for standard Kafka Consumer Groups.
+### Phase 4: S3 Reads & Recovery (Week 6) - [DONE]
+*   **Goal**: Ensure reading works for data offloaded to S3.
+*   **S3 Read Path**:
+    -   Update `StorageEngine.Read`: If not in hot WAL, check S3.
+    -   Need a strategy to find *which* S3 key has the offset. (Naive listing or Index).
+    -   For MVP: simple `ListObjects` filtering for range.
+*   **Recovery**:
+    -   Agent startup should be able to resume appending. (Already tackled in Phase 2 via WAL recovery).
+*   **Deliverable**: Test creating a large backlog, letting it upload, then consume it from start.
 
 ---
 
@@ -150,3 +150,11 @@ To begin immediately, I recommend starting with **Phase 1 & 2** concurrently:
 1.  **Scaffold the project**: `go mod init warpstream-clone`.
 2.  **Define the Storage Interface**: Create the Go interfaces for the WAL and Object Store.
 3.  **Prototypes**: Write a simple "Append-Only Log" that offloads to MinIO (S3 compatible) in the background.
+
+## 6. Known Issues / Limitations
+
+### Batch vs Message Offsets
+*   **Current Behavior**: The current `StorageEngine` and `Produce` handler increment offsets per **RecordBatch**, not per individual Message within the batch.
+*   **Implication**: If a producer sends a batch of 10 messages, the next offset increases by 1, not 10.
+*   **Standard Kafka**: Kafka increments offsets by the number of messages in the batch.
+*   **Action Item**: This needs to be rectified in a future refactor to fully comply with Kafka clients that expect message-level offsets. We need to inspect the batch content to count messages before assigning offsets.

@@ -48,6 +48,18 @@ func (m *MockObjectStore) Get(ctx context.Context, key string) (io.ReadCloser, e
 	return io.NopCloser(bytes.NewReader(b)), nil
 }
 
+func (m *MockObjectStore) List(ctx context.Context, prefix string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var keys []string
+	for k := range m.data {
+		if strings.HasPrefix(k, prefix) {
+			keys = append(keys, k)
+		}
+	}
+	return keys, nil
+}
+
 func main() {
 	walDir := "./tmp-storage-test-wal"
 	os.RemoveAll(walDir) // cleanup
@@ -121,6 +133,21 @@ func main() {
 	} else {
 		log.Fatal("FAILURE: No segments uploaded.")
 	}
+
+	// Verify local file deleted? (already done above)
+	// S3 READ verification
+	fmt.Println("Verifying Read from S3...")
+	// Offset 0 should mean searching S3, as 00...00.log is uploaded and deleted locally.
+	// engine.Read should trigger S3 list & get.
+
+	data, err := engine.Read(topic, partition, 0)
+	if err != nil {
+		log.Fatalf("Failed to read offset 0 from S3: %v", err)
+	}
+	if string(data) != "msg-0" {
+		log.Fatalf("Read wrong data: %s", string(data))
+	}
+	fmt.Println("SUCCESS: Read from S3.")
 
 	// Verify local file deleted?
 	// The uploader deletes it.

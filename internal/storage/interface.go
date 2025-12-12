@@ -23,5 +23,6 @@ type Engine interface {
 type ObjectStore interface {
 	Put(ctx context.Context, key string, r io.Reader) error
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
+	List(ctx context.Context, prefix string) ([]string, error)
 	// Range(key string, start, end int64) (io.ReadCloser, error) // Future optimization
 }

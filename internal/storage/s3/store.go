@@ -53,3 +53,22 @@ func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	}
 	return out.Body, nil
 }
+
+func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
+	var keys []string
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, obj := range page.Contents {
+			keys = append(keys, *obj.Key)
+		}
+	}
+	return keys, nil
+}
