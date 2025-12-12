@@ -134,6 +134,14 @@ func scanStreamForOffset(r io.Reader, targetOffset int64) ([]byte, error) {
 			// Found it. Read data.
 			data := make([]byte, msgSize)
 			_, err := io.ReadFull(r, data)
+
+			// PATCH: Rewrite the offset in the MessageSet to match the WAL offset.
+			// The stored data is a MessageSet (Offset+Size+Msg).
+			// The producer sent it with relative/zero offset. We must serve it with the actual log offset.
+			if len(data) >= 8 {
+				binary.BigEndian.PutUint64(data[0:8], uint64(targetOffset))
+			}
+
 			return data, err
 		}
 

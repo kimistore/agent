@@ -325,6 +325,18 @@ func (p *PartitionWAL) readFromFile(f *os.File, pos int64) ([]byte, error) {
 	if _, err := io.ReadFull(f, body); err != nil {
 		return nil, err
 	}
+
+	// PATCH: Rewrite the offset in the MessageSet to match the WAL offset.
+	// We already know the offset is `offset` (passed to Read, but not here).
+	// Wait, readFromFile has `pos` but not `offset`.
+	// We need to pass offset to readFromFile or rely on caller?
+	// Caller `Read` knows offset. `readFromFile` does not.
+	// But `readFromFile` reads `header` which contains `msgOffset`.
+	msgOffset := int64(binary.BigEndian.Uint64(header[0:8]))
+	if len(body) >= 8 {
+		binary.BigEndian.PutUint64(body[0:8], uint64(msgOffset))
+	}
+
 	return body, nil
 }
 
