@@ -9,7 +9,7 @@ import (
 type Engine interface {
 	// Append writes a batch of records to the log for a given topic/partition.
 	// Returns the base offset of the appended batch.
-	Append(topic string, partition int32, batch []byte) (int64, error)
+	Append(topic string, partition int32, batch []byte, recordCount int) (int64, error)
 
 	// Read reads data from the log starting at the given offset.
 	// It returns the data and the next offset to read from.

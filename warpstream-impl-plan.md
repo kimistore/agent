@@ -153,8 +153,7 @@ To begin immediately, I recommend starting with **Phase 1 & 2** concurrently:
 
 ## 6. Known Issues / Limitations
 
-### Batch vs Message Offsets
-*   **Current Behavior**: The current `StorageEngine` and `Produce` handler increment offsets per **RecordBatch**, not per individual Message within the batch.
-*   **Implication**: If a producer sends a batch of 10 messages, the next offset increases by 1, not 10.
-*   **Standard Kafka**: Kafka increments offsets by the number of messages in the batch.
-*   **Action Item**: This needs to be rectified in a future refactor to fully comply with Kafka clients that expect message-level offsets. We need to inspect the batch content to count messages before assigning offsets.
+### Batch vs Message Offsets - [RESOLVED]
+*   **Resolution**: The `StorageEngine` and `WAL` interfaces were updated to accept `recordCount`. The `handleProduce` function now parses the incoming `MessageSet` (V0/V1) to count records and increments the offset accordingly.
+*   **Implication**: Offsets now correctly reflect the number of messages in the batch.
+*   **Note**: Compressed batches are treated as 1 message for now (offset +1), which aligns with how Wrapper messages work in V0/V1 if we don't perform deep inspection. For uncompressed batches, offsets are accurate.

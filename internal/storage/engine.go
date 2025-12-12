@@ -47,8 +47,8 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string) (*Stor
 	return se, nil
 }
 
-func (s *StorageEngine) Append(topic string, partition int32, batch []byte) (int64, error) {
-	return s.walMgr.Append(topic, partition, batch)
+func (s *StorageEngine) Append(topic string, partition int32, batch []byte, recordCount int) (int64, error) {
+	return s.walMgr.Append(topic, partition, batch, recordCount)
 }
 
 func (s *StorageEngine) Read(topic string, partition int32, offset int64) ([]byte, error) {

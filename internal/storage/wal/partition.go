@@ -208,7 +208,7 @@ func (p *PartitionWAL) recoverActive() error {
 	return nil
 }
 
-func (p *PartitionWAL) Append(batch []byte) (int64, error) {
+func (p *PartitionWAL) Append(batch []byte, recordCount int) (int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -242,12 +242,14 @@ func (p *PartitionWAL) Append(batch []byte) (int64, error) {
 		return 0, err
 	}
 
-	// Sync?
-	// p.activeFile.Sync()
-
 	p.currentSize += int64(n1 + n2)
 	p.index[offset] = pos
-	p.nextOffset++
+
+	// Increment nextOffset by the number of records
+	if recordCount < 1 {
+		recordCount = 1
+	} // Safety, though caller should ensure
+	p.nextOffset += int64(recordCount)
 
 	return offset, nil
 }

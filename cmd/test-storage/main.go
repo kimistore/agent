@@ -79,14 +79,14 @@ func main() {
 	fmt.Println("Writing messages...")
 	for i := 0; i < 10; i++ {
 		msg := []byte(fmt.Sprintf("msg-%d", i))
-		if _, err := engine.Append(topic, partition, msg); err != nil {
+		if _, err := engine.Append(topic, partition, msg, 1); err != nil {
 			log.Fatal(err)
 		}
 	}
 
 	// 2. Write a large message to force roll (our limit is 1MB, so write 1.1MB)
 	largeMsg := make([]byte, 1153434) // ~1.1MB
-	if _, err := engine.Append(topic, partition, largeMsg); err != nil {
+	if _, err := engine.Append(topic, partition, largeMsg, 1); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("Wrote large message to trigger roll.")
@@ -98,7 +98,7 @@ func main() {
 	// NEXT Append checks size and rolls.
 
 	// So we need ONE MORE append to trigger the roll of the large segment.
-	if _, err := engine.Append(topic, partition, []byte("trigger-roll")); err != nil {
+	if _, err := engine.Append(topic, partition, []byte("trigger-roll"), 1); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("Wrote trigger message.")

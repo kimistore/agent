@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
 
@@ -85,7 +86,15 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 			dec.off += int(msgSetSize)
 
 			// APPEND TO STORAGE
-			offset, err := store.Append(topic, partition, batchData)
+			// Parse batch to count messages (MessageSet V0/V1)
+			recordCount := countMessageSet(batchData)
+			if recordCount == 0 {
+				// Empty batch? or parse error?
+				// Just fallback to 1 to avoid sticking offset
+				recordCount = 1
+			}
+
+			offset, err := store.Append(topic, partition, batchData, recordCount)
 
 			// Write Response Partition
 			enc.Int32(partition)
@@ -225,4 +234,24 @@ func handleFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, versi
 	}
 
 	return enc.Bytes(), nil
+}
+
+func countMessageSet(data []byte) int {
+	count := 0
+	pos := 0
+	// MessageSet Entry: Offset(8) + Size(4) + Msg(Size)
+	for pos <= len(data)-12 {
+		// Offset is data[pos : pos+8] (We don't need value)
+		// Size is data[pos+8 : pos+12]
+		size := binary.BigEndian.Uint32(data[pos+8 : pos+12])
+
+		totalLen := 12 + int(size)
+		if pos+totalLen > len(data) {
+			break
+		}
+
+		count++
+		pos += totalLen
+	}
+	return count
 }

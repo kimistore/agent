@@ -23,7 +23,7 @@ func main() {
 
 	// Write
 	msg := []byte("Hello WarpStream!")
-	off, err := mgr.Append(topic, partition, msg)
+	off, err := mgr.Append(topic, partition, msg, 1)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func main() {
 	}
 
 	// Write more
-	off2, _ := mgr.Append(topic, partition, []byte("Msg 2"))
+	off2, _ := mgr.Append(topic, partition, []byte("Msg 2"), 1)
 	fmt.Printf("Appended at offset: %d\n", off2)
 
 	readMsg2, _ := mgr.Read(topic, partition, off2)

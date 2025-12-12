@@ -51,12 +51,12 @@ func (m *Manager) getPartitionWAL(topic string, partition int32) (*PartitionWAL,
 	return p, nil
 }
 
-func (m *Manager) Append(topic string, partition int32, batch []byte) (int64, error) {
+func (m *Manager) Append(topic string, partition int32, batch []byte, recordCount int) (int64, error) {
 	p, err := m.getPartitionWAL(topic, partition)
 	if err != nil {
 		return 0, err
 	}
-	return p.Append(batch)
+	return p.Append(batch, recordCount)
 }
 
 func (m *Manager) Read(topic string, partition int32, offset int64) ([]byte, error) {
