@@ -50,3 +50,25 @@ kcat -b localhost:19092 -t my-topic -P
 # Consumer works using simple consumer mode (-C is actually simple consumer by default in kcat, but acts like group if -G is passed)
 kcat -b localhost:19092 -t my-topic -C -o beginning
 ```
+
+## Detailed Feature Matrix
+
+| Feature Category | Feature | Status | Notes |
+| :--- | :--- | :--- | :--- |
+| **Core Protocol** | Produce API (V2) | ✅ Supported | Batch duration/parsing pending |
+| | Fetch API (V2) | ✅ Supported | |
+| | ListOffsets (V1) | ✅ Supported | |
+| | Metadata (V2) | ✅ Supported | |
+| | ApiVersions (V0) | ✅ Supported | Higher versions return Error |
+| **Messaging** | MessageSets (V0, V1) | ✅ Supported | Legacy format |
+| | RecordBatch (V2) | ⚠️ Partial | Stored opaque; Offsets increment per batch |
+| | Compression | ❌ No | Treated as binary blob |
+| **Consumption** | Simple Consumer | ✅ Supported | `assign()` partitions manually |
+| | Consumer Groups | ❌ No | `subscribe()` will fail |
+| | Offset Commit | ❌ No | Offsets not stored in `__consumer_offsets` |
+| **Durability** | Local Persistence | ✅ Supported | Synchronous WAL |
+| | S3 Offload | ✅ Supported | Asynchronous upload |
+| | S3 Recovery | ✅ Supported | Transparent fallback to S3 |
+| **Reliability** | Replication | ❌ No | Single node only |
+| | ISR/HW | ❌ No | Always ISR=1, HW=Max |
+
