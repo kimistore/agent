@@ -402,5 +402,14 @@ func (p *PartitionWAL) readFromSealed(offset int64) ([]byte, error) {
 func (p *PartitionWAL) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.activeFile.Close()
+	if p.activeFile != nil {
+		return p.activeFile.Close()
+	}
+	return nil
+}
+
+func (p *PartitionWAL) HighWaterMark() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.nextOffset
 }

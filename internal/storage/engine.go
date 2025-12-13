@@ -116,6 +116,10 @@ func (s *StorageEngine) GetPartitions(topic string) ([]int32, error) {
 	return s.walMgr.ListPartitions(topic)
 }
 
+func (s *StorageEngine) HighWaterMark(topic string, partition int32) int64 {
+	return s.walMgr.HighWaterMark(topic, partition)
+}
+
 func scanStreamForOffset(r io.Reader, targetOffset int64) ([]byte, error) {
 	// Format: [Offset (8)][Size (4)][Data...]
 	// We scan until we find targetOffset.

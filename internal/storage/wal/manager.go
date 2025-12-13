@@ -109,6 +109,14 @@ func (m *Manager) ListPartitions(topic string) ([]int32, error) {
 	return partitions, nil
 }
 
+func (m *Manager) HighWaterMark(topic string, partition int32) int64 {
+	p, err := m.getPartitionWAL(topic, partition)
+	if err != nil {
+		return 0
+	}
+	return p.HighWaterMark()
+}
+
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
