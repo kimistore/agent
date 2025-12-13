@@ -67,6 +67,48 @@ func (m *Manager) Read(topic string, partition int32, offset int64) ([]byte, err
 	return p.Read(offset)
 }
 
+func (m *Manager) ListPartitions(topic string) ([]int32, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Scan loaded partitions
+	var partitions []int32
+	prefix := topic + "/"
+	for k := range m.partitions {
+		if len(k) > len(prefix) && k[:len(prefix)] == prefix {
+			var pid int32
+			fmt.Sscanf(k[len(prefix):], "%d", &pid)
+			partitions = append(partitions, pid)
+		}
+	}
+
+	// Also scan directory because not all might be loaded in memory
+	topicDir := filepath.Join(m.baseDir, topic)
+	entries, err := os.ReadDir(topicDir)
+	if err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				var pid int32
+				if _, err := fmt.Sscanf(e.Name(), "%d", &pid); err == nil {
+					// Dedup
+					found := false
+					for _, p := range partitions {
+						if p == pid {
+							found = true
+							break
+						}
+					}
+					if !found {
+						partitions = append(partitions, pid)
+					}
+				}
+			}
+		}
+	}
+
+	return partitions, nil
+}
+
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

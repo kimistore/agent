@@ -44,6 +44,7 @@ type Group struct {
 	Offsets      map[string]map[int32]int64 // Topic -> Partition -> Offset
 	LeaderID     string
 	mu           sync.Mutex
+	cond         *sync.Cond
 }
 
 type Coordinator struct {
@@ -72,6 +73,7 @@ func (c *Coordinator) GetGroup(groupID string) *Group {
 		Members: make(map[string]*MemberMetadata),
 		Offsets: make(map[string]map[int32]int64),
 	}
+	g.cond = sync.NewCond(&g.mu)
 	c.groups[groupID] = g
 	return g
 }
@@ -95,19 +97,21 @@ func (c *Coordinator) JoinGroup(groupID, memberID, protocolType string, protocol
 		Heartbeat:      time.Now(),
 	}
 
-	// 3. Logic for "Fake" Rebalance (Immediate)
-	// If state is Empty or Stable, we start a "Rebalance".
-	// For MVP, we treat every Join as a successful rebalance immediately if it's the Leader (first one),
-	// or if we decide to support only 1 member for now.
-
+	// 3. Fake Rebalance Logic
 	// Simplification: Always elect first member as leader.
 	if g.LeaderID == "" || g.Members[g.LeaderID] == nil {
 		g.LeaderID = memberID
 	}
 
-	g.GenerationID++
-	g.State = GroupStateCompletingRebalance // We skip "Preparing" wait for MVP
-	g.Protocol = protocols[0].Name          // Just pick first one
+	// Increment generation to signal new rebalance
+	// But ONLY if we are not already in rebalance (CompletingRebalance).
+	// If we are Completing, it means we are gathering members for the NEW generation.
+	// Late joiners will join this generation. The Leader (joining last usually) will verify everyone.
+	if g.State != GroupStateCompletingRebalance {
+		g.GenerationID++
+		g.State = GroupStateCompletingRebalance
+	}
+	g.Protocol = protocols[0].Name
 
 	// Return list of members so Leader can assign
 	memberList := make([]MemberMetadata, 0, len(g.Members))
@@ -135,6 +139,18 @@ func (c *Coordinator) SyncGroup(groupID, memberID string, generationID int32, gr
 			}
 		}
 		g.State = GroupStateStable
+		g.cond.Broadcast() // Wake up followers
+	} else {
+		// If Follower, WAIT for Stable state
+		// Simple timeout protection (e.g. 5 seconds) could be added but Cond doesn't support it easily.
+		// We relies on Leader eventually sending it.
+		for g.State != GroupStateStable && g.GenerationID == generationID {
+			g.cond.Wait()
+		}
+		// If generation changed while waiting, error out
+		if g.GenerationID != generationID {
+			return nil, fmt.Errorf("rebalance needed")
+		}
 	}
 
 	// Return my assignment

@@ -112,6 +112,10 @@ func (s *StorageEngine) Read(topic string, partition int32, offset int64) ([]byt
 	return scanStreamForOffset(rc, offset)
 }
 
+func (s *StorageEngine) GetPartitions(topic string) ([]int32, error) {
+	return s.walMgr.ListPartitions(topic)
+}
+
 func scanStreamForOffset(r io.Reader, targetOffset int64) ([]byte, error) {
 	// Format: [Offset (8)][Size (4)][Data...]
 	// We scan until we find targetOffset.

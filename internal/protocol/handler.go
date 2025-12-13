@@ -72,7 +72,7 @@ func HandleRequest(data []byte, store *storage.StorageEngine) ([]byte, error) {
 	case ApiKeyApiVersions:
 		return handleApiVersions(enc, apiVersion)
 	case ApiKeyMetadata:
-		return handleMetadata(dec, enc, apiVersion)
+		return handleMetadata(dec, enc, store, apiVersion)
 	case ApiKeyFindCoordinator:
 		return handleFindCoordinator(dec, enc, apiVersion)
 	case ApiKeyJoinGroup:
@@ -382,7 +382,7 @@ func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
 	return enc.Bytes(), nil
 }
 
-func handleMetadata(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
+func handleMetadata(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
 	// Metadata Request V0+:
 	// Topics Array (String)
 
@@ -438,19 +438,35 @@ func handleMetadata(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
 	}
 
 	// Partitions
-	enc.Int32(1) // 1 Partition (ID 0)
+	// Query storage for partitions
+	partitions, err := store.GetPartitions(requestedTopic)
+	if err != nil {
+		log.Printf("Failed to get partitions: %v", err)
+		// Fallback to 0 partitions or error?
+		// If topic doesn't exist, we usually auto-create implicitly on Produce.
+		// Metadata often returns LeaderNotAvailable if new?
+		// Let's default to Partition 0 if empty list.
+		partitions = []int32{}
+	}
 
-	enc.Int16(0) // PartitionErrorCode
-	enc.Int32(0) // PartitionID
-	enc.Int32(1) // Leader
+	// Auto-create Partition-0 default if none?
+	if len(partitions) == 0 {
+		partitions = []int32{0}
+	}
 
-	// Replicas (Array int32)
-	enc.Int32(1)
-	enc.Int32(1)
+	enc.Int32(int32(len(partitions)))
 
-	// Isr (Array int32)
-	enc.Int32(1)
-	enc.Int32(1)
+	for _, pid := range partitions {
+		enc.Int16(0)   // PartitionErrorCode
+		enc.Int32(pid) // PartitionID
+		enc.Int32(1)   // Leader
+		// Replicas (Array int32)
+		enc.Int32(1)
+		enc.Int32(1)
+		// Isr (Array int32)
+		enc.Int32(1)
+		enc.Int32(1)
+	}
 
 	log.Println("Metadata Response encoded.")
 	return enc.Bytes(), nil
