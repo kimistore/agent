@@ -22,13 +22,17 @@ const (
 	ApiKeyLeaveGroup      = 13
 	ApiKeySyncGroup       = 14
 	ApiKeyApiVersions     = 18
+	ApiKeyCreateTopics    = 19
+	ApiKeyDeleteTopics    = 20
 )
 
 const (
 	ErrNone                     = 0
 	ErrUnknown                  = -1
-	ErrUnsupportedVersion       = 35
+	ErrUnknownTopicOrPartition  = 3
 	ErrGroupAuthorizationFailed = 30
+	ErrUnsupportedVersion       = 35
+	ErrTopicAlreadyExists       = 36
 )
 
 func HandleRequest(data []byte, store *storage.StorageEngine) ([]byte, error) {
@@ -88,6 +92,10 @@ func HandleRequest(data []byte, store *storage.StorageEngine) ([]byte, error) {
 		return handleOffsetCommit(dec, enc, store, apiVersion)
 	case ApiKeyOffsetFetch:
 		return handleOffsetFetch(dec, enc, store, apiVersion)
+	case ApiKeyCreateTopics:
+		return handleCreateTopics(dec, enc, store, apiVersion)
+	case ApiKeyDeleteTopics:
+		return handleDeleteTopics(dec, enc, store, apiVersion)
 	default:
 		// Unsupported API?
 		// We should return some error code, but since formatting depends on API...
@@ -373,7 +381,7 @@ func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
 	// Supported: Produce(0-2), Fetch(0-2), ListOffsets(0-1), Metadata(0-2), ApiVersions(0)
 	// + Group APIs: OffsetCommit(0), OffsetFetch(0-1), FindCoordinator(0), JoinGroup(0), SyncGroup(0), Heartbeat(0), LeaveGroup(0)
 
-	numKeys := 12
+	numKeys := 14
 	enc.Int32(int32(numKeys)) // Array length is int32 usually?
 	// careful: Array length in V0 is int32.
 
@@ -396,6 +404,8 @@ func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
 	writeEntry(ApiKeySyncGroup, 0, 0)
 	writeEntry(ApiKeyHeartbeat, 0, 0)
 	writeEntry(ApiKeyLeaveGroup, 0, 0)
+	writeEntry(ApiKeyCreateTopics, 0, 0)
+	writeEntry(ApiKeyDeleteTopics, 0, 0)
 
 	return enc.Bytes(), nil
 }

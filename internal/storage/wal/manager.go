@@ -117,6 +117,35 @@ func (m *Manager) HighWaterMark(topic string, partition int32) int64 {
 	return p.HighWaterMark()
 }
 
+func (m *Manager) CreateTopic(topic string, partitions int32) error {
+	for i := int32(0); i < partitions; i++ {
+		// Just accessing it creates it
+		_, err := m.getPartitionWAL(topic, i)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) DeleteTopic(topic string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Close and remove from memory
+	prefix := topic + "/"
+	for k, p := range m.partitions {
+		if k == topic || (len(k) > len(prefix) && k[:len(prefix)] == prefix) {
+			_ = p.Close()
+			delete(m.partitions, k)
+		}
+	}
+
+	// Remove from disk
+	topicDir := filepath.Join(m.baseDir, topic)
+	return os.RemoveAll(topicDir)
+}
+
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

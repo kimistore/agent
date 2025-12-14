@@ -120,6 +120,18 @@ func (s *StorageEngine) HighWaterMark(topic string, partition int32) int64 {
 	return s.walMgr.HighWaterMark(topic, partition)
 }
 
+func (s *StorageEngine) CreateTopic(topic string, partitions int32) error {
+	return s.walMgr.CreateTopic(topic, partitions)
+}
+
+func (s *StorageEngine) DeleteTopic(topic string) error {
+	// Also remove from S3?
+	// For MVP, deleting local WAL is mostly what we control.
+	// Deleting from S3 needs LIST + DELETE which is heavy.
+	// We'll leave S3 cleanup for later or async process.
+	return s.walMgr.DeleteTopic(topic)
+}
+
 func scanStreamForOffset(r io.Reader, targetOffset int64) ([]byte, error) {
 	// Format: [Offset (8)][Size (4)][Data...]
 	// We scan until we find targetOffset.

@@ -53,6 +53,8 @@ The following Kafka API Keys are currently implemented:
 | **LeaveGroup** | 13 | Graceful consumer shutdown. | ✅ Active |
 | **SyncGroup** | 14 | Distribute partition assignments. | ✅ Active |
 | **ApiVersions** | 18 | Negotiate protocol support. | ✅ Active |
+| **CreateTopics** | 19 | Create new topics. | ✅ Active |
+| **DeleteTopics** | 20 | Delete topics. | ✅ Active |
 
 ## 🛠 Usage
 
