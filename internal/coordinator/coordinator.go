@@ -97,6 +97,10 @@ func (c *Coordinator) JoinGroup(groupID, memberID, protocolType string, protocol
 		Heartbeat:      time.Now(),
 	}
 
+	if g.ProtocolType == "" {
+		g.ProtocolType = protocolType
+	}
+
 	// 3. Fake Rebalance Logic
 	// Simplification: Always elect first member as leader.
 	if g.LeaderID == "" || g.Members[g.LeaderID] == nil {
@@ -210,6 +214,87 @@ func (c *Coordinator) CommitOffset(store Storage, groupID, topic string, partiti
 
 func (c *Coordinator) FetchOffset(store Storage, groupID, topic string, partition int32) (int64, error) {
 	return store.LoadOffset(groupID, topic, partition)
+}
+
+// Observability for ListGroups/DescribeGroups
+
+type GroupOverview struct {
+	GroupID      string
+	ProtocolType string
+}
+
+func (c *Coordinator) ListGroups() []GroupOverview {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var list []GroupOverview
+	for name, g := range c.groups {
+		// Filter out dead/empty? Kafka usually lists all.
+		g.mu.Lock()
+		pType := g.ProtocolType
+		g.mu.Unlock()
+
+		list = append(list, GroupOverview{GroupID: name, ProtocolType: pType})
+	}
+	return list
+}
+
+type GroupDetail struct {
+	State        string
+	ProtocolType string
+	Protocol     string
+	Members      []MemberDetail
+}
+
+type MemberDetail struct {
+	MemberID   string
+	ClientID   string
+	ClientHost string
+	Metadata   []byte
+	Assignment []byte
+}
+
+func (c *Coordinator) DescribeGroup(groupID string) (*GroupDetail, error) {
+	g := c.GetGroup(groupID)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.State == GroupStateDead {
+		return nil, fmt.Errorf("group dead")
+	}
+
+	stateStr := "Stable"
+	switch g.State {
+	case GroupStateEmpty:
+		stateStr = "Empty"
+	case GroupStatePreparingRebalance:
+		stateStr = "PreparingRebalance"
+	case GroupStateCompletingRebalance:
+		stateStr = "CompletingRebalance"
+	case GroupStateDead:
+		stateStr = "Dead"
+	}
+
+	detail := &GroupDetail{
+		State:        stateStr,
+		ProtocolType: g.ProtocolType,
+		Protocol:     g.Protocol,
+	}
+
+	for _, m := range g.Members {
+		detail.Members = append(detail.Members, MemberDetail{
+			MemberID:   m.MemberID,
+			ClientID:   m.ClientID,
+			ClientHost: m.ClientHost,
+			// For DescribeGroup, we generally return Metadata/Assignment
+			// BUT careful: Protocol metadata is per-protocol.
+			// Assignment is result of SyncGroup.
+			Assignment: m.Assignment,
+			// Metadata is usually empty in DescribeGroup response?
+			// Kafka DescribeGroups response has MemberMetadata and MemberAssignment fields.
+		})
+	}
+	return detail, nil
 }
 
 type GroupAssignment struct {

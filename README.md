@@ -52,6 +52,8 @@ The following Kafka API Keys are currently implemented:
 | **Heartbeat** | 12 | Keep member session alive. | ✅ Active |
 | **LeaveGroup** | 13 | Graceful consumer shutdown. | ✅ Active |
 | **SyncGroup** | 14 | Distribute partition assignments. | ✅ Active |
+| **DescribeGroups** | 15 | Get detailed group/member info. | ✅ Active |
+| **ListGroups** | 16 | List active consumer groups. | ✅ Active |
 | **ApiVersions** | 18 | Negotiate protocol support. | ✅ Active |
 | **CreateTopics** | 19 | Create new topics. | ✅ Active |
 | **DeleteTopics** | 20 | Delete topics. | ✅ Active |

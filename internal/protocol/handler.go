@@ -24,6 +24,8 @@ const (
 	ApiKeyApiVersions     = 18
 	ApiKeyCreateTopics    = 19
 	ApiKeyDeleteTopics    = 20
+	ApiKeyDescribeGroups  = 15
+	ApiKeyListGroups      = 16
 )
 
 const (
@@ -96,6 +98,10 @@ func HandleRequest(data []byte, store *storage.StorageEngine) ([]byte, error) {
 		return handleCreateTopics(dec, enc, store, apiVersion)
 	case ApiKeyDeleteTopics:
 		return handleDeleteTopics(dec, enc, store, apiVersion)
+	case ApiKeyListGroups:
+		return handleListGroups(dec, enc, store, apiVersion)
+	case ApiKeyDescribeGroups:
+		return handleDescribeGroups(dec, enc, store, apiVersion)
 	default:
 		// Unsupported API?
 		// We should return some error code, but since formatting depends on API...
@@ -381,7 +387,7 @@ func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
 	// Supported: Produce(0-2), Fetch(0-2), ListOffsets(0-1), Metadata(0-2), ApiVersions(0)
 	// + Group APIs: OffsetCommit(0), OffsetFetch(0-1), FindCoordinator(0), JoinGroup(0), SyncGroup(0), Heartbeat(0), LeaveGroup(0)
 
-	numKeys := 14
+	numKeys := 16
 	enc.Int32(int32(numKeys)) // Array length is int32 usually?
 	// careful: Array length in V0 is int32.
 
@@ -406,6 +412,8 @@ func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
 	writeEntry(ApiKeyLeaveGroup, 0, 0)
 	writeEntry(ApiKeyCreateTopics, 0, 0)
 	writeEntry(ApiKeyDeleteTopics, 0, 0)
+	writeEntry(ApiKeyListGroups, 0, 0)
+	writeEntry(ApiKeyDescribeGroups, 0, 0)
 
 	return enc.Bytes(), nil
 }
