@@ -24,6 +24,14 @@ type StorageEngine struct {
 
 	quit chan struct{}
 	wg   sync.WaitGroup
+
+	// Cache for S3 List results (topic/partition -> []keys)
+	segmentCache map[string][]string
+	cacheMu      sync.RWMutex
+
+	// Buffer for offsets (groupID/topic/partition -> offset)
+	offsetBuf   map[string]int64
+	offsetBufMu sync.Mutex
 }
 
 func NewStorageEngine(walDir string, objStore ObjectStore, bucket string) (*StorageEngine, error) {
@@ -33,16 +41,19 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string) (*Stor
 	}
 
 	se := &StorageEngine{
-		walMgr:   mgr,
-		objStore: objStore,
-		bucket:   bucket,
-		walDir:   walDir,
-		quit:     make(chan struct{}),
+		walMgr:       mgr,
+		objStore:     objStore,
+		bucket:       bucket,
+		walDir:       walDir,
+		quit:         make(chan struct{}),
+		segmentCache: make(map[string][]string),
+		offsetBuf:    make(map[string]int64),
 	}
 
-	// Start background uploader
-	se.wg.Add(1)
+	// Start background uploader and offset flusher
+	se.wg.Add(2)
 	go se.uploaderLoop()
+	go se.offsetFlusherLoop()
 
 	return se, nil
 }
@@ -59,43 +70,65 @@ func (s *StorageEngine) Read(topic string, partition int32, offset int64) ([]byt
 	}
 
 	// 2. Try Object Store (Cold)
-	// Construct prefix: topic/partition/
 	prefix := fmt.Sprintf("%s/%d/", topic, partition)
+	cacheKey := fmt.Sprintf("%s/%d", topic, partition)
 
-	// Note: For MVP, Listing every read is inefficient.
-	// Ideally we cache the segment list or use an index.
-	ctx := context.TODO()
-	keys, err := s.objStore.List(ctx, prefix)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list s3: %v", err)
-	}
-
-	// Find the segment that SHOULD contain the offset.
-	// Format: <offset>.log
-	// We want max(start_offset) where start_offset <= requested_offset
-
-	var bestKey string
-	var bestStartOffset int64 = -1
-
-	for _, k := range keys {
-		if !strings.HasSuffix(k, ".log") {
-			continue
-		}
-		// key: topic/partition/000.log
-		parts := strings.Split(k, "/")
-		filename := parts[len(parts)-1]
-		baseName := strings.TrimSuffix(filename, ".log")
-		startOffset, err := strconv.ParseInt(baseName, 10, 64)
-		if err != nil {
-			continue
-		}
-
-		if startOffset <= offset {
-			if startOffset > bestStartOffset {
-				bestStartOffset = startOffset
-				bestKey = k
+	// Helper to find best key from a list of keys
+	findBestKey := func(keys []string) string {
+		var bKey string
+		var bStartOffset int64 = -1
+		for _, k := range keys {
+			if !strings.HasSuffix(k, ".log") {
+				continue
+			}
+			parts := strings.Split(k, "/")
+			filename := parts[len(parts)-1]
+			baseName := strings.TrimSuffix(filename, ".log")
+			startOffset, err := strconv.ParseInt(baseName, 10, 64)
+			if err != nil {
+				continue
+			}
+			if startOffset <= offset {
+				if startOffset > bStartOffset {
+					bStartOffset = startOffset
+					bKey = k
+				}
 			}
 		}
+		return bKey
+	}
+
+	// Try Cache First
+	s.cacheMu.RLock()
+	cachedKeys, hit := s.segmentCache[cacheKey]
+	s.cacheMu.RUnlock()
+
+	var bestKey string
+	if hit {
+		bestKey = findBestKey(cachedKeys)
+	}
+
+	// If miss or not found in cache, Refresh Cache
+	if bestKey == "" {
+		s.cacheMu.Lock()
+		// Double check
+		cachedKeys, hit = s.segmentCache[cacheKey]
+		if hit {
+			bestKey = findBestKey(cachedKeys)
+		}
+
+		if bestKey == "" {
+			// Actually list S3
+			ctx := context.TODO()
+			keys, err := s.objStore.List(ctx, prefix)
+			if err != nil {
+				s.cacheMu.Unlock()
+				return nil, fmt.Errorf("failed to list s3: %v", err)
+			}
+			s.segmentCache[cacheKey] = keys
+			bestKey = findBestKey(keys)
+		}
+		s.cacheMu.Unlock()
 	}
 
 	if bestKey == "" {
@@ -103,6 +136,7 @@ func (s *StorageEngine) Read(topic string, partition int32, offset int64) ([]byt
 	}
 
 	// Download and Scan
+	ctx := context.TODO()
 	rc, err := s.objStore.Get(ctx, bestKey)
 	if err != nil {
 		return nil, err
@@ -256,6 +290,15 @@ func (s *StorageEngine) uploadSegments() {
 		} else {
 			log.Printf("Uploaded and trimmed %s", key)
 		}
+
+		// Update Cache
+		cacheKey := fmt.Sprintf("%s/%s", topic, partition)
+		s.cacheMu.Lock()
+		if list, ok := s.segmentCache[cacheKey]; ok {
+			s.segmentCache[cacheKey] = append(list, key)
+		}
+		s.cacheMu.Unlock()
+
 		return nil
 	})
 
@@ -264,14 +307,56 @@ func (s *StorageEngine) uploadSegments() {
 	}
 }
 func (s *StorageEngine) SaveOffset(groupID, topic string, partition int32, offset int64) error {
-	// For MVP: persist as a special object in S3
-	// key: _offsets/<groupID>/<topic>/<partition>
-	key := fmt.Sprintf("_offsets/%s/%s/%d", groupID, topic, partition)
-	data := []byte(fmt.Sprintf("%d", offset))
+	// Buffer the offset save
+	key := fmt.Sprintf("%s/%s/%d", groupID, topic, partition)
+	s.offsetBufMu.Lock()
+	s.offsetBuf[key] = offset
+	s.offsetBufMu.Unlock()
+	return nil
+}
 
-	ctx := context.TODO()
-	// Using strings.NewReader for simplicity
-	return s.objStore.Put(ctx, key, strings.NewReader(string(data)))
+func (s *StorageEngine) offsetFlusherLoop() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.quit:
+			s.flushOffsets()
+			return
+		case <-ticker.C:
+			s.flushOffsets()
+		}
+	}
+}
+
+func (s *StorageEngine) flushOffsets() {
+	s.offsetBufMu.Lock()
+	if len(s.offsetBuf) == 0 {
+		s.offsetBufMu.Unlock()
+		return
+	}
+	// Copy buffer to release lock quickly
+	todo := make(map[string]int64)
+	for k, v := range s.offsetBuf {
+		todo[k] = v
+	}
+	// Clear buffer (assume we will succeed or retry in next call if we failed? MVP: simple clear)
+	// Actually better to clear only what we process. But for offsets, last write wins.
+	// We can just clear.
+	s.offsetBuf = make(map[string]int64)
+	s.offsetBufMu.Unlock()
+
+	ctx := context.Background()
+	for k, offset := range todo {
+		// k is "groupID/topic/partition"
+		s3Key := fmt.Sprintf("_offsets/%s", k)
+		data := []byte(fmt.Sprintf("%d", offset))
+		if err := s.objStore.Put(ctx, s3Key, strings.NewReader(string(data))); err != nil {
+			log.Printf("Failed to flush offset %s: %v", s3Key, err)
+		}
+	}
 }
 
 func (s *StorageEngine) LoadOffset(groupID, topic string, partition int32) (int64, error) {

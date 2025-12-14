@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"go-stream/internal/storage"
+	"go-stream/internal/storage/wal"
 )
 
 // MockObjectStore
@@ -63,6 +64,9 @@ func (m *MockObjectStore) List(ctx context.Context, prefix string) ([]string, er
 func main() {
 	walDir := "./tmp-storage-test-wal"
 	os.RemoveAll(walDir) // cleanup
+
+	// Override MaxSegmentSize for test to force roll
+	wal.MaxSegmentSize = 1 * 1024 * 1024
 
 	store := NewMockObjectStore()
 

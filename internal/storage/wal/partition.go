@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	// MaxSegmentSize is the threshold to roll a segment.
-	// Small for testing/demo purposes.
-	MaxSegmentSize = 1 * 1024 * 1024 // 1MB
+// MaxSegmentSize is the threshold to roll a segment.
+// Increased to 64MB to reduce invalid S3 PUT costs.
 )
+
+var MaxSegmentSize = int64(64 * 1024 * 1024) // 64MB
 
 type PartitionWAL struct {
 	dir              string
