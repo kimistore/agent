@@ -195,6 +195,23 @@ func (c *Coordinator) LeaveGroup(groupID, memberID string) error {
 	return nil
 }
 
+// External Store is needed for Offset Commit/Fetch?
+// Actually better to have Coordinator call StorageEngine or have StorageEngine passed in methods.
+// For specific OffsetCommit/Fetch APIs, we can just pass the StorageEngine interface.
+
+type Storage interface {
+	SaveOffset(groupID, topic string, partition int32, offset int64) error
+	LoadOffset(groupID, topic string, partition int32) (int64, error)
+}
+
+func (c *Coordinator) CommitOffset(store Storage, groupID, topic string, partition int32, offset int64) error {
+	return store.SaveOffset(groupID, topic, partition, offset)
+}
+
+func (c *Coordinator) FetchOffset(store Storage, groupID, topic string, partition int32) (int64, error) {
+	return store.LoadOffset(groupID, topic, partition)
+}
+
 type GroupAssignment struct {
 	MemberID   string
 	Assignment []byte

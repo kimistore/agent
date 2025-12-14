@@ -251,3 +251,36 @@ func (s *StorageEngine) uploadSegments() {
 		log.Printf("Error walking WAL dir: %v", err)
 	}
 }
+func (s *StorageEngine) SaveOffset(groupID, topic string, partition int32, offset int64) error {
+	// For MVP: persist as a special object in S3
+	// key: _offsets/<groupID>/<topic>/<partition>
+	key := fmt.Sprintf("_offsets/%s/%s/%d", groupID, topic, partition)
+	data := []byte(fmt.Sprintf("%d", offset))
+
+	ctx := context.TODO()
+	// Using strings.NewReader for simplicity
+	return s.objStore.Put(ctx, key, strings.NewReader(string(data)))
+}
+
+func (s *StorageEngine) LoadOffset(groupID, topic string, partition int32) (int64, error) {
+	key := fmt.Sprintf("_offsets/%s/%s/%d", groupID, topic, partition)
+
+	ctx := context.TODO()
+	rc, err := s.objStore.Get(ctx, key)
+	if err != nil {
+		// Assume not found if error (simplified)
+		return -1, nil
+	}
+	defer rc.Close()
+
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return -1, err
+	}
+
+	offset, err := strconv.ParseInt(string(data), 10, 64)
+	if err != nil {
+		return -1, err
+	}
+	return offset, nil
+}

@@ -26,6 +26,7 @@ const (
 
 const (
 	ErrNone                     = 0
+	ErrUnknown                  = -1
 	ErrUnsupportedVersion       = 35
 	ErrGroupAuthorizationFailed = 30
 )
@@ -84,9 +85,9 @@ func HandleRequest(data []byte, store *storage.StorageEngine) ([]byte, error) {
 	case ApiKeyLeaveGroup:
 		return handleLeaveGroup(dec, enc, apiVersion)
 	case ApiKeyOffsetCommit:
-		return handleOffsetCommit(dec, enc, apiVersion)
+		return handleOffsetCommit(dec, enc, store, apiVersion)
 	case ApiKeyOffsetFetch:
-		return handleOffsetFetch(dec, enc, apiVersion)
+		return handleOffsetFetch(dec, enc, store, apiVersion)
 	default:
 		// Unsupported API?
 		// We should return some error code, but since formatting depends on API...
@@ -248,47 +249,55 @@ func handleLeaveGroup(dec *Decoder, enc *Encoder, version int16) ([]byte, error)
 	return enc.Bytes(), nil
 }
 
-func handleOffsetCommit(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
-	// This is needed for the consumer to actually "commit" offsets.
-	// OffsetCommit V0:
-	// GroupID
-	// Topics Array [Topic -> Partitions Array [Partition -> Offset, Metadata]]
+func handleOffsetCommit(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
+	groupID, _ := dec.String()
+	topicCount, _ := dec.Int32()
 
-	// Stub: consume and ignore
-	dec.String() // Group
-	cnt, _ := dec.Int32()
-	for i := 0; i < int(cnt); i++ {
-		dec.String() // Topic
-		pcnt, _ := dec.Int32()
-		for j := 0; j < int(pcnt); j++ {
-			dec.Int32()  // Partition
-			dec.Int64()  // Offset
-			dec.String() // Metadata (nullable?) V0 has string? V1+? V0 has string.
+	// We need to buffer the response structure to write it after processing
+	// Response: TopicArray [TopicName, PartitionArray [PartitionID, ErrorCode]]
+
+	// To simplify: We process and write immediately.
+	// NOTE: If request parsing fails, we might produce partial response.
+
+	// Wait, we need to read ALL request first?
+	// Usually Handler decodes then acts then encodes.
+	// For MVP we can stream read/write if strict order.
+
+	// BUT `enc` is append-only.
+	// V0 Request: GroupID, TopicArray...
+	// V0 Response: TopicArray...
+
+	enc.Int32(topicCount)
+
+	for i := int32(0); i < topicCount; i++ {
+		topic, _ := dec.String()
+		enc.String(topic)
+
+		partCount, _ := dec.Int32()
+		enc.Int32(partCount)
+
+		for j := int32(0); j < partCount; j++ {
+			partition, _ := dec.Int32()
+			offset, _ := dec.Int64()
+			_, _ = dec.String() // Metadata
+
+			// SAVE OFFSET
+			err := GlobalCoordinator.CommitOffset(store, groupID, topic, partition, offset)
+
+			enc.Int32(partition)
+			if err != nil {
+				log.Printf("Error committing offset group=%s topic=%s part=%d off=%d: %v", groupID, topic, partition, offset, err)
+				enc.Int16(ErrUnknown)
+			} else {
+				enc.Int16(ErrNone)
+			}
 		}
 	}
-
-	enc.Int16(0)
-	// Response V0: Array of [Topic -> Array [Partition -> ErrorCode]]
-	// We parsed it, so we need to construct matching response structure...
-	// Too complex to stub cleanly without parsing correctly.
-	// If kcat asks for it, it expects structure.
-
-	// Let's assume for MVP kcat simple consumer does NOT commit unless configured.
-	// Actually, high level consumer DOES commit.
-
-	// Quick Fix: Return empty encoded bytes? No client will crash.
-	// Valid Response:
-	// Array(0) - No topics error?
-	// If client sent topics, it expects topics in response.
-
-	// Given complexity, let's return Error "Unsupported" at top level if possible?
-	// V0 response is just Array.
-	enc.Int32(0)
 
 	return enc.Bytes(), nil
 }
 
-func handleOffsetFetch(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
+func handleOffsetFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
 	// OffsetFetch Request V1:
 	// GroupID (string)
 	// Topics Array (int32)
@@ -314,10 +323,19 @@ func handleOffsetFetch(dec *Decoder, enc *Encoder, version int16) ([]byte, error
 		for j := 0; j < int(partitionCount); j++ {
 			partition, _ := dec.Int32()
 
+			// LOAD OFFSET
+			offset, err := GlobalCoordinator.FetchOffset(store, groupID, topic, partition)
+
 			enc.Int32(partition)
-			enc.Int64(-1)      // Offset: -1 (Unknown/Start)
-			enc.String("")     // Metadata
-			enc.Int16(ErrNone) // ErrorCode
+			if err != nil || offset == -1 {
+				enc.Int64(-1) // Unknown
+				enc.String("")
+				enc.Int16(ErrNone)
+			} else {
+				enc.Int64(offset)
+				enc.String("") // Metadata
+				enc.Int16(ErrNone)
+			}
 		}
 	}
 
