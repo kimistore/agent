@@ -16,8 +16,10 @@ func (m *MockObjectStore) Put(ctx context.Context, key string, data io.Reader) e
 func (m *MockObjectStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return nil, nil
 }
-func (m *MockObjectStore) List(ctx context.Context, prefix string) ([]string, error) { return nil, nil }
-func (m *MockObjectStore) Delete(ctx context.Context, key string) error              { return nil }
+func (m *MockObjectStore) List(ctx context.Context, prefix string) ([]storage.ObjectMetadata, error) {
+	return nil, nil
+}
+func (m *MockObjectStore) Delete(ctx context.Context, key string) error { return nil }
 
 func TestAdminHandlers(t *testing.T) {
 	// Setup
@@ -27,7 +29,7 @@ func TestAdminHandlers(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	engine, err := storage.NewStorageEngine(tmpDir, &MockObjectStore{}, "test-bucket")
+	engine, err := storage.NewStorageEngine(tmpDir, &MockObjectStore{}, "test-bucket", storage.RetentionConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -32,9 +32,11 @@ type StorageEngine struct {
 	// Buffer for offsets (groupID/topic/partition -> offset)
 	offsetBuf   map[string]int64
 	offsetBufMu sync.Mutex
+
+	retentionCfg RetentionConfig
 }
 
-func NewStorageEngine(walDir string, objStore ObjectStore, bucket string) (*StorageEngine, error) {
+func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retentionCfg RetentionConfig) (*StorageEngine, error) {
 	mgr, err := wal.NewManager(walDir)
 	if err != nil {
 		return nil, err
@@ -48,12 +50,14 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string) (*Stor
 		quit:         make(chan struct{}),
 		segmentCache: make(map[string][]string),
 		offsetBuf:    make(map[string]int64),
+		retentionCfg: retentionCfg,
 	}
 
-	// Start background uploader and offset flusher
-	se.wg.Add(2)
+	// Start background uploader, offset flusher, and retention loop
+	se.wg.Add(3)
 	go se.uploaderLoop()
 	go se.offsetFlusherLoop()
+	go se.retentionLoop()
 
 	return se, nil
 }
@@ -120,11 +124,17 @@ func (s *StorageEngine) Read(topic string, partition int32, offset int64) ([]byt
 		if bestKey == "" {
 			// Actually list S3
 			ctx := context.TODO()
-			keys, err := s.objStore.List(ctx, prefix)
+			objects, err := s.objStore.List(ctx, prefix)
 			if err != nil {
 				s.cacheMu.Unlock()
 				return nil, fmt.Errorf("failed to list s3: %v", err)
 			}
+
+			var keys []string
+			for _, o := range objects {
+				keys = append(keys, o.Key)
+			}
+
 			s.segmentCache[cacheKey] = keys
 			bestKey = findBestKey(keys)
 		}

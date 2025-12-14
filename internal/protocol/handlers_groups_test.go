@@ -16,7 +16,7 @@ func TestGroupObservabilityHandlers(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	engine, err := storage.NewStorageEngine(tmpDir, &MockObjectStore{}, "test-bucket")
+	engine, err := storage.NewStorageEngine(tmpDir, &MockObjectStore{}, "test-bucket", storage.RetentionConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}

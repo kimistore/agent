@@ -49,16 +49,28 @@ func (m *MockObjectStore) Get(ctx context.Context, key string) (io.ReadCloser, e
 	return io.NopCloser(bytes.NewReader(b)), nil
 }
 
-func (m *MockObjectStore) List(ctx context.Context, prefix string) ([]string, error) {
+func (m *MockObjectStore) List(ctx context.Context, prefix string) ([]storage.ObjectMetadata, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var keys []string
-	for k := range m.data {
+	var results []storage.ObjectMetadata
+	for k, v := range m.data {
 		if strings.HasPrefix(k, prefix) {
-			keys = append(keys, k)
+			results = append(results, storage.ObjectMetadata{
+				Key:  k,
+				Size: int64(len(v)),
+				// LastModified: 0, // Mock infinite age or set current time? 0 is fine.
+				LastModified: time.Now().Unix(),
+			})
 		}
 	}
-	return keys, nil
+	return results, nil
+}
+
+func (m *MockObjectStore) Delete(ctx context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.data, key)
+	return nil
 }
 
 func main() {
@@ -70,7 +82,7 @@ func main() {
 
 	store := NewMockObjectStore()
 
-	engine, err := storage.NewStorageEngine(walDir, store, "test-bucket")
+	engine, err := storage.NewStorageEngine(walDir, store, "test-bucket", storage.RetentionConfig{})
 	if err != nil {
 		log.Fatal(err)
 	}

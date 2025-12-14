@@ -77,6 +77,11 @@ func TestPartitionWAL_Roll(t *testing.T) {
 	}
 	defer p.Close()
 
+	// Override MaxSegmentSize for test
+	originalSize := MaxSegmentSize
+	MaxSegmentSize = 1024 * 1024
+	defer func() { MaxSegmentSize = originalSize }()
+
 	// Fill up close to 1MB
 	// MaxSegmentSize is 1MB.
 	// Let's write 500KB chunks.

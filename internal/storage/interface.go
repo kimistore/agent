@@ -19,10 +19,18 @@ type Engine interface {
 	Close() error
 }
 
+// ObjectMetadata contains information about a stored object.
+type ObjectMetadata struct {
+	Key          string
+	Size         int64
+	LastModified int64 // Unix timestamp
+}
+
 // ObjectStore is the abstraction for the cold storage layer (S3, GCS, File).
 type ObjectStore interface {
 	Put(ctx context.Context, key string, r io.Reader) error
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
-	List(ctx context.Context, prefix string) ([]string, error)
+	List(ctx context.Context, prefix string) ([]ObjectMetadata, error)
+	Delete(ctx context.Context, key string) error
 	// Range(key string, start, end int64) (io.ReadCloser, error) // Future optimization
 }

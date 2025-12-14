@@ -7,6 +7,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+
+	"go-stream/internal/storage"
 )
 
 type Store struct {
@@ -54,8 +56,8 @@ func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return out.Body, nil
 }
 
-func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
-	var keys []string
+func (s *Store) List(ctx context.Context, prefix string) ([]storage.ObjectMetadata, error) {
+	var results []storage.ObjectMetadata
 	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.bucket),
 		Prefix: aws.String(prefix),
@@ -67,8 +69,23 @@ func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
 			return nil, err
 		}
 		for _, obj := range page.Contents {
-			keys = append(keys, *obj.Key)
+			meta := storage.ObjectMetadata{
+				Key:  *obj.Key,
+				Size: *obj.Size,
+			}
+			if obj.LastModified != nil {
+				meta.LastModified = obj.LastModified.Unix()
+			}
+			results = append(results, meta)
 		}
 	}
-	return keys, nil
+	return results, nil
+}
+
+func (s *Store) Delete(ctx context.Context, key string) error {
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	return err
 }
