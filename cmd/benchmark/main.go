@@ -119,6 +119,62 @@ func main() {
 	sec := duration.Seconds()
 
 	fmt.Printf("Done in %.2f seconds.\n", sec)
-	fmt.Printf("Throughput: %.2f MB/sec\n", mb/sec)
-	fmt.Printf("Throughput: %.2f msgs/sec\n", float64(totalMsgs)/sec)
+	fmt.Printf("Produce Throughput: %.2f MB/sec\n", mb/sec)
+	fmt.Printf("Produce Throughput: %.2f msgs/sec\n", float64(totalMsgs)/sec)
+
+	// 5. Consume Benchmark
+	fmt.Println("\nStarting Consume Benchmark...")
+
+	// Reset connection for reading (or dial new one to be safe)
+	conn.Close()
+	conn, err = kafka.DialLeader(context.Background(), "tcp", brokerAddr, topic, 0)
+	if err != nil {
+		log.Fatalf("Failed to dial leader for consume: %v", err)
+	}
+	defer conn.Close()
+
+	// Seek to beginning
+	if _, err := conn.Seek(0, kafka.SeekStart); err != nil {
+		log.Fatalf("Failed to seek: %v", err)
+	}
+
+	// Pre-start timer
+	startConsume := time.Now()
+
+	consumedCount := 0
+	for consumedCount < totalMsgs {
+		// Read a new batch
+		batchReader := conn.ReadBatch(1, 10*1024*1024) // min 1 byte, max 10MB
+
+		for {
+			_, err := batchReader.ReadMessage()
+			if err != nil {
+				if err == io.EOF {
+					break // Batch finished, fetch next one
+				}
+				log.Printf("Consume error: %v", err)
+				batchReader.Close()
+				goto DoneConsume // Break out of outer loop on error
+			}
+			consumedCount++
+			if consumedCount%5000 == 0 {
+				fmt.Printf("Consumed %d/%d messages...\r", consumedCount, totalMsgs)
+			}
+			if consumedCount >= totalMsgs {
+				batchReader.Close()
+				goto DoneConsume
+			}
+		}
+		batchReader.Close()
+	}
+DoneConsume:
+	fmt.Println()
+
+	durationConsume := time.Since(startConsume)
+	mbConsume := float64(totalBytes) / (1024 * 1024)
+	secConsume := durationConsume.Seconds()
+
+	fmt.Printf("Consume Done in %.2f seconds.\n", secConsume)
+	fmt.Printf("Consume Throughput: %.2f MB/sec\n", mbConsume/secConsume)
+	fmt.Printf("Consume Throughput: %.2f msgs/sec\n", float64(totalMsgs)/secConsume)
 }

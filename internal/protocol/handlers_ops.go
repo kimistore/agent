@@ -234,12 +234,10 @@ func handleFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, versi
 				// I should update it to return nextOffset too.
 
 				// Simpler hack: We assume we read *some* messages.
-				// If we read exactly one wrapper from WAL, we know nextOffset = fetchOffset + 1
-				// (because my WAL stores 1 batch per offset in simple index).
 				// YES! My WAL Append increments offset by 1 per "Batch".
 				// So if we read successfully, HWMark is at least fetchOffset + 1.
 
-				enc.Int64(fetchOffset + 1) // HighwaterMark
+				enc.Int64(hw) // HighwaterMark
 				// enc.Int32(int32(len(data))) // PutBytes adds this
 				enc.PutBytes(data) // MessageSet raw
 			}

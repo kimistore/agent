@@ -199,11 +199,26 @@ func scanStreamForOffset(r io.Reader, targetOffset int64) ([]byte, error) {
 			data := make([]byte, msgSize)
 			_, err := io.ReadFull(r, data)
 
-			// PATCH: Rewrite the offset in the MessageSet to match the WAL offset.
+			// PATCH: Rewrite the offsets in the MessageSet to match the WAL sequence.
 			// The stored data is a MessageSet (Offset+Size+Msg).
-			// The producer sent it with relative/zero offset. We must serve it with the actual log offset.
-			if len(data) >= 8 {
-				binary.BigEndian.PutUint64(data[0:8], uint64(targetOffset))
+			// We need to update all offsets in the batch to be monotonic starting from targetOffset.
+
+			pos := 0
+			currentOff := targetOffset
+			for pos <= len(data)-12 {
+				// data[pos : pos+8] is offset
+				size := binary.BigEndian.Uint32(data[pos+8 : pos+12])
+				totalLen := 12 + int(size)
+
+				if pos+totalLen > len(data) {
+					break
+				}
+
+				// Rewrite offset
+				binary.BigEndian.PutUint64(data[pos:pos+8], uint64(currentOff))
+
+				pos += totalLen
+				currentOff++
 			}
 
 			return data, err
