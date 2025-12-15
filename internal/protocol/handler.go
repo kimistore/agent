@@ -438,7 +438,7 @@ func handleMetadata(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ve
 	log.Println("Handling Metadata Request...")
 
 	if requestedTopic == "" {
-		requestedTopic = "my-topic" // Default for testing
+		requestedTopic = "bench-topic" // Default for testing/benchmark
 	}
 
 	// 1. Brokers
