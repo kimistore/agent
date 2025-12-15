@@ -23,7 +23,9 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 		return nil, err
 	}
 
-	log.Printf("Produce: Acks=%d Timeout=%d", acks, timeout)
+	// log.Printf("Produce: Acks=%d Timeout=%d", acks, timeout)
+	_ = acks
+	_ = timeout
 
 	// Topics Array
 	count, err := dec.Int32()
@@ -100,18 +102,20 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 			enc.Int32(partition)
 			if err != nil {
 				log.Printf("Storage append error: %v", err)
-				enc.Int16(10) // Error: MessageSizeTooLarge or similar? 10=MessageSizeTooLarge, 1=OffsetOutOfRange...
+				enc.Int16(10) // Error: MessageSizeTooLarge
 				// Generic error: 1 unknown
 				enc.Int64(-1)
 				if version >= 2 {
 					enc.Int64(-1) // LogAppendTime
 				}
+				log.Printf("Produce Resp: Topic=%s Partition=%d Error=10", topic, partition)
 			} else {
 				enc.Int16(0) // No Error
 				enc.Int64(offset)
 				if version >= 2 {
 					enc.Int64(-1) // LogAppendTime
 				}
+				// log.Printf("Produce Resp: Topic=%s Partition=%d Offset=%d Error=0", topic, partition, offset)
 			}
 		}
 	}
@@ -121,6 +125,9 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 		enc.Int32(0)
 	}
 
+	if acks == 0 {
+		return nil, nil
+	}
 	return enc.Bytes(), nil
 }
 
@@ -146,7 +153,10 @@ func handleFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, versi
 		return nil, err
 	}
 
-	log.Printf("Fetch: Replica=%d Wait=%d MinBytes=%d", replicaID, maxWait, minBytes)
+	// log.Printf("Fetch: Replica=%d Wait=%d MinBytes=%d", replicaID, maxWait, minBytes)
+	_ = replicaID
+	_ = maxWait
+	_ = minBytes
 
 	// We are ignoring Long Polling (MaxWait) for MVP phase.
 

@@ -64,7 +64,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
 
-	log.Printf("New connection from %s", conn.RemoteAddr())
+	// log.Printf("New connection from %s", conn.RemoteAddr())
 
 	for {
 		// 1. Read Message Size (int32)
@@ -92,7 +92,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return // Or close connection on protocol error
 		}
 
-		log.Printf("Sending Response: Size=%d", len(resp))
+		if resp == nil {
+			// No response needed (e.g. Acks=0)
+			continue
+		}
+
+		// log.Printf("Sending Response: Size=%d", len(resp))
 		// log.Printf("Response Hex: %x", resp)
 
 		// 4. Send Response

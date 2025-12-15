@@ -7,6 +7,8 @@ import (
 	"io"
 	"log"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go-stream/internal/server"
@@ -32,7 +34,14 @@ func (m *MockObjectStore) List(ctx context.Context, prefix string) ([]storage.Ob
 func (m *MockObjectStore) Delete(ctx context.Context, key string) error { return nil }
 
 func main() {
-	// 1. Setup Storage
+	// 1. Config
+	numPartitions := 4
+	numConsumers := 4
+	totalMsgs := 100000 // Increased total messages
+	msgSize := 1024
+	batchSize := 1000
+
+	// 2. Setup Storage
 	tmpDir, err := os.MkdirTemp("", "bench-wal")
 	if err != nil {
 		log.Fatal(err)
@@ -40,17 +49,13 @@ func main() {
 	defer os.RemoveAll(tmpDir)
 
 	mockS3 := &MockObjectStore{}
-	// Use default retention (infinite) or small to avoid disk fill?
-	// The uploader deletes local files immediately after upload (which is fake here).
-	// So disk usage should be low.
-
 	engine, err := storage.NewStorageEngine(tmpDir, mockS3, "bench-bucket", storage.RetentionConfig{})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer engine.Close()
 
-	// 2. Setup Server
+	// 3. Setup Server
 	port := "19092"
 	srv := server.NewServer(":"+port, engine)
 	go func() {
@@ -60,121 +65,124 @@ func main() {
 	}()
 	defer srv.Stop()
 
-	// Wait for server to start
 	time.Sleep(1 * time.Second)
 
-	// 3. Setup Producer
-	topic := "bench-topic"
-	// Ensure topic exists (creates partitions)
-	engine.CreateTopic(topic, 1)
+	// 4. Create Topic with 4 Partitions
+	topic := "bench-multi"
+	if err := engine.CreateTopic(topic, int32(numPartitions)); err != nil {
+		log.Fatalf("Failed to create topic: %v", err)
+	}
+	fmt.Printf("Created topic %s with %d partitions.\n", topic, numPartitions)
 
 	brokerAddr := "localhost:" + port
-
-	fmt.Println("Dialing leader...")
-	// DialLeader will trigger a Metadata request.
-	conn, err := kafka.DialLeader(context.Background(), "tcp", brokerAddr, topic, 0)
-	if err != nil {
-		log.Fatalf("Failed to dial leader: %v", err)
-	}
-	defer conn.Close()
-
-	// Optimize TCP
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-
-	// 4. Benchmark Loop
-	msgSize := 1024 // 1KB messages
 	payload := make([]byte, msgSize)
 	rand.Read(payload)
 
-	totalMsgs := 50000
-	batchSize := 1000
-	fmt.Printf("Starting benchmark: %d messages of %d bytes...\n", totalMsgs, msgSize)
+	// 5. Produce Benchmark (Distributed)
+	fmt.Printf("Starting Produce Benchmark (%d msgs, %d partitions)...\n", totalMsgs, numPartitions)
+	startProduce := time.Now()
 
-	start := time.Now()
+	// Use kafka.Writer with RoundRobin balancer to distribute messages
+	writer := &kafka.Writer{
+		Addr:       kafka.TCP(brokerAddr),
+		Topic:      topic,
+		Balancer:   &kafka.RoundRobin{},
+		BatchSize:  batchSize,
+		BatchBytes: 10 * 1024 * 1024,
+	}
+	defer writer.Close()
 
 	msgs := make([]kafka.Message, batchSize)
 	for i := 0; i < batchSize; i++ {
-		msgs[i] = kafka.Message{
-			Value: payload,
-		}
+		msgs[i] = kafka.Message{Value: payload}
 	}
 
 	batches := totalMsgs / batchSize
 	for i := 0; i < batches; i++ {
-		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		_, err := conn.WriteMessages(msgs...)
-		if err != nil {
-			log.Printf("Write failed: %v", err)
-			break
+		if err := writer.WriteMessages(context.Background(), msgs...); err != nil {
+			log.Fatalf("Write failed: %v", err)
 		}
-		if (i+1)%100 == 0 {
+		if (i+1)%10 == 0 {
 			fmt.Printf("Sent %d/%d messages...\r", (i+1)*batchSize, totalMsgs)
 		}
 	}
 	fmt.Println()
 
-	duration := time.Since(start)
+	durProduce := time.Since(startProduce)
 	totalBytes := int64(totalMsgs * msgSize)
 	mb := float64(totalBytes) / (1024 * 1024)
-	sec := duration.Seconds()
+	sec := durProduce.Seconds()
 
-	fmt.Printf("Done in %.2f seconds.\n", sec)
-	fmt.Printf("Produce Throughput: %.2f MB/sec\n", mb/sec)
-	fmt.Printf("Produce Throughput: %.2f msgs/sec\n", float64(totalMsgs)/sec)
+	fmt.Printf("Produce Done in %.2f s.\n", sec)
+	fmt.Printf("Throughput: %.2f MB/sec (%.0f msgs/sec)\n", mb/sec, float64(totalMsgs)/sec)
 
-	// 5. Consume Benchmark
-	fmt.Println("\nStarting Consume Benchmark...")
+	// 6. Consume Benchmark (Parallel)
+	fmt.Printf("\nStarting Consume Benchmark (%d consumers)...\n", numConsumers)
 
-	// Reset connection for reading (or dial new one to be safe)
-	conn.Close()
-	conn, err = kafka.DialLeader(context.Background(), "tcp", brokerAddr, topic, 0)
-	if err != nil {
-		log.Fatalf("Failed to dial leader for consume: %v", err)
-	}
-	defer conn.Close()
+	var wg sync.WaitGroup
+	wg.Add(numConsumers)
 
-	// Seek to beginning
-	if _, err := conn.Seek(0, kafka.SeekStart); err != nil {
-		log.Fatalf("Failed to seek: %v", err)
-	}
-
-	// Pre-start timer
+	var totalConsumed int64
 	startConsume := time.Now()
 
-	consumedCount := 0
-	for consumedCount < totalMsgs {
-		// Read a new batch
-		batchReader := conn.ReadBatch(1, 10*1024*1024) // min 1 byte, max 10MB
+	for i := 0; i < numConsumers; i++ {
+		pID := i
+		go func(partitionID int) {
+			defer wg.Done()
 
-		for {
-			_, err := batchReader.ReadMessage()
+			conn, err := kafka.DialLeader(context.Background(), "tcp", brokerAddr, topic, partitionID)
 			if err != nil {
-				if err == io.EOF {
-					break // Batch finished, fetch next one
+				log.Printf("Consumer %d dial failed: %v", partitionID, err)
+				return
+			}
+			defer conn.Close()
+
+			if _, err := conn.Seek(0, kafka.SeekStart); err != nil {
+				log.Printf("Consumer %d seek failed: %v", partitionID, err)
+				return
+			}
+
+			// 10s timeout per batch loop? No, refreshing deadline
+
+			for {
+				if atomic.LoadInt64(&totalConsumed) >= int64(totalMsgs) {
+					break
 				}
-				log.Printf("Consume error: %v", err)
+
+				conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+				batchReader := conn.ReadBatch(1, 10*1024*1024)
+
+				for {
+					_, err := batchReader.ReadMessage()
+					if err != nil {
+						// Batch exhausted or error (EOF usually means end of batch)
+						break
+					}
+					// Increment global counter
+					val := atomic.AddInt64(&totalConsumed, 1)
+					if val >= int64(totalMsgs) {
+						break
+					}
+				}
 				batchReader.Close()
-				goto DoneConsume // Break out of outer loop on error
 			}
-			consumedCount++
-			if consumedCount%5000 == 0 {
-				fmt.Printf("Consumed %d/%d messages...\r", consumedCount, totalMsgs)
-			}
-			if consumedCount >= totalMsgs {
-				batchReader.Close()
-				goto DoneConsume
-			}
-		}
-		batchReader.Close()
+		}(pID)
 	}
-DoneConsume:
-	fmt.Println()
 
-	durationConsume := time.Since(startConsume)
-	mbConsume := float64(totalBytes) / (1024 * 1024)
-	secConsume := durationConsume.Seconds()
+	// Wait loop for completion instead of wg.Wait() which waits for timeout
+	for {
+		c := atomic.LoadInt64(&totalConsumed)
+		if c >= int64(totalMsgs) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
-	fmt.Printf("Consume Done in %.2f seconds.\n", secConsume)
-	fmt.Printf("Consume Throughput: %.2f MB/sec\n", mbConsume/secConsume)
-	fmt.Printf("Consume Throughput: %.2f msgs/sec\n", float64(totalMsgs)/secConsume)
+	wg.Wait() // Wait for all consumer goroutines to finish their cleanup (e.g., defer conn.Close())
+
+	durConsume := time.Since(startConsume)
+	secConsume := durConsume.Seconds()
+
+	fmt.Printf("Consume Done in %.2f s.\n", secConsume)
+	fmt.Printf("Throughput: %.2f MB/sec (%.0f msgs/sec)\n", mb/secConsume, float64(totalMsgs)/secConsume)
 }
