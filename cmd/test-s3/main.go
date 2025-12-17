@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"go-stream/internal/storage/s3"
+	"kimistore/internal/storage/s3"
 )
 
 func main() {
@@ -27,7 +27,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	key := "test-warpstream/hello.txt"
+	key := "test-kimistore/hello.txt"
 	body := "Hello Object Storage!"
 
 	fmt.Printf("Uploading to %s/%s...\n", bucket, key)

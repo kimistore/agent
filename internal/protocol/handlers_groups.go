@@ -1,7 +1,7 @@
 package protocol
 
 import (
-	"go-stream/internal/storage"
+	"kimistore/internal/storage"
 )
 
 func handleListGroups(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {

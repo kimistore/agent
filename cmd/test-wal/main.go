@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	"go-stream/internal/storage/wal"
+	"kimistore/internal/storage/wal"
 )
 
 func main() {
@@ -22,7 +22,7 @@ func main() {
 	partition := int32(0)
 
 	// Write
-	msg := []byte("Hello WarpStream!")
+	msg := []byte("Hello Kimistore!")
 	off, err := mgr.Append(topic, partition, msg, 1)
 	if err != nil {
 		log.Fatal(err)

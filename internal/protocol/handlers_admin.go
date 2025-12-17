@@ -3,7 +3,7 @@ package protocol
 import (
 	"log"
 
-	"go-stream/internal/storage"
+	"kimistore/internal/storage"
 )
 
 func handleCreateTopics(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {

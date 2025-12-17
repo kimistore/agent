@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"go-stream/internal/storage/wal"
+	"kimistore/internal/storage/wal"
 )
 
 type StorageEngine struct {

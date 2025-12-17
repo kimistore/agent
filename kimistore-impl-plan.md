@@ -1,8 +1,8 @@
-# warpstream-impl-plan.md
+# kimistore-impl-plan.md
 
 ## Overview
 
-This document outlines a comprehensive plan to re-implement a **WarpStream-like** Kafka-compatible streaming platform in **Go**, utilizing **Object Storage (S3)** as the primary storage backend. 
+This document outlines a comprehensive plan to implement **Kimistore**, a Kafka-compatible streaming platform in **Go**, utilizing **Object Storage (S3)** as the primary storage backend. 
 
 Per the requirements, this implementation will adopt the **AutoMQ storage architecture**, specifically the **S3WAL** concept, to achieve low-latency writes while leveraging the cost-effectiveness and scalability of object storage.
 
@@ -147,7 +147,7 @@ We will target the **15 Core APIs** necessary for a functional streaming platfor
 ## 5. Next Steps
 
 To begin immediately, I recommend starting with **Phase 1 & 2** concurrently:
-1.  **Scaffold the project**: `go mod init warpstream-clone`.
+1.  **Scaffold the project**: `go mod init kimistore`.
 2.  **Define the Storage Interface**: Create the Go interfaces for the WAL and Object Store.
 3.  **Prototypes**: Write a simple "Append-Only Log" that offloads to MinIO (S3 compatible) in the background.
 

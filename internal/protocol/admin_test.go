@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"go-stream/internal/storage"
+	"kimistore/internal/storage"
 )
 
 type MockObjectStore struct{}

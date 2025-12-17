@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 
-	"go-stream/internal/storage"
+	"kimistore/internal/storage"
 )
 
 func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {

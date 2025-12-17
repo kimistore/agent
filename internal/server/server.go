@@ -7,8 +7,8 @@ import (
 	"net"
 	"sync"
 
-	"go-stream/internal/protocol"
-	"go-stream/internal/storage"
+	"kimistore/internal/protocol"
+	"kimistore/internal/storage"
 )
 
 type Server struct {

@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"go-stream/internal/storage"
-	"go-stream/internal/storage/wal"
+	"kimistore/internal/storage"
+	"kimistore/internal/storage/wal"
 )
 
 // MockObjectStore

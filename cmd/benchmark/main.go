@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"go-stream/internal/server"
-	"go-stream/internal/storage"
+	"kimistore/internal/server"
+	"kimistore/internal/storage"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -84,11 +84,12 @@ func main() {
 
 	// Use kafka.Writer with RoundRobin balancer to distribute messages
 	writer := &kafka.Writer{
-		Addr:       kafka.TCP(brokerAddr),
-		Topic:      topic,
-		Balancer:   &kafka.RoundRobin{},
-		BatchSize:  batchSize,
-		BatchBytes: 10 * 1024 * 1024,
+		Addr:         kafka.TCP(brokerAddr),
+		Topic:        topic,
+		Balancer:     &kafka.RoundRobin{},
+		BatchSize:    batchSize,
+		BatchBytes:   10 * 1024 * 1024,
+		RequiredAcks: kafka.RequireAll,
 	}
 	defer writer.Close()
 

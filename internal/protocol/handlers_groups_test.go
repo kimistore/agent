@@ -4,8 +4,8 @@ import (
 	"os"
 	"testing"
 
-	"go-stream/internal/coordinator"
-	"go-stream/internal/storage"
+	"kimistore/internal/coordinator"
+	"kimistore/internal/storage"
 )
 
 func TestGroupObservabilityHandlers(t *testing.T) {

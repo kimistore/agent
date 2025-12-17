@@ -7,13 +7,13 @@ import (
 	"os/signal"
 	"syscall"
 
-	"go-stream/internal/server"
-	"go-stream/internal/storage"
-	"go-stream/internal/storage/s3"
+	"kimistore/internal/server"
+	"kimistore/internal/storage"
+	"kimistore/internal/storage/s3"
 )
 
 func main() {
-	log.Println("Starting WarpStream-clone Agent...")
+	log.Println("Starting Kimistore Agent...")
 
 	// Setup Storage
 	ctx := context.TODO()

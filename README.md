@@ -1,8 +1,8 @@
-# Go-Stream
+# Kimistore
 
-**Go-Stream** is a lightweight, cloud-native streaming platform built in Go. It is designed to be protocol-compatible with Apache Kafka but re-architected to run on top of commodity Object Storage (like S3) without local disks or heavy dependencies like ZooKeeper.
+**Kimistore** is a lightweight, cloud-native streaming platform built in Go. It is designed to be protocol-compatible with Apache Kafka but re-architected to run on top of commodity Object Storage (like S3) without local disks or heavy dependencies like ZooKeeper.
 
-This project is an educational re-implementation inspired by the architecture of [WarpStream](https://www.warpstream.com/). The goal is to separate compute from storage, allowing for stateless agents that can scale instantly while durable data resides cheaply and safely in object storage.
+This project is a Apache Kafka® - compatible data streaming agent. The goal is to separate compute from storage, allowing for stateless agents that can scale instantly while durable data resides cheaply and safely in object storage.
 
 ## 🚀 Project Goal
 
@@ -61,7 +61,7 @@ The following Kafka API Keys are currently implemented:
 ## 🛠 Usage
 
 ### Prerequisites
-*   Go 1.22+
+*   Go 1.25+
 *   S3-compatible bucket (or local filesystem simulation)
 *   `kcat` (recommended for testing)
 

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"log"
 
-	"go-stream/internal/coordinator"
-	"go-stream/internal/storage"
+	"kimistore/internal/coordinator"
+	"kimistore/internal/storage"
 )
 
 // ... constants ...
@@ -458,7 +458,7 @@ func handleMetadata(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ve
 
 	// ClusterID (string) - Added in V2
 	if version >= 2 {
-		enc.String("warpstream-cluster")
+		enc.String("kimistore-cluster")
 	}
 
 	// ControllerID (int32) - Added in V1
