@@ -90,6 +90,7 @@ func main() {
 		BatchSize:    batchSize,
 		BatchBytes:   10 * 1024 * 1024,
 		RequiredAcks: kafka.RequireAll,
+		Compression:  kafka.Gzip,
 	}
 	defer writer.Close()
 
