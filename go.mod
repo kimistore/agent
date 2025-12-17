@@ -6,6 +6,8 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.41.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.5
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.93.2
+	github.com/golang/snappy v1.0.0
+	github.com/pierrec/lz4/v4 v4.1.22
 	github.com/segmentio/kafka-go v0.4.49
 )
 
@@ -27,5 +29,4 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.5 // indirect
 	github.com/aws/smithy-go v1.24.0 // indirect
 	github.com/klauspost/compress v1.15.9 // indirect
-	github.com/pierrec/lz4/v4 v4.1.15 // indirect
 )

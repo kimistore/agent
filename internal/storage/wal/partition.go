@@ -27,7 +27,8 @@ type PartitionWAL struct {
 	currentSize      int64
 
 	nextOffset int64
-	index      map[int64]int64 // Offset -> Position in active file (only for active segment)
+	index      map[int64]int64 // Offset -> Position
+	offsets    []int64         // Sorted list of offsets in active file
 
 	mu sync.Mutex
 }
@@ -168,10 +169,22 @@ func (p *PartitionWAL) findMaxSealedOffset() (int64, error) {
 		}
 		offset := int64(binary.BigEndian.Uint64(header[0:8]))
 		size := binary.BigEndian.Uint32(header[8:12])
-		if offset >= endOffset {
-			endOffset = offset + 1
+
+		// To correctly determine endOffset, we must read the body and count
+		body := make([]byte, size)
+		if _, err := io.ReadFull(f, body); err != nil {
+			break
 		}
-		f.Seek(int64(size), io.SeekCurrent)
+
+		count := CountMessageSet(body)
+		if count == 0 {
+			count = 1
+		} // Safety
+
+		next := offset + int64(count)
+		if next > endOffset {
+			endOffset = next
+		}
 	}
 
 	return endOffset, nil
@@ -180,6 +193,7 @@ func (p *PartitionWAL) findMaxSealedOffset() (int64, error) {
 func (p *PartitionWAL) recoverActive() error {
 	p.activeFile.Seek(0, 0)
 	pos := int64(0)
+	p.offsets = nil
 
 	for {
 		header := make([]byte, 12)
@@ -194,18 +208,28 @@ func (p *PartitionWAL) recoverActive() error {
 		size := binary.BigEndian.Uint32(header[8:12])
 
 		p.index[offset] = pos
-		if offset >= p.nextOffset {
-			p.nextOffset = offset + 1
+		p.offsets = append(p.offsets, offset)
+
+		// Read body to count
+		body := make([]byte, size)
+		if _, err := io.ReadFull(p.activeFile, body); err != nil {
+			return err
 		}
 
-		if _, err := p.activeFile.Seek(int64(size), io.SeekCurrent); err != nil {
-			return err
+		count := CountMessageSet(body)
+		if count == 0 {
+			count = 1
+		}
+
+		next := offset + int64(count)
+		if next > p.nextOffset {
+			p.nextOffset = next
 		}
 
 		pos += 12 + int64(size)
 	}
 
-	p.activeFile.Seek(0, 2)
+	// offsets are appended in order naturally from log scan
 	return nil
 }
 
@@ -245,6 +269,7 @@ func (p *PartitionWAL) Append(batch []byte, recordCount int) (int64, error) {
 
 	p.currentSize += int64(n1 + n2)
 	p.index[offset] = pos
+	p.offsets = append(p.offsets, offset)
 
 	// Increment nextOffset by the number of records
 	if recordCount < 1 {
@@ -282,6 +307,7 @@ func (p *PartitionWAL) roll() error {
 
 	// Clear index for active segment (past segments are not indexed in memory for MVP)
 	p.index = make(map[int64]int64)
+	p.offsets = nil
 
 	return nil
 }
@@ -290,9 +316,33 @@ func (p *PartitionWAL) Read(offset int64) ([]byte, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Check active
-	if pos, ok := p.index[offset]; ok {
-		return p.readFromFile(p.activeFile, pos)
+	// Check active using binary search on offsets
+	// Find largest startOffset <= offset
+	idx := sort.Search(len(p.offsets), func(i int) bool {
+		return p.offsets[i] > offset
+	})
+	// idx is where p.offsets[i] > offset.
+	// So p.offsets[idx-1] <= offset.
+	// However, if idx == 0, it means p.offsets[0] > offset, so no element <= offset.
+	// If idx == len, it means all elements <= offset.
+
+	searchIdx := idx - 1
+	if searchIdx >= 0 && searchIdx < len(p.offsets) {
+		startOffset := p.offsets[searchIdx]
+		pos := p.index[startOffset]
+
+		// If found, verify it covers the offset
+		data, err := p.readFromFile(p.activeFile, pos)
+		if err == nil {
+			// Check coverage requires count.
+			count := CountMessageSet(data)
+			if count == 0 {
+				count = 1
+			}
+			if startOffset+int64(count) > offset {
+				return data, nil
+			}
+		}
 	}
 
 	// Not in active. Check sealed files?
@@ -329,16 +379,45 @@ func (p *PartitionWAL) readFromFile(f *os.File, pos int64) ([]byte, error) {
 
 	msgOffset := int64(binary.BigEndian.Uint64(header[0:8]))
 
-	// PATCH: Rewrite the offsets in the MessageSet
+	// Determine total count (recursive)
+	totalCount := CountMessageSet(body)
+	if totalCount == 0 {
+		totalCount = 1
+	}
+
+	// Patch offsets
 	offsetPos := 0
 	currentOff := msgOffset
+
+	// Check if we have a single compressed wrapper
+	// A wrapper implies shallowCount == 1 and totalCount > 1
+	// Or simply if Attributes says compressed.
+	// But simply: if shallow entries loop only finds 1 entry, and totalCount > 1.
+
+	shallowCount := 0
+	checkPos := 0
+	for checkPos <= len(body)-12 {
+		entrySize := binary.BigEndian.Uint32(body[checkPos+8 : checkPos+12])
+		checkPos += 12 + int(entrySize)
+		shallowCount++
+	}
+
+	isCompressedWrapper := (shallowCount == 1 && totalCount > 1)
+
 	for offsetPos <= len(body)-12 {
-		size := binary.BigEndian.Uint32(body[offsetPos+8 : offsetPos+12])
-		totalLen := 12 + int(size)
+		entrySize := binary.BigEndian.Uint32(body[offsetPos+8 : offsetPos+12])
+		totalLen := 12 + int(entrySize)
 		if offsetPos+totalLen > len(body) {
 			break
 		}
-		binary.BigEndian.PutUint64(body[offsetPos:offsetPos+8], uint64(currentOff))
+
+		writeOff := currentOff
+		if isCompressedWrapper {
+			// Use Last Offset
+			writeOff = msgOffset + int64(totalCount) - 1
+		}
+
+		binary.BigEndian.PutUint64(body[offsetPos:offsetPos+8], uint64(writeOff))
 		offsetPos += totalLen
 		currentOff++
 	}

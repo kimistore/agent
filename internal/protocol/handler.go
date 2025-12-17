@@ -398,7 +398,7 @@ func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
 		enc.Int16(maxV)
 	}
 
-	writeEntry(ApiKeyProduce, 0, 2)
+	writeEntry(ApiKeyProduce, 0, 3)
 	writeEntry(ApiKeyFetch, 0, 2)
 	writeEntry(ApiKeyListOffsets, 0, 1)
 	writeEntry(ApiKeyMetadata, 0, 2)

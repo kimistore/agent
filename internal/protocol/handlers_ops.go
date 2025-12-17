@@ -1,11 +1,11 @@
 package protocol
 
 import (
-	"encoding/binary"
 	"fmt"
 	"log"
 
 	"kimistore/internal/storage"
+	"kimistore/internal/storage/wal"
 )
 
 func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
@@ -89,7 +89,7 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 
 			// APPEND TO STORAGE
 			// Parse batch to count messages (MessageSet V0/V1)
-			recordCount := countMessageSet(batchData)
+			recordCount := wal.CountMessageSet(batchData)
 			if recordCount == 0 {
 				// Empty batch? or parse error?
 				// Just fallback to 1 to avoid sticking offset
@@ -108,7 +108,6 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 				if version >= 2 {
 					enc.Int64(-1) // LogAppendTime
 				}
-				log.Printf("Produce Resp: Topic=%s Partition=%d Error=10", topic, partition)
 			} else {
 				enc.Int16(0) // No Error
 				enc.Int64(offset)
@@ -255,24 +254,4 @@ func handleFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, versi
 	}
 
 	return enc.Bytes(), nil
-}
-
-func countMessageSet(data []byte) int {
-	count := 0
-	pos := 0
-	// MessageSet Entry: Offset(8) + Size(4) + Msg(Size)
-	for pos <= len(data)-12 {
-		// Offset is data[pos : pos+8] (We don't need value)
-		// Size is data[pos+8 : pos+12]
-		size := binary.BigEndian.Uint32(data[pos+8 : pos+12])
-
-		totalLen := 12 + int(size)
-		if pos+totalLen > len(data) {
-			break
-		}
-
-		count++
-		pos += totalLen
-	}
-	return count
 }
