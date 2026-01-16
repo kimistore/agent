@@ -10,34 +10,50 @@ import (
 
 // ... constants ...
 const (
-	ApiKeyProduce         = 0
-	ApiKeyFetch           = 1
-	ApiKeyListOffsets     = 2
-	ApiKeyMetadata        = 3
-	ApiKeyOffsetCommit    = 8
-	ApiKeyOffsetFetch     = 9
-	ApiKeyFindCoordinator = 10
-	ApiKeyJoinGroup       = 11
-	ApiKeyHeartbeat       = 12
-	ApiKeyLeaveGroup      = 13
-	ApiKeySyncGroup       = 14
-	ApiKeyApiVersions     = 18
-	ApiKeyCreateTopics    = 19
-	ApiKeyDeleteTopics    = 20
-	ApiKeyDescribeGroups  = 15
-	ApiKeyListGroups      = 16
+	ApiKeyProduce          = 0
+	ApiKeyFetch            = 1
+	ApiKeyListOffsets      = 2
+	ApiKeyMetadata         = 3
+	ApiKeyOffsetCommit     = 8
+	ApiKeyOffsetFetch      = 9
+	ApiKeyFindCoordinator  = 10
+	ApiKeyJoinGroup        = 11
+	ApiKeyHeartbeat        = 12
+	ApiKeyLeaveGroup       = 13
+	ApiKeySyncGroup        = 14
+	ApiKeyDescribeGroups   = 15
+	ApiKeyListGroups       = 16
+	ApiKeySaslHandshake    = 17
+	ApiKeyApiVersions      = 18
+	ApiKeyCreateTopics     = 19
+	ApiKeyDeleteTopics     = 20
+	ApiKeySaslAuthenticate = 36
 )
 
 const (
-	ErrNone                     = 0
-	ErrUnknown                  = -1
-	ErrUnknownTopicOrPartition  = 3
-	ErrGroupAuthorizationFailed = 30
-	ErrUnsupportedVersion       = 35
-	ErrTopicAlreadyExists       = 36
+	ErrNone                       = 0
+	ErrUnknown                    = -1
+	ErrUnknownTopicOrPartition    = 3
+	ErrGroupAuthorizationFailed   = 30
+	ErrClusterAuthorizationFailed = 31
+	ErrUnsupportedVersion         = 35
+	ErrTopicAlreadyExists         = 36
+	ErrSaslAuthenticationFailed   = 58
+	ErrUnsupportedSaslMechanism   = 33
+	ErrIllegalSaslState           = 34
 )
 
-func HandleRequest(data []byte, store *storage.StorageEngine) ([]byte, error) {
+type Session struct {
+	Authenticated bool
+	User          string
+}
+
+type AuthConfig struct {
+	Username string
+	Password string
+}
+
+func HandleRequest(data []byte, store *storage.StorageEngine, session *Session, authConfig AuthConfig) ([]byte, error) {
 	dec := NewDecoder(data)
 
 	// Parse Header
@@ -69,7 +85,42 @@ func HandleRequest(data []byte, store *storage.StorageEngine) ([]byte, error) {
 	// Response Header: CorrelationID
 	enc.Int32(correlationID)
 
+	// Check Authentication
+	// If auth is configured, we only allow ApiVersions, SaslHandshake, SaslAuthenticate
+	// OR if session is authenticated.
+	authRequired := authConfig.Username != ""
+	isAuthRelated := apiKey == ApiKeySaslHandshake || apiKey == ApiKeySaslAuthenticate || apiKey == ApiKeyApiVersions
+
+	if authRequired && !session.Authenticated && !isAuthRelated {
+		log.Printf("Unauthenticated access attempt: ApiKey=%d ClientID=%s", apiKey, clientID)
+		// Return appropriate error.
+		// For many APIs, ClusterAuthorizationFailed or GroupAuthorizationFailed is appropriate.
+		// NOTE: Some clients might strictly expect standard ErrorCode in response body.
+		// We try to handle it.
+		// But first, switch on ApiKey to dispatch correctly, but implement auth check inside or here?
+		// If we do it here, we must know the response format.
+		// Most responses start with ErrorCode (int16) exceptions:
+		// - Produce: Array
+		// - Metadata: Array
+		// - etc.
+		// Simplest for now: Let specific handlers check?
+		// Or generic failure with best guess?
+		// Let's create a generic "AuthFailed" responder?
+		// No, it's complex because every response schema is different.
+		// Strategy: Pass session/auth to handlers or check at top of each case?
+		// Better: We check here and return a specific "Auth Error" for known schemas.
+		// For MVP, if we return error from HandleRequest, Server just closes connection?
+		// That is arguably safer for unauth access.
+		// BUT standard Kafka clients might retry infinitely if connection closes without error.
+		// Let's implement a 'handleAuthFailure' helper or just close connection for now.
+		return nil, fmt.Errorf("authentication required")
+	}
+
 	switch apiKey {
+	case ApiKeySaslHandshake:
+		return handleSaslHandshake(dec, enc, apiVersion)
+	case ApiKeySaslAuthenticate:
+		return handleSaslAuthenticate(dec, enc, apiVersion, session, authConfig)
 	case ApiKeyProduce:
 		return handleProduce(dec, enc, store, apiVersion)
 	case ApiKeyFetch:
@@ -386,8 +437,9 @@ func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
 	// Listing: Produce, Fetch, ListOffsets, Metadata, ApiVersions
 	// Supported: Produce(0-2), Fetch(0-2), ListOffsets(0-1), Metadata(0-2), ApiVersions(0)
 	// + Group APIs: OffsetCommit(0), OffsetFetch(0-1), FindCoordinator(0), JoinGroup(0), SyncGroup(0), Heartbeat(0), LeaveGroup(0)
+	// + SASL: SaslHandshake(0-1), SaslAuthenticate(0)
 
-	numKeys := 16
+	numKeys := 18
 	enc.Int32(int32(numKeys)) // Array length is int32 usually?
 	// careful: Array length in V0 is int32.
 
@@ -414,6 +466,8 @@ func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
 	writeEntry(ApiKeyDeleteTopics, 0, 0)
 	writeEntry(ApiKeyListGroups, 0, 0)
 	writeEntry(ApiKeyDescribeGroups, 0, 0)
+	writeEntry(ApiKeySaslHandshake, 0, 1)
+	writeEntry(ApiKeySaslAuthenticate, 0, 0)
 
 	return enc.Bytes(), nil
 }
@@ -525,5 +579,92 @@ func handleMetadata(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ve
 	}
 
 	log.Println("Metadata Response encoded.")
+	return enc.Bytes(), nil
+}
+
+func handleSaslHandshake(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
+	// SaslHandshake Request V0:
+	// Mechanism (string)
+
+	// SaslHandshake Request V1:
+	// Mechanism (string)
+
+	mech, err := dec.String()
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("SaslHandshake: Mechanism=%s Version=%d", mech, version)
+
+	// We only support PLAIN
+	if mech == "PLAIN" {
+		enc.Int16(ErrNone)
+		enc.Int32(1)        // Enabled Mechanisms Array Length
+		enc.String("PLAIN") // Mechanism
+	} else {
+		enc.Int16(ErrUnsupportedSaslMechanism)
+		enc.Int32(1)
+		enc.String("PLAIN")
+	}
+
+	return enc.Bytes(), nil
+}
+
+func handleSaslAuthenticate(dec *Decoder, enc *Encoder, version int16, session *Session, authConfig AuthConfig) ([]byte, error) {
+	// SaslAuthenticate Request V0:
+	// AuthBytes (bytes)
+
+	authBytes, err := dec.Bytes()
+	if err != nil {
+		return nil, err
+	}
+
+	// SASL PLAIN format: [AuthorizationID] NULL [AuthenticationID] NULL [Password]
+	// We typically ignore AuthorizationID.
+	// We expect: \x00 username \x00 password
+	// Or: authorized_user \x00 username \x00 password
+
+	parts := make([][]byte, 0)
+	last := 0
+	for i := 0; i < len(authBytes); i++ {
+		if authBytes[i] == 0 {
+			parts = append(parts, authBytes[last:i])
+			last = i + 1
+		}
+	}
+	parts = append(parts, authBytes[last:])
+
+	var username, password string
+	if len(parts) == 3 {
+		// normal case
+		// parts[0] is authz id (usually empty)
+		username = string(parts[1])
+		password = string(parts[2])
+	} else {
+		log.Printf("SaslAuthenticate: Invalid PLAIN payload format. Parts=%d", len(parts))
+		enc.Int16(ErrSaslAuthenticationFailed)
+		enc.String("Invalid SASL PLAIN payload")
+		// SaslAuth Response V0:
+		// ErrorCode (int16)
+		// ErrorMessage (string)
+		// AuthBytes (bytes)
+		enc.PutBytes(nil)
+		return enc.Bytes(), nil
+	}
+
+	log.Printf("SaslAuthenticate: user=%s", username)
+
+	if username == authConfig.Username && password == authConfig.Password {
+		session.Authenticated = true
+		session.User = username
+		enc.Int16(ErrNone)
+		enc.String("")    // No error message
+		enc.PutBytes(nil) // No auth bytes
+	} else {
+		log.Printf("SaslAuthenticate: Authentication failed for user=%s", username)
+		enc.Int16(ErrSaslAuthenticationFailed)
+		enc.String("Authentication failed")
+		enc.PutBytes(nil)
+	}
+
 	return enc.Bytes(), nil
 }

@@ -57,7 +57,7 @@ func main() {
 
 	// 3. Setup Server
 	port := "19092"
-	srv := server.NewServer(":"+port, engine)
+	srv := server.NewServer(":"+port, engine, "", "")
 	go func() {
 		if err := srv.Start(); err != nil {
 			log.Printf("Server stopped: %v", err)

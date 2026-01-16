@@ -31,7 +31,9 @@ func main() {
 	}
 	defer engine.Close()
 
-	srv := server.NewServer(":19092", engine)
+	saslUser := os.Getenv("SASL_USERNAME")
+	saslPassword := os.Getenv("SASL_PASSWORD")
+	srv := server.NewServer(":19092", engine, saslUser, saslPassword)
 
 	go func() {
 		if err := srv.Start(); err != nil {

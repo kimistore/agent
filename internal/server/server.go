@@ -12,18 +12,23 @@ import (
 )
 
 type Server struct {
-	addr     string
-	listener net.Listener
-	quit     chan struct{}
-	wg       sync.WaitGroup
-	storage  *storage.StorageEngine
+	addr       string
+	listener   net.Listener
+	quit       chan struct{}
+	wg         sync.WaitGroup
+	storage    *storage.StorageEngine
+	authConfig protocol.AuthConfig
 }
 
-func NewServer(addr string, storage *storage.StorageEngine) *Server {
+func NewServer(addr string, storage *storage.StorageEngine, saslUser, saslPassword string) *Server {
 	return &Server{
 		addr:    addr,
 		quit:    make(chan struct{}),
 		storage: storage,
+		authConfig: protocol.AuthConfig{
+			Username: saslUser,
+			Password: saslPassword,
+		},
 	}
 }
 
@@ -66,6 +71,10 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	// log.Printf("New connection from %s", conn.RemoteAddr())
 
+	session := &protocol.Session{
+		Authenticated: false,
+	}
+
 	for {
 		// 1. Read Message Size (int32)
 		headerBuf := make([]byte, 4)
@@ -86,7 +95,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 
 		// 3. Process Request
-		resp, err := protocol.HandleRequest(bodyBuf, s.storage)
+		resp, err := protocol.HandleRequest(bodyBuf, s.storage, session, s.authConfig)
 		if err != nil {
 			log.Printf("Protocol error: %v", err)
 			return // Or close connection on protocol error
