@@ -48,7 +48,7 @@ The following Kafka API Keys are currently implemented:
 | **OffsetCommit** | 8 | Save consumer group offsets to Object Store. | ✅ Active (S3) |
 | **OffsetFetch** | 9 | Retrieve consumer group offsets from Object Store. | ✅ Active (S3) |
 | **FindCoordinator** | 10 | Locate the group coordinator. | ✅ Active |
-| **JoinGroup** | 11 | Register a consumer member. | ✅ Active |
+| **JoinGroup** | 11 | Register a consumer member. | ✅ Active (V0-V1) |
 | **Heartbeat** | 12 | Keep member session alive. | ✅ Active |
 | **LeaveGroup** | 13 | Graceful consumer shutdown. | ✅ Active |
 | **SyncGroup** | 14 | Distribute partition assignments. | ✅ Active |

@@ -78,7 +78,7 @@ func (c *Coordinator) GetGroup(groupID string) *Group {
 	return g
 }
 
-func (c *Coordinator) JoinGroup(groupID, memberID, protocolType string, protocols []GroupProtocol, sessionTimeout int32) (string, int32, string, []MemberMetadata, error) {
+func (c *Coordinator) JoinGroup(groupID, memberID, protocolType string, protocols []GroupProtocol, sessionTimeout int32, rebalanceTimeout int32) (string, int32, string, []MemberMetadata, error) {
 	g := c.GetGroup(groupID)
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -90,11 +90,12 @@ func (c *Coordinator) JoinGroup(groupID, memberID, protocolType string, protocol
 
 	// 2. Add/Update Member
 	g.Members[memberID] = &MemberMetadata{
-		MemberID:       memberID,
-		SessionTimeout: sessionTimeout,
-		ProtocolType:   protocolType,
-		Protocols:      protocols,
-		Heartbeat:      time.Now(),
+		MemberID:         memberID,
+		SessionTimeout:   sessionTimeout,
+		RebalanceTimeout: rebalanceTimeout,
+		ProtocolType:     protocolType,
+		Protocols:        protocols,
+		Heartbeat:        time.Now(),
 	}
 
 	if g.ProtocolType == "" {

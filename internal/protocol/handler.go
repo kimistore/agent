@@ -78,8 +78,11 @@ func HandleRequest(data []byte, store *storage.StorageEngine, session *Session, 
 		return nil, err
 	}
 
-	log.Printf("Request: ApiKey=%d Version=%d CorrelationID=%d ClientID=%s",
-		apiKey, apiVersion, correlationID, clientID)
+	// Silence high-volume requests like Fetch (1)
+	if apiKey != ApiKeyFetch {
+		log.Printf("Request: ApiKey=%d Version=%d CorrelationID=%d ClientID=%s",
+			apiKey, apiVersion, correlationID, clientID)
+	}
 
 	enc := NewEncoder()
 	// Response Header: CorrelationID
@@ -198,6 +201,14 @@ func handleJoinGroup(dec *Decoder, enc *Encoder, version int16) ([]byte, error) 
 	// JoinGroup Request V0:
 	groupID, _ := dec.String()
 	sessionTimeout, _ := dec.Int32()
+
+	var rebalanceTimeout int32
+	if version >= 1 {
+		rebalanceTimeout, _ = dec.Int32()
+	} else {
+		rebalanceTimeout = sessionTimeout
+	}
+
 	memberID, _ := dec.String()
 	protocolType, _ := dec.String()
 
@@ -210,10 +221,10 @@ func handleJoinGroup(dec *Decoder, enc *Encoder, version int16) ([]byte, error) 
 		protocols = append(protocols, coordinator.GroupProtocol{Name: name, Metadata: meta})
 	}
 
-	log.Printf("JoinGroup: Group=%s Member=%s ProtocolType=%s", groupID, memberID, protocolType)
+	log.Printf("JoinGroup: Group=%s Member=%s ProtocolType=%s RebalanceTimeout=%d", groupID, memberID, protocolType, rebalanceTimeout)
 
 	// Call Coordinator
-	newMemberID, generationID, leaderID, members, err := GlobalCoordinator.JoinGroup(groupID, memberID, protocolType, protocols, sessionTimeout)
+	newMemberID, generationID, leaderID, members, err := GlobalCoordinator.JoinGroup(groupID, memberID, protocolType, protocols, sessionTimeout, rebalanceTimeout)
 
 	errorCode := int16(ErrNone)
 	if err != nil {
@@ -458,7 +469,7 @@ func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
 	writeEntry(ApiKeyOffsetCommit, 0, 0)
 	writeEntry(ApiKeyOffsetFetch, 0, 1)
 	writeEntry(ApiKeyFindCoordinator, 0, 0)
-	writeEntry(ApiKeyJoinGroup, 0, 0)
+	writeEntry(ApiKeyJoinGroup, 0, 1)
 	writeEntry(ApiKeySyncGroup, 0, 0)
 	writeEntry(ApiKeyHeartbeat, 0, 0)
 	writeEntry(ApiKeyLeaveGroup, 0, 0)

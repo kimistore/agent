@@ -28,7 +28,7 @@ func TestGroupObservabilityHandlers(t *testing.T) {
 	protocols := []coordinator.GroupProtocol{
 		{Name: "range", Metadata: []byte{}},
 	}
-	_, _, _, _, err = GlobalCoordinator.JoinGroup("test-group-obs", "member-1", "consumer", protocols, 10000)
+	_, _, _, _, err = GlobalCoordinator.JoinGroup("test-group-obs", "member-1", "consumer", protocols, 10000, 10000)
 	if err != nil {
 		t.Fatal(err)
 	}

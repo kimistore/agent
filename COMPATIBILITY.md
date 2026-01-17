@@ -4,11 +4,12 @@
 This server implements a subset of the Kafka Protocol (primarily V0-V2). It is designed to be compatible with standard Kafka clients, but strictly for **Simple Producer** and **Simple Consumer** workflows.
 
 ### Supported Features
-*   **Protocol Versions**: Kafka 0.10.x era (ApiVersions V0, Produce V2, Fetch V2, Metadata V2).
+*   **Protocol Versions**: Kafka 0.10.x era (ApiVersions V0, Produce V2, Fetch V2, Metadata V2, JoinGroup V1).
 *   **Message Format**: MessageSet V0/V1 (Legacy).
     *   *Note*: Modern clients sending RecordBatch V2 (Kafka 0.11+) will be treated as opaque batches. They will succeed, but offset increments will be 1 per batch rather than 1 per message.
 *   **Discovery**: `Metadata` requests work for topic/partition discovery.
 *   **Data Persistence**: Full S3 offloading supported.
+*   **KIP-62 Support**: Background heartbeats supported via `JoinGroup` V1 (RebalanceTimeout).
 
 ### Limitations (What WON'T work)
 1.  **Consumer Groups**: Features like `group.id`, auto-balancing, and offset committing (`FindCoordinator`, `JoinGroup`, etc.) are **NOT implemented**.
