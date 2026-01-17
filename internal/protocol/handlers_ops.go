@@ -210,28 +210,33 @@ func handleFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, versi
 			// READ FROM STORAGE
 			hw := store.HighWaterMark(topic, partition)
 
+			// Fast Path: If at HW, return empty immediately without checking storage (avoids S3 calls)
+			if fetchOffset == hw {
+				enc.Int32(partition)
+				enc.Int16(0)  // No Error
+				enc.Int64(hw) // HighwaterMark
+				enc.Int32(0)  // MessageSetSize 0
+				continue
+			}
+			if fetchOffset > hw {
+				enc.Int32(partition)
+				enc.Int16(1) // OffsetOutOfRange
+				enc.Int64(hw)
+				enc.Int32(0)
+				continue
+			}
+
 			data, err := store.Read(topic, partition, fetchOffset)
 
 			enc.Int32(partition)
 			if err != nil {
-				// If requested offset is >= HighWaterMark, return NoError and empty data
-				if fetchOffset == hw {
-					enc.Int16(0)  // No Error
-					enc.Int64(hw) // HighwaterMark
-					enc.Int32(0)  // MessageSetSize 0
-				} else if fetchOffset > hw {
-					enc.Int16(1) // OffsetOutOfRange
-					enc.Int64(hw)
-					enc.Int32(0)
-				} else {
-					// Actual read error (e.g. data lost/corrupt or unexpected)
-					// If it's "not found" but < hw, it implies gap or deleted.
-					// For now, treat as OffsetOutOfRange to force client reset?
-					// Or Unknown (1).
-					enc.Int16(1)
-					enc.Int64(hw)
-					enc.Int32(0)
-				}
+				// Actual read error (e.g. data lost/corrupt or unexpected)
+				// If it's "not found" but < hw, it implies gap or deleted.
+				// For now, treat as OffsetOutOfRange to force client reset?
+				// Or Unknown (1).
+				enc.Int16(1)
+				enc.Int64(hw)
+				enc.Int32(0)
 			} else {
 				enc.Int16(0) // No error
 				// HighwaterMark: Next offset. We don't track it easily yet from Read().

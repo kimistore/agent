@@ -18,8 +18,8 @@ func main() {
 	// Setup Storage
 	ctx := context.TODO()
 
-	bucket := "test-warpstream-us-east-1-andy"
-	store, err := s3.NewStore(ctx, bucket, "us-east-1")
+	bucket := "kimistore"
+	store, err := s3.NewStore(ctx, bucket, "garage")
 	if err != nil {
 		log.Fatalf("Failed to init S3: %v", err)
 	}

@@ -23,7 +23,9 @@ func NewStore(ctx context.Context, bucket string, region string) (*Store, error)
 		return nil, err
 	}
 
-	client := s3.NewFromConfig(cfg)
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+	})
 	return &Store{
 		client: client,
 		bucket: bucket,
