@@ -58,6 +58,10 @@ func (m *MockStore) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+func (m *MockStore) GetRange(ctx context.Context, key string, start, length int64) (io.ReadCloser, error) {
+	return nil, nil // TODO: Implement if needed for tests
+}
+
 func TestRetention_Size(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "retention_size")
 	defer os.RemoveAll(tmpDir)

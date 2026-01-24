@@ -2,6 +2,7 @@ package s3
 
 import (
 	"context"
+	"fmt"
 	"io"
 
 	"os"
@@ -95,4 +96,17 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 		Key:    aws.String(key),
 	})
 	return err
+}
+
+func (s *Store) GetRange(ctx context.Context, key string, start, length int64) (io.ReadCloser, error) {
+	rangeHeader := aws.String(fmt.Sprintf("bytes=%d-%d", start, start+length-1))
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+		Range:  rangeHeader,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out.Body, nil
 }

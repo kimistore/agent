@@ -73,6 +73,24 @@ func (m *MockObjectStore) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+func (m *MockObjectStore) GetRange(ctx context.Context, key string, start, length int64) (io.ReadCloser, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fmt.Printf("[MockS3] GetRange %s start=%d len=%d\n", key, start, length)
+	b, ok := m.data[key]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	if start >= int64(len(b)) {
+		return nil, io.EOF
+	}
+	end := start + length
+	if end > int64(len(b)) {
+		end = int64(len(b))
+	}
+	return io.NopCloser(bytes.NewReader(b[start:end])), nil
+}
+
 func main() {
 	walDir := "./tmp-storage-test-wal"
 	os.RemoveAll(walDir) // cleanup

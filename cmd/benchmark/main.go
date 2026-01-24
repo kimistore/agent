@@ -32,6 +32,9 @@ func (m *MockObjectStore) List(ctx context.Context, prefix string) ([]storage.Ob
 	return nil, nil
 }
 func (m *MockObjectStore) Delete(ctx context.Context, key string) error { return nil }
+func (m *MockObjectStore) GetRange(ctx context.Context, key string, start, length int64) (io.ReadCloser, error) {
+	return nil, nil
+}
 
 func main() {
 	// 1. Config

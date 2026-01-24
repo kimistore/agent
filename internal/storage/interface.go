@@ -32,5 +32,5 @@ type ObjectStore interface {
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
 	List(ctx context.Context, prefix string) ([]ObjectMetadata, error)
 	Delete(ctx context.Context, key string) error
-	// Range(key string, start, end int64) (io.ReadCloser, error) // Future optimization
+	GetRange(ctx context.Context, key string, start, length int64) (io.ReadCloser, error)
 }

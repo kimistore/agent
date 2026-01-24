@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"kimistore/internal/storage/index"
 	"kimistore/internal/storage/wal"
 )
 
@@ -161,8 +163,68 @@ func (s *StorageEngine) Read(topic string, partition int32, offset int64) ([]byt
 		return nil, fmt.Errorf("offset %d not found in verified segments", offset)
 	}
 
-	// Download and Scan
+	// Indexed Read Logic
 	ctx := context.TODO()
+	indexKey := strings.TrimSuffix(bestKey, ".log") + ".index"
+
+	// Try to get index
+	// Optimization: Cache index? For MVP, just fetch it. It's small.
+	indexReader, err := s.objStore.Get(ctx, indexKey)
+	var shouldUseIndex = false
+	var indexBytes []byte
+
+	if err == nil {
+		indexBytes, err = io.ReadAll(indexReader)
+		indexReader.Close()
+		if err == nil && len(indexBytes) > 0 {
+			shouldUseIndex = true
+		}
+	}
+
+	if shouldUseIndex {
+		// Lookup Position
+		// Need baseOffset from filename
+		parts := strings.Split(bestKey, "/")
+		filename := parts[len(parts)-1]
+		baseName := strings.TrimSuffix(filename, ".log")
+		baseOffset, _ := strconv.ParseInt(baseName, 10, 64)
+
+		pos, err := index.Lookup(indexBytes, offset, baseOffset)
+		if err == nil {
+			// Range Read!
+			// We read from pos to end (or a chunk).
+			// If we don't know end, we can read to end of object.
+			// But ObjectStore.GetRange needs length.
+			// Ideally we know size. `Get` might return size or we Listed it.
+			// s.segmentCache could store size? For now, we don't have size easily.
+			// Let's assume we read 1MB or similar, or just use GetRange with large length if supported?
+			// Standard S3 Range: bytes=X- (to end).
+			// Our interface GetRange takes length.
+			// If we pass -1 as length? Or very large?
+			// Let's use GetRange with a reasonable chunk (e.g. 10MB) or just standard Get if interface limits.
+			// Wait, I designed GetRange(start, length).
+			// If I don't know size, I can't effectively fetch "rest of file".
+			// But wait, `List` returned metadata including Size!
+			// `segmentCache` stores KEYS.
+			// We could enhance segmentCache to store Metadata.
+			// OR for MVP: Just fallback to full read if we don't know size, OR just guess large.
+
+			// Actually, let's use a large number. S3 ignores out of range.
+			// "bytes=X-Y". If Y > size, S3 returns up to size.
+			const FetchSize = 10 * 1024 * 1024 // 10MB
+
+			rc, err := s.objStore.GetRange(ctx, bestKey, pos, FetchSize)
+			if err == nil {
+				defer rc.Close()
+				// We need to scan from the start of this range (which corresponds to `pos` in file)
+				// `scanStreamForOffset` assumes it's reading a stream of messages.
+				// Since `pos` points to start of a message (guaranteed by index), it should work perfectly.
+				return scanStreamForOffset(rc, offset)
+			}
+		}
+	}
+
+	// Fallback to Full Download
 	rc, err := s.objStore.Get(ctx, bestKey)
 	if err != nil {
 		return nil, err
@@ -237,6 +299,9 @@ func scanStreamForOffset(r io.Reader, targetOffset int64) ([]byte, error) {
 
 		// Count messages to see coverage
 		count := wal.CountMessageSet(data)
+		if count == 0 {
+			count = 1
+		}
 		endOffset := msgOffset + int64(count)
 
 		if targetOffset < endOffset {
@@ -378,8 +443,25 @@ func (s *StorageEngine) uploadSegments() {
 		filename := parts[2]
 
 		key := fmt.Sprintf("%s/%s/%s", topic, partition, filename)
+		indexKey := strings.TrimSuffix(key, ".log") + ".index"
 
 		log.Printf("Uploading segment %s -> s3://%s/%s", rel, s.bucket, key)
+
+		// 1. Generate Index
+		baseOffset, _ := strconv.ParseInt(strings.TrimSuffix(filename, ".log"), 10, 64)
+		indexData, err := index.GenerateIndex(path, baseOffset)
+		if err != nil {
+			log.Printf("Error generating index for %s: %v", path, err)
+			// Continue without index? Or failing?
+			// PROD: Maybe fail. MVP: Log and skip index.
+		} else if len(indexData) > 0 {
+			// Upload Index
+			if err := s.objStore.Put(context.Background(), indexKey, bytes.NewReader(indexData)); err != nil {
+				log.Printf("Failed to upload index %s: %v", indexKey, err)
+			} else {
+				log.Printf("Uploaded index %s", indexKey)
+			}
+		}
 
 		f, err := os.Open(path)
 		if err != nil {
