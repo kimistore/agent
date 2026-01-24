@@ -34,6 +34,8 @@ type StorageEngine struct {
 	offsetBufMu sync.Mutex
 
 	retentionCfg RetentionConfig
+
+	metadataCache *MetadataCache
 }
 
 func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retentionCfg RetentionConfig) (*StorageEngine, error) {
@@ -43,14 +45,20 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 	}
 
 	se := &StorageEngine{
-		walMgr:       mgr,
-		objStore:     objStore,
-		bucket:       bucket,
-		walDir:       walDir,
-		quit:         make(chan struct{}),
-		segmentCache: make(map[string][]string),
-		offsetBuf:    make(map[string]int64),
-		retentionCfg: retentionCfg,
+		walMgr:        mgr,
+		objStore:      objStore,
+		bucket:        bucket,
+		walDir:        walDir,
+		quit:          make(chan struct{}),
+		segmentCache:  make(map[string][]string),
+		offsetBuf:     make(map[string]int64),
+		retentionCfg:  retentionCfg,
+		metadataCache: NewMetadataCache(),
+	}
+
+	// Load Cache from WAL
+	if err := se.metadataCache.Load(walDir); err != nil {
+		log.Printf("Warning: Failed to load metadata cache: %v", err)
 	}
 
 	// Start background uploader, offset flusher, and retention loop
@@ -63,6 +71,8 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 }
 
 func (s *StorageEngine) Append(topic string, partition int32, batch []byte, recordCount int) (int64, error) {
+	// Update Cache (Idempotent)
+	s.metadataCache.AddPartition(topic, partition)
 	return s.walMgr.Append(topic, partition, batch, recordCount)
 }
 
@@ -165,7 +175,14 @@ func (s *StorageEngine) HighWaterMark(topic string, partition int32) int64 {
 }
 
 func (s *StorageEngine) CreateTopic(topic string, partitions int32) error {
-	return s.walMgr.CreateTopic(topic, partitions)
+	err := s.walMgr.CreateTopic(topic, partitions)
+	if err == nil {
+		s.metadataCache.AddTopic(topic)
+		for i := int32(0); i < partitions; i++ {
+			s.metadataCache.AddPartition(topic, i)
+		}
+	}
+	return err
 }
 
 func (s *StorageEngine) DeleteTopic(topic string) error {
@@ -173,7 +190,11 @@ func (s *StorageEngine) DeleteTopic(topic string) error {
 	// For MVP, deleting local WAL is mostly what we control.
 	// Deleting from S3 needs LIST + DELETE which is heavy.
 	// We'll leave S3 cleanup for later or async process.
-	return s.walMgr.DeleteTopic(topic)
+	err := s.walMgr.DeleteTopic(topic)
+	if err == nil {
+		s.metadataCache.RemoveTopic(topic)
+	}
+	return err
 }
 
 func scanStreamForOffset(r io.Reader, targetOffset int64) ([]byte, error) {
@@ -466,37 +487,9 @@ func (s *StorageEngine) LoadOffset(groupID, topic string, partition int32) (int6
 }
 
 func (e *StorageEngine) GetTopicCount() int {
-	entries, err := os.ReadDir(e.walDir)
-	if err != nil {
-		return 0
-	}
-	count := 0
-	for _, entry := range entries {
-		if entry.IsDir() {
-			count++
-		}
-	}
-	return count
+	return e.metadataCache.GetTopicCount()
 }
 
 func (e *StorageEngine) GetPartitionCount() int {
-	entries, err := os.ReadDir(e.walDir)
-	if err != nil {
-		return 0
-	}
-	count := 0
-	for _, entry := range entries {
-		if entry.IsDir() {
-			// This is a topic directory. Count its subdirectories (partitions).
-			parts, err := os.ReadDir(filepath.Join(e.walDir, entry.Name()))
-			if err == nil {
-				for _, p := range parts {
-					if p.IsDir() {
-						count++
-					}
-				}
-			}
-		}
-	}
-	return count
+	return e.metadataCache.GetPartitionCount()
 }
