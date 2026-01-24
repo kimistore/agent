@@ -56,16 +56,22 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 		metadataCache: NewMetadataCache(),
 	}
 
-	// Load Cache from WAL
+	// Load Cache from Checkpoint first
+	if err := se.LoadCheckpoint(); err != nil {
+		log.Printf("Info: No checkpoint found or failed to load: %v (will rely on WAL)", err)
+	}
+
+	// Load/Merge Cache from WAL
 	if err := se.metadataCache.Load(walDir); err != nil {
 		log.Printf("Warning: Failed to load metadata cache: %v", err)
 	}
 
-	// Start background uploader, offset flusher, and retention loop
-	se.wg.Add(3)
+	// Start background uploader, offset flusher, retention, and checkpoint loop
+	se.wg.Add(4)
 	go se.uploaderLoop()
 	go se.offsetFlusherLoop()
 	go se.retentionLoop()
+	go se.checkpointLoop()
 
 	return se, nil
 }
@@ -446,9 +452,8 @@ func (s *StorageEngine) flushOffsets() {
 	for k, v := range s.offsetBuf {
 		todo[k] = v
 	}
+
 	// Clear buffer (assume we will succeed or retry in next call if we failed? MVP: simple clear)
-	// Actually better to clear only what we process. But for offsets, last write wins.
-	// We can just clear.
 	s.offsetBuf = make(map[string]int64)
 	s.offsetBufMu.Unlock()
 
@@ -461,6 +466,63 @@ func (s *StorageEngine) flushOffsets() {
 			log.Printf("Failed to flush offset %s: %v", s3Key, err)
 		}
 	}
+}
+
+func (s *StorageEngine) checkpointLoop() {
+	defer s.wg.Done()
+	// Checkpoint every 30 seconds
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.quit:
+			s.SaveCheckpoint()
+			return
+		case <-ticker.C:
+			s.SaveCheckpoint()
+		}
+	}
+}
+
+func (s *StorageEngine) SaveCheckpoint() error {
+	data, err := s.metadataCache.ToJSON()
+	if err != nil {
+		return err
+	}
+	key := "_meta/checkpoint.json"
+
+	ctx := context.Background()
+	// Use bytes reader
+	r := strings.NewReader(string(data))
+	if err := s.objStore.Put(ctx, key, r); err != nil {
+		log.Printf("Failed to save checkpoint: %v", err)
+		return err
+	}
+	log.Printf("Saved metadata checkpoint to %s (%d bytes)", key, len(data))
+	return nil
+}
+
+func (s *StorageEngine) LoadCheckpoint() error {
+	key := "_meta/checkpoint.json"
+	ctx := context.Background()
+
+	r, err := s.objStore.Get(ctx, key)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+
+	if err := s.metadataCache.FromJSON(data); err != nil {
+		return err
+	}
+	log.Printf("Loaded metadata cache from checkpoint %s (%d bytes)", key, len(data))
+	return nil
 }
 
 func (s *StorageEngine) LoadOffset(groupID, topic string, partition int32) (int64, error) {

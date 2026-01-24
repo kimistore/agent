@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,23 +14,23 @@ type MetadataCache struct {
 }
 
 type TopicState struct {
-	Partitions map[int32]*PartitionState
+	Partitions map[int32]*PartitionState `json:"partitions"`
 }
 
 type PartitionState struct {
 	// Current HW, LE (Log End Offset)
-	HighWatermark int64
-	LogEndOffset  int64
+	HighWatermark int64 `json:"high_watermark"`
+	LogEndOffset  int64 `json:"log_end_offset"`
 
 	// Sorted list of segments for fast binary search
 	// We will populate this later in Phase 1 or 2
-	Segments []*SegmentMetadata
+	Segments []*SegmentMetadata `json:"segments"`
 }
 
 type SegmentMetadata struct {
-	StartOffset int64
-	EndOffset   int64
-	S3Key       string
+	StartOffset int64  `json:"start_offset"`
+	EndOffset   int64  `json:"end_offset"`
+	S3Key       string `json:"s3_key"`
 }
 
 func NewMetadataCache() *MetadataCache {
@@ -142,4 +143,22 @@ func (mc *MetadataCache) RemoveTopic(topic string) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 	delete(mc.Topics, topic)
+}
+
+func (mc *MetadataCache) ToJSON() ([]byte, error) {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	return json.Marshal(mc.Topics)
+}
+
+func (mc *MetadataCache) FromJSON(data []byte) error {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	var topics map[string]*TopicState
+	if err := json.Unmarshal(data, &topics); err != nil {
+		return err
+	}
+	mc.Topics = topics
+	return nil
 }
