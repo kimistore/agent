@@ -22,7 +22,10 @@ func main() {
 	// Setup Storage
 	ctx := context.TODO()
 
-	bucket := "kimistore"
+	bucket := os.Getenv("S3_BUCKET")
+	if bucket == "" {
+		bucket = "kimistore"
+	}
 	store, err := s3.NewStore(ctx, bucket, "garage")
 	if err != nil {
 		log.Fatalf("Failed to init S3: %v", err)
