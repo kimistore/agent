@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 
+	"kimistore/internal/metrics"
 	"kimistore/internal/protocol"
 	"kimistore/internal/storage"
 )
@@ -69,6 +70,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
 
+	metrics.IncConnection()
+	defer metrics.DecConnection()
+
 	// log.Printf("New connection from %s", conn.RemoteAddr())
 
 	session := &protocol.Session{
@@ -84,6 +88,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 			return
 		}
+		metrics.AddIOBytes("inbound", 4)
 
 		size := binary.BigEndian.Uint32(headerBuf)
 
@@ -93,6 +98,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			log.Printf("Read body error: %v", err)
 			return
 		}
+		metrics.AddIOBytes("inbound", int(size))
 
 		// 3. Process Request
 		resp, err := protocol.HandleRequest(bodyBuf, s.storage, session, s.authConfig)
@@ -118,9 +124,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 			log.Printf("Write error: %v", err)
 			return
 		}
+		metrics.AddIOBytes("outbound", 4)
 		if _, err := conn.Write(resp); err != nil {
 			log.Printf("Write body error: %v", err)
 			return
 		}
+		metrics.AddIOBytes("outbound", len(resp))
 	}
 }

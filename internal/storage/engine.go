@@ -464,3 +464,39 @@ func (s *StorageEngine) LoadOffset(groupID, topic string, partition int32) (int6
 	}
 	return offset, nil
 }
+
+func (e *StorageEngine) GetTopicCount() int {
+	entries, err := os.ReadDir(e.walDir)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			count++
+		}
+	}
+	return count
+}
+
+func (e *StorageEngine) GetPartitionCount() int {
+	entries, err := os.ReadDir(e.walDir)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			// This is a topic directory. Count its subdirectories (partitions).
+			parts, err := os.ReadDir(filepath.Join(e.walDir, entry.Name()))
+			if err == nil {
+				for _, p := range parts {
+					if p.IsDir() {
+						count++
+					}
+				}
+			}
+		}
+	}
+	return count
+}

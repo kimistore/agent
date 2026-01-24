@@ -3,8 +3,10 @@ package protocol
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"kimistore/internal/coordinator"
+	"kimistore/internal/metrics"
 	"kimistore/internal/storage"
 )
 
@@ -119,52 +121,63 @@ func HandleRequest(data []byte, store *storage.StorageEngine, session *Session, 
 		return nil, fmt.Errorf("authentication required")
 	}
 
+	// Metrics: Start Timer
+	startTime := time.Now()
+	var errorCode int16 = ErrNone
+
+	var resp []byte
+	var errProc error
+
 	switch apiKey {
 	case ApiKeySaslHandshake:
-		return handleSaslHandshake(dec, enc, apiVersion)
+		resp, errProc = handleSaslHandshake(dec, enc, apiVersion)
 	case ApiKeySaslAuthenticate:
-		return handleSaslAuthenticate(dec, enc, apiVersion, session, authConfig)
+		resp, errProc = handleSaslAuthenticate(dec, enc, apiVersion, session, authConfig)
 	case ApiKeyProduce:
-		return handleProduce(dec, enc, store, apiVersion)
+		resp, errProc = handleProduce(dec, enc, store, apiVersion)
 	case ApiKeyFetch:
-		return handleFetch(dec, enc, store, apiVersion)
+		resp, errProc = handleFetch(dec, enc, store, apiVersion)
 	case ApiKeyListOffsets:
-		return handleListOffsets(dec, enc, store, apiVersion)
+		resp, errProc = handleListOffsets(dec, enc, store, apiVersion)
 	case ApiKeyApiVersions:
-		return handleApiVersions(enc, apiVersion)
+		resp, errProc = handleApiVersions(enc, apiVersion)
 	case ApiKeyMetadata:
-		return handleMetadata(dec, enc, store, apiVersion)
+		resp, errProc = handleMetadata(dec, enc, store, apiVersion)
 	case ApiKeyFindCoordinator:
-		return handleFindCoordinator(dec, enc, apiVersion)
+		resp, errProc = handleFindCoordinator(dec, enc, apiVersion)
 	case ApiKeyJoinGroup:
-		return handleJoinGroup(dec, enc, apiVersion)
+		resp, errProc = handleJoinGroup(dec, enc, apiVersion)
 	case ApiKeySyncGroup:
-		return handleSyncGroup(dec, enc, apiVersion)
+		resp, errProc = handleSyncGroup(dec, enc, apiVersion)
 	case ApiKeyHeartbeat:
-		return handleHeartbeat(dec, enc, apiVersion)
+		resp, errProc = handleHeartbeat(dec, enc, apiVersion)
 	case ApiKeyLeaveGroup:
-		return handleLeaveGroup(dec, enc, apiVersion)
+		resp, errProc = handleLeaveGroup(dec, enc, apiVersion)
 	case ApiKeyOffsetCommit:
-		return handleOffsetCommit(dec, enc, store, apiVersion)
+		resp, errProc = handleOffsetCommit(dec, enc, store, apiVersion)
 	case ApiKeyOffsetFetch:
-		return handleOffsetFetch(dec, enc, store, apiVersion)
+		resp, errProc = handleOffsetFetch(dec, enc, store, apiVersion)
 	case ApiKeyCreateTopics:
-		return handleCreateTopics(dec, enc, store, apiVersion)
+		resp, errProc = handleCreateTopics(dec, enc, store, apiVersion)
 	case ApiKeyDeleteTopics:
-		return handleDeleteTopics(dec, enc, store, apiVersion)
+		resp, errProc = handleDeleteTopics(dec, enc, store, apiVersion)
 	case ApiKeyListGroups:
-		return handleListGroups(dec, enc, store, apiVersion)
+		resp, errProc = handleListGroups(dec, enc, store, apiVersion)
 	case ApiKeyDescribeGroups:
-		return handleDescribeGroups(dec, enc, store, apiVersion)
+		resp, errProc = handleDescribeGroups(dec, enc, store, apiVersion)
 	default:
-		// Unsupported API?
-		// We should return some error code, but since formatting depends on API...
-		// For now just close or return empty.
-		// Real Kafka returns a response with ErrorCode if it can parse it,
-		// but generic error handling is per-api.
 		log.Printf("Unsupported API Key: %d", apiKey)
-		return nil, fmt.Errorf("unsupported api key: %d", apiKey)
+		errProc = fmt.Errorf("unsupported api key: %d", apiKey)
 	}
+
+	if errProc != nil {
+		errorCode = ErrUnknown
+	}
+
+	// Metrics: Observe
+	metrics.ObserveRequest(apiKey, apiVersion, errorCode, startTime, len(resp))
+
+	return resp, errProc
 }
 
 // ----------------------------------------------------------------------
