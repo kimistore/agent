@@ -19,6 +19,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -55,7 +56,13 @@ func (m *MockStore) Put(ctx context.Context, key string, r io.Reader) error {
 }
 
 func (m *MockStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	return nil, nil
+	m.Mu.Lock()
+	defer m.Mu.Unlock()
+	b, ok := m.Data[key]
+	if !ok {
+		return nil, fmt.Errorf("not found")
+	}
+	return io.NopCloser(bytes.NewReader(b)), nil
 }
 
 func (m *MockStore) List(ctx context.Context, prefix string) ([]ObjectMetadata, error) {

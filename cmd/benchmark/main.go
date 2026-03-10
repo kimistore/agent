@@ -44,7 +44,7 @@ func (m *MockObjectStore) Put(ctx context.Context, key string, r io.Reader) erro
 	return err
 }
 func (m *MockObjectStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	return nil, nil
+	return nil, fmt.Errorf("not found")
 }
 func (m *MockObjectStore) List(ctx context.Context, prefix string) ([]storage.ObjectMetadata, error) {
 	return nil, nil

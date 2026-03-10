@@ -29,16 +29,18 @@ import (
 type Manager struct {
 	baseDir    string
 	partitions map[string]*PartitionWAL // key: "topic/partition"
+	onRoll     func(UploadTask)
 	mu         sync.RWMutex
 }
 
-func NewManager(baseDir string) (*Manager, error) {
+func NewManager(baseDir string, onRoll func(UploadTask)) (*Manager, error) {
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		return nil, err
 	}
 	return &Manager{
 		baseDir:    baseDir,
 		partitions: make(map[string]*PartitionWAL),
+		onRoll:     onRoll,
 	}, nil
 }
 
@@ -61,7 +63,7 @@ func (m *Manager) getPartitionWAL(topic string, partition int32) (*PartitionWAL,
 	}
 
 	dir := filepath.Join(m.baseDir, topic, fmt.Sprintf("%d", partition))
-	p, err := NewPartitionWAL(dir)
+	p, err := NewPartitionWAL(dir, topic, partition, m.onRoll)
 	if err != nil {
 		return nil, err
 	}

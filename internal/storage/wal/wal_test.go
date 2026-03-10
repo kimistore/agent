@@ -33,7 +33,7 @@ func TestWALManager_AppendRead(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 
-	mgr, err := NewManager(tempDir)
+	mgr, err := NewManager(tempDir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestPartitionWAL_Roll(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 
 	pDir := filepath.Join(tempDir, "topic", "0")
-	p, err := NewPartitionWAL(pDir)
+	p, err := NewPartitionWAL(pDir, "topic", 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

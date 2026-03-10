@@ -55,6 +55,27 @@ var (
 		Help: "Total number of bytes sent or received",
 	}, []string{"direction"})
 
+	// Uploader Metrics
+	UploaderTaskCount = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "kimistore_uploader_task_total",
+		Help: "Total number of upload tasks processed",
+	}, []string{"status", "source"}) // status: success, error; source: fast-path, reconciliation
+
+	UploaderMissedEvents = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_uploader_missed_events_total",
+		Help: "Total number of missed events due to channel overflow",
+	})
+
+	UploaderInFlight = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kimistore_uploader_in_flight_count",
+		Help: "Number of uploads currently in progress",
+	})
+
+	UploaderBytesUploaded = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_uploader_bytes_total",
+		Help: "Total number of bytes uploaded to S3",
+	})
+
 	// These will be registered manually via callbacks
 	TopicCount     prometheus.GaugeFunc
 	PartitionCount prometheus.GaugeFunc

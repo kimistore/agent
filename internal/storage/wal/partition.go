@@ -38,8 +38,18 @@ const (
 
 var MaxSegmentSize = int64(64 * 1024 * 1024) // 64MB
 
+type UploadTask struct {
+	Topic      string
+	Partition  int32
+	Path       string // Local disk path
+	BaseOffset int64  // Starting offset for the segment
+	Source     string // fast-path or reconciliation
+}
+
 type PartitionWAL struct {
 	dir              string
+	topic            string
+	partition        int32
 	activeFile       *os.File
 	activeBaseOffset int64
 	currentSize      int64
@@ -48,17 +58,22 @@ type PartitionWAL struct {
 	index      map[int64]int64 // Offset -> Position
 	offsets    []int64         // Sorted list of offsets in active file
 
+	onRoll func(UploadTask)
+
 	mu sync.Mutex
 }
 
-func NewPartitionWAL(dir string) (*PartitionWAL, error) {
+func NewPartitionWAL(dir string, topic string, partition int32, onRoll func(UploadTask)) (*PartitionWAL, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
 
 	pw := &PartitionWAL{
-		dir:   dir,
-		index: make(map[int64]int64),
+		dir:       dir,
+		topic:     topic,
+		partition: partition,
+		index:     make(map[int64]int64),
+		onRoll:    onRoll,
 	}
 
 	if err := pw.loadState(); err != nil {
@@ -321,11 +336,23 @@ func (p *PartitionWAL) roll() error {
 	}
 	p.activeFile = f
 	p.currentSize = 0
+	baseOffset := p.activeBaseOffset
 	p.activeBaseOffset = p.nextOffset
 
 	// Clear index for active segment (past segments are not indexed in memory for MVP)
 	p.index = make(map[int64]int64)
 	p.offsets = nil
+
+	// Trigger async upload
+	if p.onRoll != nil {
+		task := UploadTask{
+			Topic:      p.topic,
+			Partition:  p.partition,
+			Path:       newPath,
+			BaseOffset: baseOffset,
+		}
+		go p.onRoll(task)
+	}
 
 	return nil
 }

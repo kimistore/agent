@@ -32,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"kimistore/internal/metrics"
 	"kimistore/internal/storage/index"
 	"kimistore/internal/storage/wal"
 )
@@ -44,6 +45,10 @@ type StorageEngine struct {
 
 	quit chan struct{}
 	wg   sync.WaitGroup
+
+	// Parallel Uploader
+	uploadChan      chan wal.UploadTask
+	inFlightUploads sync.Map // path -> struct{}
 
 	// Cache for S3 List results (topic/partition -> []keys)
 	segmentCache map[string][]string
@@ -59,22 +64,33 @@ type StorageEngine struct {
 }
 
 func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retentionCfg RetentionConfig) (*StorageEngine, error) {
-	mgr, err := wal.NewManager(walDir)
-	if err != nil {
-		return nil, err
-	}
-
 	se := &StorageEngine{
-		walMgr:        mgr,
 		objStore:      objStore,
 		bucket:        bucket,
 		walDir:        walDir,
 		quit:          make(chan struct{}),
+		uploadChan:    make(chan wal.UploadTask, 1024),
 		segmentCache:  make(map[string][]string),
 		offsetBuf:     make(map[string]int64),
 		retentionCfg:  retentionCfg,
 		metadataCache: NewMetadataCache(),
 	}
+
+	onRoll := func(task wal.UploadTask) {
+		task.Source = "fast-path"
+		select {
+		case se.uploadChan <- task:
+		default:
+			metrics.UploaderMissedEvents.Inc()
+			log.Printf("Warning: Upload channel full, skipping fast-path for %s", task.Path)
+		}
+	}
+
+	mgr, err := wal.NewManager(walDir, onRoll)
+	if err != nil {
+		return nil, err
+	}
+	se.walMgr = mgr
 
 	// Load Cache from Checkpoint first
 	if err := se.LoadCheckpoint(); err != nil {
@@ -86,7 +102,13 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 		log.Printf("Warning: Failed to load metadata cache: %v", err)
 	}
 
-	// Start background uploader, offset flusher, retention, and checkpoint loop
+	// Start worker pool (8 workers)
+	for i := 0; i < 8; i++ {
+		se.wg.Add(1)
+		go se.uploaderWorker()
+	}
+
+	// Start background uploader (reconciliation), offset flusher, retention, and checkpoint loop
 	se.wg.Add(4)
 	go se.uploaderLoop()
 	go se.offsetFlusherLoop()
@@ -417,10 +439,89 @@ func (s *StorageEngine) Close() error {
 	return s.walMgr.Close()
 }
 
+func (s *StorageEngine) uploaderWorker() {
+	defer s.wg.Done()
+
+	for {
+		select {
+		case <-s.quit:
+			return
+		case task := <-s.uploadChan:
+			s.handleUpload(task)
+		}
+	}
+}
+
+func (s *StorageEngine) handleUpload(task wal.UploadTask) {
+	// 1. Check/Set In-Flight
+	if _, loaded := s.inFlightUploads.LoadOrStore(task.Path, struct{}{}); loaded {
+		return // Already being handled
+	}
+	defer s.inFlightUploads.Delete(task.Path)
+
+	metrics.UploaderInFlight.Inc()
+	defer metrics.UploaderInFlight.Dec()
+
+	// Verify file still exists (might have been uploaded by someone else just now)
+	info, err := os.Stat(task.Path)
+	if err != nil {
+		return
+	}
+
+	key := fmt.Sprintf("%s/%d/%s", task.Topic, task.Partition, filepath.Base(task.Path))
+	indexKey := strings.TrimSuffix(key, ".log") + ".index"
+
+	log.Printf("Uploader: Processing %s (size: %d, source: %s)", key, info.Size(), task.Source)
+
+	// 2. Generate Index
+	indexData, err := index.GenerateIndex(task.Path, task.BaseOffset)
+	if err != nil {
+		log.Printf("Error generating index for %s: %v", task.Path, err)
+	} else if len(indexData) > 0 {
+		if err := s.objStore.Put(context.Background(), indexKey, bytes.NewReader(indexData)); err != nil {
+			log.Printf("Failed to upload index %s: %v", indexKey, err)
+		}
+	}
+
+	// 3. Upload Log
+	f, err := os.Open(task.Path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	if err := s.objStore.Put(context.Background(), key, f); err != nil {
+		metrics.UploaderTaskCount.WithLabelValues("error", task.Source).Inc()
+		log.Printf("Failed to upload %s: %v", key, err)
+		return
+	}
+
+	// 4. Remove Local
+	if err := os.Remove(task.Path); err != nil {
+		log.Printf("Failed to remove %s: %v", task.Path, err)
+	} else {
+		log.Printf("Uploaded and trimmed %s", key)
+	}
+
+	// 5. Update Metrics & Cache
+	metrics.UploaderTaskCount.WithLabelValues("success", task.Source).Inc()
+	metrics.UploaderBytesUploaded.Add(float64(info.Size()))
+
+	cacheKey := fmt.Sprintf("%s/%d", task.Topic, task.Partition)
+	s.cacheMu.Lock()
+	if list, ok := s.segmentCache[cacheKey]; ok {
+		s.segmentCache[cacheKey] = append(list, key)
+	}
+	s.cacheMu.Unlock()
+}
+
 func (s *StorageEngine) uploaderLoop() {
 	defer s.wg.Done()
 
-	ticker := time.NewTicker(2 * time.Second)
+	// Initial scan
+	s.uploadSegments()
+
+	ticker := time.NewTicker(1 * time.Minute) // Reconciliation every minute
 	defer ticker.Stop()
 
 	for {
@@ -457,57 +558,23 @@ func (s *StorageEngine) uploadSegments() {
 		}
 
 		topic := parts[0]
-		partition := parts[1]
+		pID, _ := strconv.ParseInt(parts[1], 10, 32)
 		filename := parts[2]
-
-		key := fmt.Sprintf("%s/%s/%s", topic, partition, filename)
-		indexKey := strings.TrimSuffix(key, ".log") + ".index"
-
-		log.Printf("Uploading segment %s -> s3://%s/%s", rel, s.bucket, key)
-
-		// 1. Generate Index
 		baseOffset, _ := strconv.ParseInt(strings.TrimSuffix(filename, ".log"), 10, 64)
-		indexData, err := index.GenerateIndex(path, baseOffset)
-		if err != nil {
-			log.Printf("Error generating index for %s: %v", path, err)
-			// Continue without index? Or failing?
-			// PROD: Maybe fail. MVP: Log and skip index.
-		} else if len(indexData) > 0 {
-			// Upload Index
-			if err := s.objStore.Put(context.Background(), indexKey, bytes.NewReader(indexData)); err != nil {
-				log.Printf("Failed to upload index %s: %v", indexKey, err)
-			} else {
-				log.Printf("Uploaded index %s", indexKey)
-			}
+
+		task := wal.UploadTask{
+			Topic:      topic,
+			Partition:  int32(pID),
+			Path:       path,
+			BaseOffset: baseOffset,
+			Source:     "reconciliation",
 		}
 
-		f, err := os.Open(path)
-		if err != nil {
-			return nil
+		select {
+		case s.uploadChan <- task:
+		default:
+			// Queue full, will be picked up in next reconciliation
 		}
-		// Don't defer f.Close() here inside loop easily, handle explicitly
-
-		ctx := context.Background()
-		if err := s.objStore.Put(ctx, key, f); err != nil {
-			log.Printf("Failed to upload %s: %v", key, err)
-			f.Close()
-			return nil
-		}
-		f.Close()
-
-		if err := os.Remove(path); err != nil {
-			log.Printf("Failed to remove %s: %v", path, err)
-		} else {
-			log.Printf("Uploaded and trimmed %s", key)
-		}
-
-		// Update Cache
-		cacheKey := fmt.Sprintf("%s/%s", topic, partition)
-		s.cacheMu.Lock()
-		if list, ok := s.segmentCache[cacheKey]; ok {
-			s.segmentCache[cacheKey] = append(list, key)
-		}
-		s.cacheMu.Unlock()
 
 		return nil
 	})

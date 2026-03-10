@@ -30,7 +30,7 @@ func main() {
 	tmpDir := "./tmp-wal-test"
 	os.RemoveAll(tmpDir) // cleanup
 
-	mgr, err := wal.NewManager(tmpDir)
+	mgr, err := wal.NewManager(tmpDir, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
