@@ -27,10 +27,18 @@ import (
 )
 
 func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
-	// Produce Request V0:
+	// Produce Request V3:
+	// TransactionalID (Nullable String)
 	// Acks (int16)
 	// Timeout (int32)
 	// TopicArray
+
+	if version >= 3 {
+		_, err := dec.String() // transactional_id
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	acks, err := dec.Int16()
 	if err != nil {
@@ -82,6 +90,14 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 			msgSetSize, err := dec.Int32()
 			if err != nil {
 				return nil, err
+			}
+
+			if msgSetSize < 0 {
+				return nil, fmt.Errorf("invalid negative message set size: %d", msgSetSize)
+			}
+
+			if msgSetSize > 100*1024*1024 { // 100MB safety limit
+				return nil, fmt.Errorf("message set size too large: %d", msgSetSize)
 			}
 
 			// The MessageSet (Bytes). We treat it as opaque.
@@ -149,10 +165,11 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 }
 
 func handleFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
-	// Fetch Request V0:
+	// Fetch Request V0-V3:
 	// ReplicaId (int32)
 	// MaxWaitTime (int32)
 	// MinBytes (int32)
+	// MaxBytes (int32) -- added in V3
 	// TopicArray
 
 	replicaID, err := dec.Int32()
@@ -170,7 +187,15 @@ func handleFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, versi
 		return nil, err
 	}
 
-	// log.Printf("Fetch: Replica=%d Wait=%d MinBytes=%d", replicaID, maxWait, minBytes)
+	totalMaxBytes := int32(-1)
+	if version >= 3 {
+		totalMaxBytes, err = dec.Int32()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// log.Printf("Fetch: Replica=%d Wait=%d MinBytes=%d MaxBytes=%d", replicaID, maxWait, minBytes, totalMaxBytes)
 	_ = replicaID
 	_ = maxWait
 	_ = minBytes
@@ -183,15 +208,13 @@ func handleFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, versi
 		return nil, err
 	}
 
-	// Fetch Response V0 (similar structure)
-	// V1 adds ThrottleTime at the front of response.
-	// Docs say: V1 FetchResponse: ThrottleTime [TopicResponse]
-
+	// Fetch Response V1+ adds ThrottleTime at the front of response.
 	if version >= 1 {
 		enc.Int32(0) // ThrottleTimeMs 0
 	}
 
 	enc.Int32(count)
+	currentResponseSize := int32(0)
 
 	for i := 0; i < int(count); i++ {
 		topic, err := dec.String()
@@ -219,11 +242,21 @@ func handleFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, versi
 				return nil, err
 			}
 
-			maxBytes, err := dec.Int32()
+			partitionMaxBytes, err := dec.Int32()
 			if err != nil {
 				return nil, err
 			}
-			_ = maxBytes
+			_ = partitionMaxBytes
+
+			// Enforce totalMaxBytes if V3+
+			if totalMaxBytes > 0 && currentResponseSize >= totalMaxBytes {
+				// We reached the limit, return empty for remaining partitions
+				enc.Int32(partition)
+				enc.Int16(0) // No Error
+				enc.Int64(store.HighWaterMark(topic, partition))
+				enc.Int32(0) // MessageSetSize 0
+				continue
+			}
 
 			// READ FROM STORAGE
 			hw := store.HighWaterMark(topic, partition)
@@ -248,30 +281,14 @@ func handleFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, versi
 
 			enc.Int32(partition)
 			if err != nil {
-				// Actual read error (e.g. data lost/corrupt or unexpected)
-				// If it's "not found" but < hw, it implies gap or deleted.
-				// For now, treat as OffsetOutOfRange to force client reset?
-				// Or Unknown (1).
-				enc.Int16(1)
+				enc.Int16(1) // OffsetOutOfRange
 				enc.Int64(hw)
 				enc.Int32(0)
 			} else {
 				enc.Int16(0) // No error
-				// HighwaterMark: Next offset. We don't track it easily yet from Read().
-				// Read() returns data. We need to parse data to know how many messages?
-				// Or store.Read() should return NextOffset.
-
-				// Ideally store.Read() returns (data, nextOffset).
-				// My interface was: Read(topic, partition, offset) ([]byte, error)
-				// I should update it to return nextOffset too.
-
-				// Simpler hack: We assume we read *some* messages.
-				// YES! My WAL Append increments offset by 1 per "Batch".
-				// So if we read successfully, HWMark is at least fetchOffset + 1.
-
-				enc.Int64(hw) // HighwaterMark
-				// enc.Int32(int32(len(data))) // PutBytes adds this
+				enc.Int64(hw)
 				enc.PutBytes(data) // MessageSet raw
+				currentResponseSize += int32(len(data))
 			}
 		}
 	}

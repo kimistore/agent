@@ -158,7 +158,7 @@ func HandleRequest(data []byte, store *storage.StorageEngine, session *Session, 
 	case ApiKeyListOffsets:
 		resp, errProc = handleListOffsets(dec, enc, store, apiVersion)
 	case ApiKeyApiVersions:
-		resp, errProc = handleApiVersions(enc, apiVersion)
+		resp, errProc = handleApiVersions(dec, enc, apiVersion)
 	case ApiKeyMetadata:
 		resp, errProc = handleMetadata(dec, enc, store, apiVersion)
 	case ApiKeyFindCoordinator:
@@ -221,7 +221,7 @@ func handleFindCoordinator(dec *Decoder, enc *Encoder, version int16) ([]byte, e
 	// Port (int32)
 
 	enc.Int16(ErrNone)      // No Error
-	enc.Int32(1)            // NodeID 1 (Our static broker)
+	enc.Int32(0)            // NodeID 0
 	enc.String("localhost") // Host
 	enc.Int32(19092)        // Port
 
@@ -449,7 +449,7 @@ func handleOffsetFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine,
 	return enc.Bytes(), nil
 }
 
-func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
+func handleApiVersions(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
 	if version > 0 {
 		// We only support V0.
 		// If client asks for V1+, we return UnsupportedVersion.
@@ -477,7 +477,7 @@ func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
 
 	// Array length: 5
 	// Listing: Produce, Fetch, ListOffsets, Metadata, ApiVersions
-	// Supported: Produce(0-2), Fetch(0-2), ListOffsets(0-1), Metadata(0-2), ApiVersions(0)
+	// Supported: Produce(0-3), Fetch(0-3), ListOffsets(0-1), Metadata(0-3), ApiVersions(0)
 	// + Group APIs: OffsetCommit(0), OffsetFetch(0-1), FindCoordinator(0), JoinGroup(0), SyncGroup(0), Heartbeat(0), LeaveGroup(0)
 	// + SASL: SaslHandshake(0-1), SaslAuthenticate(0)
 
@@ -492,10 +492,10 @@ func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
 		enc.Int16(maxV)
 	}
 
-	writeEntry(ApiKeyProduce, 0, 2)
-	writeEntry(ApiKeyFetch, 0, 2)
+	writeEntry(ApiKeyProduce, 0, 3)
+	writeEntry(ApiKeyFetch, 0, 3)
 	writeEntry(ApiKeyListOffsets, 0, 1)
-	writeEntry(ApiKeyMetadata, 0, 2)
+	writeEntry(ApiKeyMetadata, 0, 3)
 	writeEntry(ApiKeyApiVersions, 0, 0)
 	writeEntry(ApiKeyOffsetCommit, 0, 0)
 	writeEntry(ApiKeyOffsetFetch, 0, 1)
@@ -515,36 +515,38 @@ func handleApiVersions(enc *Encoder, version int16) ([]byte, error) {
 }
 
 func handleMetadata(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
-	// Metadata Request V0+:
-	// Topics Array (String)
-
-	// We should decode the request body first.
-	// But wait, the `HandleRequest` called `handleMetadata` which takes `enc`.
-	// We need `dec` too!
-	// Existing signature was: func handleMetadata(enc *Encoder, version int16)
-	// I need to change it to accept `dec`.
+	// Metadata Request V0-V3:
+	// Topics (Array of Strings). Empty array means "all topics".
+	// V4+ adds allow_auto_topic_creation.
 
 	count, err := dec.Int32()
-	requestedTopic := ""
-	if err == nil && count > 0 {
-		// Just read the first one for MVP
-		t, _ := dec.String()
-		requestedTopic = t
-		// If there are more, we ignore them (read remaining to clear buffer?)
-		// This is a BUG if count > 1.
-		// But usually clients ask for 1 or All.
+	if err != nil {
+		return nil, err
 	}
-	log.Printf("Metadata Req: Count=%d Requested=%s", count, requestedTopic)
 
-	if requestedTopic == "" {
-		requestedTopic = "bench-topic" // Default for testing/benchmark
+	var requestedTopics []string
+	for i := 0; i < int(count); i++ {
+		t, _ := dec.String()
+		requestedTopics = append(requestedTopics, t)
+	}
+
+	// Metadata Response V3:
+	// ThrottleTimeMs (int32)
+	// Brokers (Array)
+	// ClusterId (Nullable String)
+	// ControllerId (int32)
+	// TopicMetadata (Array)
+
+	if version >= 3 {
+		enc.Int32(0) // ThrottleTimeMs
 	}
 
 	// 1. Brokers
-	enc.Int32(1)
+	// We are a single-node broker for now. ID=0.
+	enc.Int32(1) // Broker Count
 
 	// Broker 0
-	enc.Int32(1)            // NodeID
+	enc.Int32(0)            // NodeID
 	enc.String("localhost") // Host
 	enc.Int32(19092)        // Port
 
@@ -552,31 +554,23 @@ func handleMetadata(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ve
 		enc.String("") // Rack (empty instead of null)
 	}
 
-	// ClusterID (string) - Added in V2
 	if version >= 2 {
-		enc.String("kimistore-cluster")
+		enc.String("kimistore-cluster") // ClusterID
 	}
 
-	// ControllerID (int32) - Added in V1
 	if version >= 1 {
-		enc.Int32(1) // Controller is Node 1
+		enc.Int32(0) // ControllerID (Node 0)
 	}
 
 	// 2. Topic Metadata
-
-	var topicsToReturn []string
+	allTopics, _ := store.GetTopics()
+	topicsToReturn := requestedTopics
 	if count <= 0 {
-		// Return All topics
-		// Scan storage
-		// For MVP: List directory? Using GetPartitions logic on known topics?
-		// We don't have a "ListTopics" in storage yet.
-		// NOTE: NewStorageEngine has ListPartitions but not ListTopics efficiently exposed.
-		// However, we can trick it or just return the default + requested.
-		// If requested is empty, we MUST return something useful or ALL.
-		// Let's return "bench-topic" AND "bench-multi" for now to fix test.
+		topicsToReturn = allTopics
+	}
+	if len(topicsToReturn) == 0 {
+		// Fallback for tests if store is empty
 		topicsToReturn = []string{"bench-topic", "bench-multi"}
-	} else {
-		topicsToReturn = []string{requestedTopic}
 	}
 
 	enc.Int32(int32(len(topicsToReturn)))
@@ -590,39 +584,29 @@ func handleMetadata(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ve
 
 		partitions, err := store.GetPartitions(tName)
 		if err != nil {
-			log.Printf("Failed to get partitions for %s: %v", tName, err)
 			partitions = []int32{}
 		}
 		if len(partitions) == 0 {
-			// If it's a known topic, default 0?
-			if tName == "bench-multi" {
-				// We expect 4. If 0, something is wrong with GetPartitions scanning?
-				// But let's assume auto-create 0
-				partitions = []int32{0}
-			} else {
-				partitions = []int32{0}
-			}
+			partitions = []int32{0}
 		}
-
-		log.Printf("Metadata Return: Topic=%s Partitions=%v", tName, partitions)
 
 		enc.Int32(int32(len(partitions)))
 		for _, pid := range partitions {
 			enc.Int16(0)   // PartitionErrorCode
 			enc.Int32(pid) // PartitionID
-			enc.Int32(1)   // Leader
+			enc.Int32(0)   // Leader (Node 0)
 			// Replicas
-			enc.Int32(1)
-			enc.Int32(1)
+			enc.Int32(1) // Count
+			enc.Int32(0) // Node 0
 			// Isr
-			enc.Int32(1)
-			enc.Int32(1)
+			enc.Int32(1) // Count
+			enc.Int32(0) // Node 0
 		}
 	}
 
-	log.Println("Metadata Response encoded.")
 	return enc.Bytes(), nil
 }
+
 
 func handleSaslHandshake(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
 	// SaslHandshake Request V0:

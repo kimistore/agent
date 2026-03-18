@@ -45,13 +45,13 @@ func NewStore(ctx context.Context, bucket string, region string) (*Store, error)
 	}
 
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.UsePathStyle = true
 		endpoint := os.Getenv("S3_ENDPOINT")
 		if endpoint == "" {
 			endpoint = os.Getenv("AWS_ENDPOINT_URL")
 		}
 		if endpoint != "" {
 			o.BaseEndpoint = aws.String(endpoint)
+			o.UsePathStyle = true
 		}
 	})
 	return &Store{

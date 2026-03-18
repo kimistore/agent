@@ -71,6 +71,15 @@ func (d *Decoder) remaining() int {
 	return len(d.data) - d.off
 }
 
+func (d *Decoder) UVarint() (uint64, error) {
+	val, n := binary.Uvarint(d.data[d.off:])
+	if n <= 0 {
+		return 0, errors.New("insufficient data for uvarint")
+	}
+	d.off += n
+	return val, nil
+}
+
 func (d *Decoder) Int64() (int64, error) {
 	if d.remaining() < 8 {
 		return 0, errors.New("insufficient data for int64")
@@ -129,6 +138,18 @@ func (e *Encoder) Int64(val int64) {
 
 func (e *Encoder) String(val string) {
 	e.Int16(int16(len(val)))
+	e.data = append(e.data, []byte(val)...)
+}
+
+func (e *Encoder) PutUVarint(val uint64) {
+	buf := make([]byte, binary.MaxVarintLen64)
+	n := binary.PutUvarint(buf, val)
+	e.data = append(e.data, buf[:n]...)
+}
+
+func (e *Encoder) CompactString(val string) {
+	// COMPACT_STRING: length is uvarint(len+1)
+	e.PutUVarint(uint64(len(val) + 1))
 	e.data = append(e.data, []byte(val)...)
 }
 

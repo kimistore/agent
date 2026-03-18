@@ -203,6 +203,10 @@ func (p *PartitionWAL) findMaxSealedOffset() (int64, error) {
 		offset := int64(binary.BigEndian.Uint64(header[0:8]))
 		size := binary.BigEndian.Uint32(header[8:12])
 
+		if size > 100*1024*1024 { // 100MB safety
+			break // Corrupt
+		}
+
 		// To correctly determine endOffset, we must read the body and count
 		body := make([]byte, size)
 		if _, err := io.ReadFull(f, body); err != nil {
@@ -239,6 +243,10 @@ func (p *PartitionWAL) recoverActive() error {
 
 		offset := int64(binary.BigEndian.Uint64(header[0:8]))
 		size := binary.BigEndian.Uint32(header[8:12])
+
+		if size > 100*1024*1024 { // 100MB safety
+			return fmt.Errorf("corrupt log: entry size %d too large at pos %d", size, pos)
+		}
 
 		p.index[offset] = pos
 		p.offsets = append(p.offsets, offset)

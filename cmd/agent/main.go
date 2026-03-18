@@ -27,6 +27,7 @@ import (
 	"syscall"
 
 	"kimistore/internal/metrics"
+	"kimistore/internal/protocol"
 	"kimistore/internal/server"
 	"kimistore/internal/storage"
 	"kimistore/internal/storage/s3"
@@ -44,7 +45,11 @@ func main() {
 	if bucket == "" {
 		bucket = "kimistore"
 	}
-	store, err := s3.NewStore(ctx, bucket, "garage")
+	region := os.Getenv("AWS_REGION")
+	if region == "" {
+		region = "us-east-1"
+	}
+	store, err := s3.NewStore(ctx, bucket, region)
 	if err != nil {
 		log.Fatalf("Failed to init S3: %v", err)
 	}
@@ -56,7 +61,11 @@ func main() {
 	}
 	defer engine.Close()
 
+	// Link Coordinator for persistence
+	engine.SetCoordinator(protocol.GlobalCoordinator)
+
 	// Initialize Metrics
+
 	// For now, we pass dummy functions for topic/partition counts until we implement them in storage
 	// or we can implement them on the engine now.
 	// We will wire up the engine to provide these stats.

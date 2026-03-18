@@ -32,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"kimistore/internal/coordinator"
 	"kimistore/internal/metrics"
 	"kimistore/internal/storage/index"
 	"kimistore/internal/storage/wal"
@@ -61,6 +62,7 @@ type StorageEngine struct {
 	retentionCfg RetentionConfig
 
 	metadataCache *MetadataCache
+	coordinator   *coordinator.Coordinator
 }
 
 func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retentionCfg RetentionConfig) (*StorageEngine, error) {
@@ -91,11 +93,6 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 		return nil, err
 	}
 	se.walMgr = mgr
-
-	// Load Cache from Checkpoint first
-	if err := se.LoadCheckpoint(); err != nil {
-		log.Printf("Info: No checkpoint found or failed to load: %v (will rely on WAL)", err)
-	}
 
 	// Load/Merge Cache from WAL
 	if err := se.metadataCache.Load(walDir); err != nil {
@@ -272,6 +269,10 @@ func (s *StorageEngine) Read(topic string, partition int32, offset int64) ([]byt
 	defer rc.Close()
 
 	return scanStreamForOffset(rc, offset)
+}
+
+func (s *StorageEngine) GetTopics() ([]string, error) {
+	return s.metadataCache.GetTopics(), nil
 }
 
 func (s *StorageEngine) GetPartitions(topic string) ([]int32, error) {
@@ -597,6 +598,7 @@ func (s *StorageEngine) checkpointLoop() {
 	defer ticker.Stop()
 
 	for {
+
 		select {
 		case <-s.quit:
 			s.SaveCheckpoint()
@@ -607,7 +609,19 @@ func (s *StorageEngine) checkpointLoop() {
 	}
 }
 
+func (s *StorageEngine) SetCoordinator(c *coordinator.Coordinator) {
+	s.coordinator = c
+	// Load Cache from Checkpoint now that coordinator is linked
+	if err := s.LoadCheckpoint(); err != nil {
+		log.Printf("Info: No checkpoint found or failed to load: %v (will rely on WAL)", err)
+	}
+}
+
 func (s *StorageEngine) SaveCheckpoint() error {
+	if s.coordinator != nil {
+		state := s.coordinator.ToState()
+		s.metadataCache.Coordinator = &state
+	}
 	data, err := s.metadataCache.ToJSON()
 	if err != nil {
 		return err
@@ -643,6 +657,12 @@ func (s *StorageEngine) LoadCheckpoint() error {
 	if err := s.metadataCache.FromJSON(data); err != nil {
 		return err
 	}
+
+	if s.coordinator != nil && s.metadataCache.Coordinator != nil {
+		s.coordinator.FromState(*s.metadataCache.Coordinator)
+		log.Printf("Restored coordinator state from checkpoint")
+	}
+
 	log.Printf("Loaded metadata cache from checkpoint %s (%d bytes)", key, len(data))
 	return nil
 }

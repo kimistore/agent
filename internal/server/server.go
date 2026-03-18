@@ -23,6 +23,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"runtime/debug"
 	"sync"
 
 	"kimistore/internal/metrics"
@@ -88,10 +89,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
 
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Panic in handleConnection: %v\n%s", r, debug.Stack())
+		}
+	}()
+
 	metrics.IncConnection()
 	defer metrics.DecConnection()
 
-	// log.Printf("New connection from %s", conn.RemoteAddr())
+	remoteAddr := conn.RemoteAddr().String()
+	log.Printf("New connection from %s", remoteAddr)
+	defer log.Printf("Connection closed from %s", remoteAddr)
 
 	session := &protocol.Session{
 		Authenticated: false,

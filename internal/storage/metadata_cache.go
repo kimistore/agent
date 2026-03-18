@@ -24,11 +24,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+
+	"kimistore/internal/coordinator"
 )
 
 type MetadataCache struct {
-	Topics map[string]*TopicState
-	mu     sync.RWMutex
+	Topics      map[string]*TopicState          `json:"topics"`
+	Coordinator *coordinator.CoordinatorState `json:"coordinator,omitempty"`
+	mu          sync.RWMutex
 }
 
 type TopicState struct {
@@ -116,6 +119,16 @@ func (mc *MetadataCache) Load(walDir string) error {
 
 // Accessors
 
+func (mc *MetadataCache) GetTopics() []string {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	topics := make([]string, 0, len(mc.Topics))
+	for t := range mc.Topics {
+		topics = append(topics, t)
+	}
+	return topics
+}
+
 func (mc *MetadataCache) GetTopicCount() int {
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
@@ -166,17 +179,21 @@ func (mc *MetadataCache) RemoveTopic(topic string) {
 func (mc *MetadataCache) ToJSON() ([]byte, error) {
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
-	return json.Marshal(mc.Topics)
+	return json.Marshal(mc)
 }
 
 func (mc *MetadataCache) FromJSON(data []byte) error {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
-	var topics map[string]*TopicState
-	if err := json.Unmarshal(data, &topics); err != nil {
+	var state struct {
+		Topics      map[string]*TopicState          `json:"topics"`
+		Coordinator *coordinator.CoordinatorState `json:"coordinator"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil {
 		return err
 	}
-	mc.Topics = topics
+	mc.Topics = state.Topics
+	mc.Coordinator = state.Coordinator
 	return nil
 }

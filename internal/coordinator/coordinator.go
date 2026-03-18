@@ -36,20 +36,87 @@ const (
 )
 
 type MemberMetadata struct {
-	MemberID         string
-	ClientID         string
-	ClientHost       string
-	SessionTimeout   int32
-	RebalanceTimeout int32
-	ProtocolType     string
-	Protocols        []GroupProtocol // List of (Name, Metadata)
-	Assignment       []byte          // Assigned partitions (serialized)
-	Heartbeat        time.Time
+	MemberID         string          `json:"member_id"`
+	ClientID         string          `json:"client_id"`
+	ClientHost       string          `json:"client_host"`
+	SessionTimeout   int32           `json:"session_timeout"`
+	RebalanceTimeout int32           `json:"rebalance_timeout"`
+	ProtocolType     string          `json:"protocol_type"`
+	Protocols        []GroupProtocol `json:"protocols"`
+	Assignment       []byte          `json:"assignment"`
+	Heartbeat        time.Time       `json:"heartbeat"`
 }
 
 type GroupProtocol struct {
-	Name     string
-	Metadata []byte
+	Name     string `json:"name"`
+	Metadata []byte `json:"metadata"`
+}
+
+type CoordinatorState struct {
+	Groups map[string]GroupSnapshot `json:"groups"`
+}
+
+type GroupSnapshot struct {
+	Name         string                    `json:"name"`
+	State        GroupState                `json:"state"`
+	GenerationID int32                     `json:"generation_id"`
+	ProtocolType string                    `json:"protocol_type"`
+	Protocol     string                    `json:"protocol"`
+	Members      map[string]MemberMetadata `json:"members"`
+	LeaderID     string                    `json:"leader_id"`
+}
+
+func (c *Coordinator) ToState() CoordinatorState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	state := CoordinatorState{
+		Groups: make(map[string]GroupSnapshot),
+	}
+
+	for name, g := range c.groups {
+		g.mu.Lock()
+		members := make(map[string]MemberMetadata)
+		for mID, m := range g.Members {
+			members[mID] = *m
+		}
+		state.Groups[name] = GroupSnapshot{
+			Name:         g.Name,
+			State:        g.State,
+			GenerationID: g.GenerationID,
+			ProtocolType: g.ProtocolType,
+			Protocol:     g.Protocol,
+			Members:      members,
+			LeaderID:     g.LeaderID,
+		}
+		g.mu.Unlock()
+	}
+
+	return state
+}
+
+func (c *Coordinator) FromState(state CoordinatorState) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for name, gs := range state.Groups {
+		g := &Group{
+			Name:         gs.Name,
+			State:        gs.State,
+			GenerationID: gs.GenerationID,
+			ProtocolType: gs.ProtocolType,
+			Protocol:     gs.Protocol,
+			Members:      make(map[string]*MemberMetadata),
+			Offsets:      make(map[string]map[int32]int64),
+			LeaderID:     gs.LeaderID,
+		}
+		g.cond = sync.NewCond(&g.mu)
+		for mID, m := range gs.Members {
+			mCopy := m
+			g.Members[mID] = &mCopy
+		}
+		c.groups[name] = g
+	}
 }
 
 type Group struct {
