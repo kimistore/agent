@@ -158,10 +158,18 @@ func (mc *MetadataCache) AddTopic(topic string) {
 func (mc *MetadataCache) AddPartition(topic string, partition int32) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
+	// Ensure Topics map is initialized
+	if mc.Topics == nil {
+		mc.Topics = make(map[string]*TopicState)
+	}
 	if _, ok := mc.Topics[topic]; !ok {
 		mc.Topics[topic] = &TopicState{
 			Partitions: make(map[int32]*PartitionState),
 		}
+	}
+	// Ensure Partitions map is initialized (may be nil after JSON unmarshal)
+	if mc.Topics[topic].Partitions == nil {
+		mc.Topics[topic].Partitions = make(map[int32]*PartitionState)
 	}
 	if _, ok := mc.Topics[topic].Partitions[partition]; !ok {
 		mc.Topics[topic].Partitions[partition] = &PartitionState{
@@ -192,6 +200,10 @@ func (mc *MetadataCache) FromJSON(data []byte) error {
 	}
 	if err := json.Unmarshal(data, &state); err != nil {
 		return err
+	}
+	// Ensure Topics map is never nil
+	if state.Topics == nil {
+		state.Topics = make(map[string]*TopicState)
 	}
 	mc.Topics = state.Topics
 	mc.Coordinator = state.Coordinator
