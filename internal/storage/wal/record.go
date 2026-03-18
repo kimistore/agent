@@ -49,6 +49,16 @@ func CountMessageSet(data []byte) int {
 		// MsgContent starts at pos + 12
 		msgStart := pos + 12
 		msgLen := int(size)
+		if msgLen >= 49 { // Minimum size for a V2 RecordBatch header
+			magic := data[msgStart+4]
+			if magic == 2 {
+				// RecordBatch V2: recordsCount is at msgStart + 45 (4 bytes)
+				count += int(binary.BigEndian.Uint32(data[msgStart+45 : msgStart+49]))
+				pos += totalLen
+				continue
+			}
+		}
+
 		if msgLen >= 6 {
 			// attributes is at msgStart + 5
 			attributes := data[msgStart+5]

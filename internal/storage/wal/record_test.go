@@ -186,3 +186,43 @@ func createWrapperMessage(codec byte, value []byte) []byte {
 
 	return entry.Bytes()
 }
+
+func TestCountMessageSet_V2(t *testing.T) {
+	// 1. Single RecordBatch V2 with 5 records
+	v2_5 := createRecordBatchV2(5)
+	if n := CountMessageSet(v2_5); n != 5 {
+		t.Errorf("expected 5 records for V2 batch, got %d", n)
+	}
+
+	// 2. Mixed batch (V0/V1 + V2)
+	v0_1 := createMessage(0, []byte("k1"), []byte("v1"))
+	v2_3 := createRecordBatchV2(3)
+	mixed := append(v0_1, v2_3...)
+	if n := CountMessageSet(mixed); n != 4 {
+		t.Errorf("expected 4 records for mixed batch, got %d", n)
+	}
+}
+
+func createRecordBatchV2(count int32) []byte {
+	var body bytes.Buffer
+	binary.Write(&body, binary.BigEndian, int32(0))      // LeaderEpoch
+	body.WriteByte(2)                                    // Magic
+	binary.Write(&body, binary.BigEndian, uint32(0))     // CRC
+	binary.Write(&body, binary.BigEndian, int16(0))      // Attributes
+	binary.Write(&body, binary.BigEndian, int32(count-1)) // LastOffsetDelta
+	binary.Write(&body, binary.BigEndian, int64(0))      // BaseTimestamp
+	binary.Write(&body, binary.BigEndian, int64(0))      // MaxTimestamp
+	binary.Write(&body, binary.BigEndian, int64(-1))     // ProducerId
+	binary.Write(&body, binary.BigEndian, int16(-1))     // ProducerEpoch
+	binary.Write(&body, binary.BigEndian, int32(-1))     // BaseSequence
+	binary.Write(&body, binary.BigEndian, count)         // RecordsCount
+
+	bodyBytes := body.Bytes()
+	var entry bytes.Buffer
+	binary.Write(&entry, binary.BigEndian, int64(0))               // BaseOffset
+	binary.Write(&entry, binary.BigEndian, int32(len(bodyBytes))) // BatchLength
+	entry.Write(bodyBytes)
+
+	return entry.Bytes()
+}
+
