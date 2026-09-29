@@ -21,7 +21,9 @@ package protocol
 import (
 	"fmt"
 	"log"
+	"time"
 
+	"kimistore/internal/metrics"
 	"kimistore/internal/storage"
 	"kimistore/internal/storage/wal"
 )
@@ -50,8 +52,16 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 	}
 
 	// log.Printf("Produce: Acks=%d Timeout=%d", acks, timeout)
-	_ = acks
 	_ = timeout
+
+	// Durability policy, matching Kafka's acks semantics:
+	//   acks=0  -> no response expected, producer does not want a durability
+	//              guarantee, so skip the fsync and absorb the cost.
+	//   acks=1  -> leader ack; the record must survive a crash.
+	//   acks=-1 -> all in-sync replicas ack; same requirement here, since
+	//              this agent is single-node.
+	// A single-node agent is its own only replica, so acks>=1 means fsync.
+	durable := acks != 0
 
 	// Topics Array
 	count, err := dec.Int32()
@@ -130,7 +140,7 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 				recordCount = 1
 			}
 
-			offset, err := store.Append(topic, partition, batchData, recordCount)
+			offset, err := store.Append(topic, partition, batchData, recordCount, durable)
 
 			// Write Response Partition
 			enc.Int32(partition)
@@ -164,134 +174,202 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 	return enc.Bytes(), nil
 }
 
+// fetchPart is one partition requested by a Fetch.
+type fetchPart struct {
+	partition int32
+	offset    int64
+}
+
+// fetchRequest is a decoded Fetch request. Decoding is separated from
+// responding so the response can be rebuilt after a long-poll wait, which a
+// single streaming pass over the wire buffer cannot do.
+type fetchRequest struct {
+	version       int16
+	minBytes      int32
+	maxWaitMs     int32
+	totalMaxBytes int32
+	partsByTopic  []fetchTopic
+
+	// responseBytes accumulates bytes returned, to enforce totalMaxBytes.
+	responseBytes int32
+}
+
+type fetchTopic struct {
+	topic string
+	parts []fetchPart
+}
+
+// maxFetchWaitMs caps how long a Fetch will park regardless of the client's
+// MaxWaitMs, bounding the resources a long poll can hold. A var so tests can
+// shrink it rather than wait it out.
+var maxFetchWaitMs int32 = 1000
+
 func handleFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
-	// Fetch Request V0-V3:
-	// ReplicaId (int32)
-	// MaxWaitTime (int32)
-	// MinBytes (int32)
-	// MaxBytes (int32) -- added in V3
-	// TopicArray
-
-	replicaID, err := dec.Int32()
+	req, err := decodeFetch(dec, version)
 	if err != nil {
 		return nil, err
 	}
 
-	maxWait, err := dec.Int32()
-	if err != nil {
-		return nil, err
-	}
-
-	minBytes, err := dec.Int32()
-	if err != nil {
-		return nil, err
-	}
-
-	totalMaxBytes := int32(-1)
-	if version >= 3 {
-		totalMaxBytes, err = dec.Int32()
-		if err != nil {
-			return nil, err
+	// Long polling. Previously maxWait was discarded and a caught-up consumer
+	// got an empty response straight away, so the client re-polled
+	// immediately: a tight request loop per consumer, burning CPU and request
+	// budget for an answer that could not have been different. When the client
+	// asked for data (minBytes > 0) and none is available, park briefly so an
+	// arriving append is served in this same round trip.
+	if req.minBytes > 0 && req.maxWaitMs > 0 && !anyDataAvailable(store, req) {
+		wait := req.maxWaitMs
+		if wait > maxFetchWaitMs {
+			wait = maxFetchWaitMs
 		}
+		waitForData(store, wait)
 	}
 
-	// log.Printf("Fetch: Replica=%d Wait=%d MinBytes=%d MaxBytes=%d", replicaID, maxWait, minBytes, totalMaxBytes)
-	_ = replicaID
-	_ = maxWait
-	_ = minBytes
-
-	// We are ignoring Long Polling (MaxWait) for MVP phase.
-
-	// Topics Array
-	count, err := dec.Int32()
-	if err != nil {
-		return nil, err
-	}
-
-	// Fetch Response V1+ adds ThrottleTime at the front of response.
+	// Response header. ThrottleTimeMs leads the body for V1+.
 	if version >= 1 {
-		enc.Int32(0) // ThrottleTimeMs 0
+		enc.Int32(0)
 	}
+	enc.Int32(int32(len(req.partsByTopic)))
 
-	enc.Int32(count)
-	currentResponseSize := int32(0)
+	for _, ft := range req.partsByTopic {
+		enc.String(ft.topic)
+		enc.Int32(int32(len(ft.parts)))
 
-	for i := 0; i < int(count); i++ {
-		topic, err := dec.String()
-		if err != nil {
-			return nil, err
-		}
-
-		enc.String(topic)
-
-		pCount, err := dec.Int32()
-		if err != nil {
-			return nil, err
-		}
-
-		enc.Int32(pCount)
-
-		for j := 0; j < int(pCount); j++ {
-			partition, err := dec.Int32()
-			if err != nil {
-				return nil, err
-			}
-
-			fetchOffset, err := dec.Int64()
-			if err != nil {
-				return nil, err
-			}
-
-			partitionMaxBytes, err := dec.Int32()
-			if err != nil {
-				return nil, err
-			}
-			_ = partitionMaxBytes
-
+		for _, p := range ft.parts {
 			// Enforce totalMaxBytes if V3+
-			if totalMaxBytes > 0 && currentResponseSize >= totalMaxBytes {
-				// We reached the limit, return empty for remaining partitions
-				enc.Int32(partition)
+			if req.totalMaxBytes > 0 && req.responseBytes >= req.totalMaxBytes {
+				enc.Int32(p.partition)
 				enc.Int16(0) // No Error
-				enc.Int64(store.HighWaterMark(topic, partition))
+				enc.Int64(store.HighWaterMark(ft.topic, p.partition))
 				enc.Int32(0) // MessageSetSize 0
 				continue
 			}
 
-			// READ FROM STORAGE
-			hw := store.HighWaterMark(topic, partition)
+			hw := store.HighWaterMark(ft.topic, p.partition)
 
-			// Fast Path: If at HW, return empty immediately without checking storage (avoids S3 calls)
-			if fetchOffset == hw {
-				enc.Int32(partition)
+			// Fast path: already at the end of the log. Answer without
+			// touching storage, so a caught-up consumer costs no S3 calls.
+			if p.offset == hw {
+				enc.Int32(p.partition)
 				enc.Int16(0)  // No Error
 				enc.Int64(hw) // HighwaterMark
 				enc.Int32(0)  // MessageSetSize 0
 				continue
 			}
-			if fetchOffset > hw {
-				enc.Int32(partition)
+			if p.offset > hw {
+				enc.Int32(p.partition)
 				enc.Int16(1) // OffsetOutOfRange
 				enc.Int64(hw)
 				enc.Int32(0)
 				continue
 			}
 
-			data, err := store.Read(topic, partition, fetchOffset)
+			data, rerr := store.Read(ft.topic, p.partition, p.offset)
 
-			enc.Int32(partition)
-			if err != nil {
+			enc.Int32(p.partition)
+			if rerr != nil {
 				enc.Int16(1) // OffsetOutOfRange
 				enc.Int64(hw)
 				enc.Int32(0)
 			} else {
 				enc.Int16(0) // No error
 				enc.Int64(hw)
-				enc.PutBytes(data) // MessageSet raw
-				currentResponseSize += int32(len(data))
+				enc.PutBytes(data)
+				req.responseBytes += int32(len(data))
 			}
 		}
 	}
 
 	return enc.Bytes(), nil
+}
+
+// anyDataAvailable reports whether at least one requested partition has
+// unread data. An offset at or beyond the high watermark has nothing to
+// return: equal means caught up, beyond means out of range.
+func anyDataAvailable(store *storage.StorageEngine, req *fetchRequest) bool {
+	for _, ft := range req.partsByTopic {
+		for _, p := range ft.parts {
+			if p.offset < store.HighWaterMark(ft.topic, p.partition) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// waitForData blocks until an append is signalled or the budget expires. The
+// caller re-checks availability afterwards, since the signal is a broadcast
+// and may have been triggered by an append to a different partition.
+func waitForData(store *storage.StorageEngine, waitMs int32) {
+	metrics.FetchLongPolls.Inc()
+
+	timer := time.NewTimer(time.Duration(waitMs) * time.Millisecond)
+	defer timer.Stop()
+
+	select {
+	case <-store.DataSignal():
+		metrics.FetchLongPollWakeups.WithLabelValues("data").Inc()
+	case <-timer.C:
+		metrics.FetchLongPollWakeups.WithLabelValues("timeout").Inc()
+	}
+}
+
+func decodeFetch(dec *Decoder, version int16) (*fetchRequest, error) {
+	req := &fetchRequest{version: version, totalMaxBytes: -1}
+
+	// ReplicaId (int32), MaxWaitTime (int32), MinBytes (int32)
+	if _, err := dec.Int32(); err != nil { // replicaID
+		return nil, err
+	}
+	maxWait, err := dec.Int32()
+	if err != nil {
+		return nil, err
+	}
+	req.maxWaitMs = maxWait
+
+	minBytes, err := dec.Int32()
+	if err != nil {
+		return nil, err
+	}
+	req.minBytes = minBytes
+
+	if version >= 3 {
+		totalMaxBytes, err := dec.Int32()
+		if err != nil {
+			return nil, err
+		}
+		req.totalMaxBytes = totalMaxBytes
+	}
+
+	count, err := dec.Int32()
+	if err != nil {
+		return nil, err
+	}
+
+	for i := 0; i < int(count); i++ {
+		topic, err := dec.String()
+		if err != nil {
+			return nil, err
+		}
+		pCount, err := dec.Int32()
+		if err != nil {
+			return nil, err
+		}
+		ft := fetchTopic{topic: topic}
+		for j := 0; j < int(pCount); j++ {
+			partition, err := dec.Int32()
+			if err != nil {
+				return nil, err
+			}
+			offset, err := dec.Int64()
+			if err != nil {
+				return nil, err
+			}
+			if _, err := dec.Int32(); err != nil { // partitionMaxBytes
+				return nil, err
+			}
+			ft.parts = append(ft.parts, fetchPart{partition: partition, offset: offset})
+		}
+		req.partsByTopic = append(req.partsByTopic, ft)
+	}
+	return req, nil
 }

@@ -25,6 +25,7 @@ import (
 	"net"
 	"runtime/debug"
 	"sync"
+	"time"
 
 	"kimistore/internal/metrics"
 	"kimistore/internal/protocol"
@@ -38,12 +39,22 @@ type Server struct {
 	wg         sync.WaitGroup
 	storage    *storage.StorageEngine
 	authConfig protocol.AuthConfig
+
+	// stateMu guards the server lifecycle: the listener, the set of live
+	// connections, and the closing flag. Connections are tracked so Stop can
+	// actively tear them down: a handler parked in a blocking read never
+	// observes s.quit on its own, so waiting for it to notice would hang
+	// shutdown for as long as any client stays connected.
+	stateMu sync.Mutex
+	conns   map[net.Conn]struct{}
+	closing bool
 }
 
 func NewServer(addr string, storage *storage.StorageEngine, saslUser, saslPassword string) *Server {
 	return &Server{
 		addr:    addr,
 		quit:    make(chan struct{}),
+		conns:   make(map[net.Conn]struct{}),
 		storage: storage,
 		authConfig: protocol.AuthConfig{
 			Username: saslUser,
@@ -57,7 +68,12 @@ func (s *Server) Start() error {
 	if err != nil {
 		return err
 	}
+
+	// Publish the listener under the lock: Stop may run concurrently and must
+	// not observe a half-published or stale listener.
+	s.stateMu.Lock()
 	s.listener = ln
+	s.stateMu.Unlock()
 
 	for {
 		conn, err := ln.Accept()
@@ -76,12 +92,46 @@ func (s *Server) Start() error {
 	}
 }
 
+// shutdownGrace bounds how long Stop waits for in-flight connection
+// handlers to finish after their sockets have been closed.
+const shutdownGrace = 5 * time.Second
+
 func (s *Server) Stop() error {
 	close(s.quit)
-	if s.listener != nil {
-		s.listener.Close()
+
+	// Mark the server closing before releasing the lock, so the accept path
+	// can no longer register a new handler, and capture the listener to close.
+	s.stateMu.Lock()
+	s.closing = true
+	ln := s.listener
+	s.stateMu.Unlock()
+
+	if ln != nil {
+		ln.Close()
 	}
-	s.wg.Wait()
+
+	// Tear down every live connection, unblocking handlers parked in a read.
+	// Taking the lock here also closes the race with the accept path.
+	s.stateMu.Lock()
+	live := len(s.conns)
+	for c := range s.conns {
+		c.Close()
+	}
+	s.stateMu.Unlock()
+
+	// Wait for handlers to unwind, but never indefinitely: a wedged handler
+	// must not prevent the process from exiting.
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(shutdownGrace):
+		log.Printf("Shutdown: %d connection handler(s) still running after %s; exiting anyway", live, shutdownGrace)
+	}
 	return nil
 }
 
@@ -93,6 +143,22 @@ func (s *Server) handleConnection(conn net.Conn) {
 		if r := recover(); r != nil {
 			log.Printf("Panic in handleConnection: %v\n%s", r, debug.Stack())
 		}
+	}()
+
+	// Register so Stop can tear this connection down. If the server is
+	// already closing, refuse rather than joining the wait group after the
+	// shutdown sweep has already run.
+	s.stateMu.Lock()
+	if s.closing {
+		s.stateMu.Unlock()
+		return
+	}
+	s.conns[conn] = struct{}{}
+	s.stateMu.Unlock()
+	defer func() {
+		s.stateMu.Lock()
+		delete(s.conns, conn)
+		s.stateMu.Unlock()
 	}()
 
 	metrics.IncConnection()

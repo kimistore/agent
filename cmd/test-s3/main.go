@@ -39,7 +39,7 @@ func main() {
 		return
 	}
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	s, err := s3.NewStore(ctx, bucket, "us-east-1") // Assumed region
 	if err != nil {
 		log.Fatal(err)

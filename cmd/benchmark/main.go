@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -86,7 +87,15 @@ func main() {
 	}()
 	defer srv.Stop()
 
-	time.Sleep(1 * time.Second)
+	// Wait for server to start
+	for i := 0; i < 100; i++ {
+		conn, err := net.Dial("tcp", "localhost:"+port)
+		if err == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// 4. Create Topic with 4 Partitions
 	topic := "bench-multi"

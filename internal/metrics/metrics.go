@@ -76,6 +76,46 @@ var (
 		Help: "Total number of bytes uploaded to S3",
 	})
 
+	// Consumer group offset persistence
+	OffsetsFlushed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_offsets_flushed_total",
+		Help: "Total number of consumer group offsets successfully persisted to object storage",
+	})
+
+	OffsetFlushFailures = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_offset_flush_failures_total",
+		Help: "Total number of failed object storage writes for consumer group offsets (these are retried, not dropped)",
+	})
+
+	// Retention
+	RetentionSegmentsDeleted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_retention_segments_deleted_total",
+		Help: "Total number of log segments reclaimed by retention",
+	})
+
+	// Coordinator / session reaper
+	CoordinatorEvictions = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_coordinator_evicted_members_total",
+		Help: "Total number of consumer group members evicted for exceeding their session timeout",
+	})
+
+	// Long-poll signalling: how many Fetch requests parked waiting for data.
+	FetchLongPolls = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_fetch_longpoll_total",
+		Help: "Total number of Fetch requests that blocked waiting for new data instead of returning empty",
+	})
+
+	FetchLongPollWakeups = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "kimistore_fetch_longpoll_wakeup_total",
+		Help: "Long-polled Fetch requests by outcome: woke with data, or timed out",
+	}, []string{"outcome"})
+
+	// WAL recovery
+	WALRecoveryTruncations = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_wal_recovery_truncations_total",
+		Help: "Total number of times WAL recovery discarded a torn or corrupt trailing record after an unclean shutdown",
+	})
+
 	// These will be registered manually via callbacks
 	TopicCount     prometheus.GaugeFunc
 	PartitionCount prometheus.GaugeFunc

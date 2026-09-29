@@ -59,23 +59,46 @@ type StorageEngine struct {
 	offsetBuf   map[string]int64
 	offsetBufMu sync.Mutex
 
+	// committedByGroup tracks each group's committed offset per topic/partition.
+	// The retention log-start is the minimum across groups, computed on demand.
+	//
+	// This must be per-group rather than a single running minimum: a single
+	// min map can never increase, so a group that advances its commit would
+	// leave retention permanently over-protecting segments it no longer needs.
+	committedMu      sync.Mutex
+	committedByGroup map[string]map[string]int64
+	// committedAuthoritative is set once consumer offsets have been loaded
+	// from object storage. Until then retention must not run, because an
+	// empty map would look exactly like "no consumers" and invite deletion of
+	// data a consumer still needs.
+	committedAuthoritative bool
+
 	retentionCfg RetentionConfig
 
 	metadataCache *MetadataCache
 	coordinator   *coordinator.Coordinator
+
+	// dataCh is a broadcast latch signalled on every successful append, so a
+	// long-polling Fetch can park until there is something to read instead of
+	// returning empty immediately and being re-polled at full speed. Guarded
+	// by dataMu.
+	dataMu sync.Mutex
+	dataCh chan struct{}
 }
 
 func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retentionCfg RetentionConfig) (*StorageEngine, error) {
 	se := &StorageEngine{
-		objStore:      objStore,
-		bucket:        bucket,
-		walDir:        walDir,
-		quit:          make(chan struct{}),
-		uploadChan:    make(chan wal.UploadTask, 1024),
-		segmentCache:  make(map[string][]string),
-		offsetBuf:     make(map[string]int64),
-		retentionCfg:  retentionCfg,
-		metadataCache: NewMetadataCache(),
+		objStore:         objStore,
+		bucket:           bucket,
+		walDir:           walDir,
+		quit:             make(chan struct{}),
+		uploadChan:       make(chan wal.UploadTask, 1024),
+		segmentCache:     make(map[string][]string),
+		offsetBuf:        make(map[string]int64),
+		committedByGroup: make(map[string]map[string]int64),
+		retentionCfg:     retentionCfg,
+		metadataCache:    NewMetadataCache(),
+		dataCh:           make(chan struct{}),
 	}
 
 	onRoll := func(task wal.UploadTask) {
@@ -112,13 +135,49 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 	go se.retentionLoop()
 	go se.checkpointLoop()
 
+	// Load consumer offsets from object storage so retention knows the log
+	// start. Registered on the wait group so Close cannot return while it is
+	// still using the object store.
+	se.wg.Add(1)
+	go func() {
+		defer se.wg.Done()
+		se.rehydrateCommittedOffsets(context.Background())
+	}()
+
 	return se, nil
 }
 
-func (s *StorageEngine) Append(topic string, partition int32, batch []byte, recordCount int) (int64, error) {
+// Append writes a batch and returns its base offset. When sync is true the
+// data is fsynced before returning, so the offset may be acknowledged to the
+// producer as durable. Callers should set sync from the request's acks value
+// (acks=0 is fire-and-forget; acks>=1 promises durability).
+func (s *StorageEngine) Append(topic string, partition int32, batch []byte, recordCount int, sync bool) (int64, error) {
 	// Update Cache (Idempotent)
 	s.metadataCache.AddPartition(topic, partition)
-	return s.walMgr.Append(topic, partition, batch, recordCount)
+	offset, err := s.walMgr.Append(topic, partition, batch, recordCount, sync)
+	if err == nil {
+		// Wake any long-polling Fetch requests. Signalled after the write so
+		// a woken reader is guaranteed to observe the new high watermark.
+		s.signalData()
+	}
+	return offset, err
+}
+
+// signalData broadcasts that new data is available.
+func (s *StorageEngine) signalData() {
+	s.dataMu.Lock()
+	close(s.dataCh)
+	s.dataCh = make(chan struct{})
+	s.dataMu.Unlock()
+}
+
+// DataSignal returns a channel closed on the next successful append. Callers
+// must re-check their condition after it fires, since it is a broadcast and
+// may be triggered by an append to a different partition.
+func (s *StorageEngine) DataSignal() <-chan struct{} {
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
+	return s.dataCh
 }
 
 func (s *StorageEngine) Read(topic string, partition int32, offset int64) ([]byte, error) {
@@ -178,7 +237,7 @@ func (s *StorageEngine) Read(topic string, partition int32, offset int64) ([]byt
 
 		if bestKey == "" {
 			// Actually list S3
-			ctx := context.TODO()
+			ctx := context.Background()
 			objects, err := s.objStore.List(ctx, prefix)
 			if err != nil {
 				s.cacheMu.Unlock()
@@ -201,7 +260,7 @@ func (s *StorageEngine) Read(topic string, partition int32, offset int64) ([]byt
 	}
 
 	// Indexed Read Logic
-	ctx := context.TODO()
+	ctx := context.Background()
 	indexKey := strings.TrimSuffix(bestKey, ".log") + ".index"
 
 	// Try to get index
@@ -295,15 +354,43 @@ func (s *StorageEngine) CreateTopic(topic string, partitions int32) error {
 }
 
 func (s *StorageEngine) DeleteTopic(topic string) error {
-	// Also remove from S3?
-	// For MVP, deleting local WAL is mostly what we control.
-	// Deleting from S3 needs LIST + DELETE which is heavy.
-	// We'll leave S3 cleanup for later or async process.
 	err := s.walMgr.DeleteTopic(topic)
 	if err == nil {
 		s.metadataCache.RemoveTopic(topic)
+		// Drop retention bookkeeping for the topic across every group.
+		s.committedMu.Lock()
+		for _, byGroup := range s.committedByGroup {
+			for k := range byGroup {
+				if strings.HasPrefix(k, topic+"/") {
+					delete(byGroup, k)
+				}
+			}
+		}
+		s.committedMu.Unlock()
+		// Delete cold segments from Object Storage asynchronously in the background
+		go s.asyncDeleteTopicFromS3(topic)
 	}
 	return err
+}
+
+func (s *StorageEngine) asyncDeleteTopicFromS3(topic string) {
+	ctx := context.Background()
+	prefix := topic + "/"
+	objects, err := s.objStore.List(ctx, prefix)
+	if err != nil {
+		log.Printf("Async S3 cleanup: Failed to list S3 objects for topic %s: %v", topic, err)
+		return
+	}
+
+	for _, obj := range objects {
+		if strings.HasPrefix(obj.Key, prefix) {
+			if err := s.objStore.Delete(ctx, obj.Key); err != nil {
+				log.Printf("Async S3 cleanup: Failed to delete cold object %s: %v", obj.Key, err)
+			} else {
+				log.Printf("Async S3 cleanup: Deleted cold object %s", obj.Key)
+			}
+		}
+	}
 }
 
 func scanStreamForOffset(r io.Reader, targetOffset int64) ([]byte, error) {
@@ -545,7 +632,23 @@ func (s *StorageEngine) SaveOffset(groupID, topic string, partition int32, offse
 	s.offsetBufMu.Lock()
 	s.offsetBuf[key] = offset
 	s.offsetBufMu.Unlock()
+
+	s.recordCommitted(groupID, topic, partition, offset)
 	return nil
+}
+
+// recordCommitted notes a group's latest committed offset. Retention derives
+// its log start from the minimum across groups, so this must track each group
+// independently.
+func (s *StorageEngine) recordCommitted(groupID, topic string, partition int32, offset int64) {
+	tp := topic + "/" + strconv.Itoa(int(partition))
+
+	s.committedMu.Lock()
+	defer s.committedMu.Unlock()
+	if s.committedByGroup[groupID] == nil {
+		s.committedByGroup[groupID] = make(map[string]int64)
+	}
+	s.committedByGroup[groupID][tp] = offset
 }
 
 func (s *StorageEngine) offsetFlusherLoop() {
@@ -556,11 +659,42 @@ func (s *StorageEngine) offsetFlusherLoop() {
 	for {
 		select {
 		case <-s.quit:
-			s.flushOffsets()
+			// Shutting down: the client was told these commits succeeded, so
+			// give the object store a few chances before we exit rather than
+			// dropping them on a transient error.
+			s.flushOffsetsOnShutdown()
 			return
 		case <-ticker.C:
 			s.flushOffsets()
 		}
+	}
+}
+
+// flushOffsetsOnShutdown retries the offset flush a bounded number of times so
+// a brief object-store hiccup during termination does not lose acked commits.
+func (s *StorageEngine) flushOffsetsOnShutdown() {
+	const attempts = 3
+	for i := 1; i <= attempts; i++ {
+		s.flushOffsets()
+
+		s.offsetBufMu.Lock()
+		remaining := len(s.offsetBuf)
+		s.offsetBufMu.Unlock()
+		if remaining == 0 {
+			return
+		}
+		if i < attempts {
+			log.Printf("Shutdown: %d offset(s) still unflushed, retrying (%d/%d)", remaining, i+1, attempts)
+			time.Sleep(time.Duration(i) * 250 * time.Millisecond)
+		}
+	}
+
+	s.offsetBufMu.Lock()
+	remaining := len(s.offsetBuf)
+	s.offsetBufMu.Unlock()
+	if remaining > 0 {
+		log.Printf("Shutdown: giving up on %d offset(s) that could not be written to object storage; "+
+			"consumers will resume from the last persisted position", remaining)
 	}
 }
 
@@ -570,24 +704,36 @@ func (s *StorageEngine) flushOffsets() {
 		s.offsetBufMu.Unlock()
 		return
 	}
-	// Copy buffer to release lock quickly
-	todo := make(map[string]int64)
+	// Snapshot under the lock, then release it before doing network I/O.
+	// Entries are NOT removed here: a commit was already acknowledged to the
+	// client, so it stays in the buffer until we know it is safely in S3.
+	todo := make(map[string]int64, len(s.offsetBuf))
 	for k, v := range s.offsetBuf {
 		todo[k] = v
 	}
-
-	// Clear buffer (assume we will succeed or retry in next call if we failed? MVP: simple clear)
-	s.offsetBuf = make(map[string]int64)
 	s.offsetBufMu.Unlock()
 
 	ctx := context.Background()
 	for k, offset := range todo {
 		// k is "groupID/topic/partition"
 		s3Key := fmt.Sprintf("_offsets/%s", k)
-		data := []byte(fmt.Sprintf("%d", offset))
-		if err := s.objStore.Put(ctx, s3Key, strings.NewReader(string(data))); err != nil {
-			log.Printf("Failed to flush offset %s: %v", s3Key, err)
+		data := []byte(strconv.FormatInt(offset, 10))
+		if err := s.objStore.Put(ctx, s3Key, bytes.NewReader(data)); err != nil {
+			// Leave the entry in the buffer so the next tick retries it.
+			// Dropping it here would silently discard a commit the client
+			// was already told had succeeded.
+			metrics.OffsetFlushFailures.Inc()
+			log.Printf("Failed to flush offset %s (%d): %v -- will retry", s3Key, offset, err)
+			continue
 		}
+		metrics.OffsetsFlushed.Inc()
+		// Only clear the entry if it has not been superseded by a newer
+		// commit while this write was in flight.
+		s.offsetBufMu.Lock()
+		if cur, ok := s.offsetBuf[k]; ok && cur == offset {
+			delete(s.offsetBuf, k)
+		}
+		s.offsetBufMu.Unlock()
 	}
 }
 
@@ -622,6 +768,13 @@ func (s *StorageEngine) SaveCheckpoint() error {
 		state := s.coordinator.ToState()
 		s.metadataCache.Coordinator = &state
 	}
+
+	// Carry consumer offsets into the checkpoint so a graceful restart does
+	// not have to re-read every offset object before retention may run.
+	s.committedMu.Lock()
+	s.metadataCache.Committed = cloneCommitted(s.committedByGroup)
+	s.committedMu.Unlock()
+
 	data, err := s.metadataCache.ToJSON()
 	if err != nil {
 		return err
@@ -663,14 +816,136 @@ func (s *StorageEngine) LoadCheckpoint() error {
 		log.Printf("Restored coordinator state from checkpoint")
 	}
 
+	// Merge any offsets carried in the checkpoint. Rehydration from object
+	// storage is authoritative and runs separately, so a checkpoint that is
+	// missing or stale cannot understate what consumers need.
+	if len(s.metadataCache.Committed) > 0 {
+		s.committedMu.Lock()
+		groups := 0
+		for group, byPartition := range s.metadataCache.Committed {
+			for tp, off := range byPartition {
+				s.recordLocked(group, tp, off)
+			}
+			groups++
+		}
+		s.committedMu.Unlock()
+		log.Printf("Restored committed offsets for %d group(s) from checkpoint", groups)
+	}
+
 	log.Printf("Loaded metadata cache from checkpoint %s (%d bytes)", key, len(data))
 	return nil
+}
+
+func cloneCommitted(in map[string]map[string]int64) map[string]map[string]int64 {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]map[string]int64, len(in))
+	for group, byPartition := range in {
+		cp := make(map[string]int64, len(byPartition))
+		for k, v := range byPartition {
+			cp[k] = v
+		}
+		out[group] = cp
+	}
+	return out
+}
+
+// recordLocked stores a commit. Callers must hold committedMu.
+func (s *StorageEngine) recordLocked(group, topicPartition string, offset int64) {
+	if s.committedByGroup[group] == nil {
+		s.committedByGroup[group] = make(map[string]int64)
+	}
+	s.committedByGroup[group][topicPartition] = offset
+}
+
+// offsetsPrefix is the object-store location of consumer group offsets.
+const offsetsPrefix = "_offsets/"
+
+// rehydrateCommittedOffsets rebuilds per-group committed offsets from object
+// storage, which is the authoritative record of what consumers have claimed.
+//
+// The checkpoint only covers up to 30s of commits, and may be missing or
+// stale entirely. Retention must not treat "no offsets known" as "no
+// consumers", so it stays disabled until this has run. The engine fails
+// closed: if the offsets cannot be read, retention does not run at all,
+// because it cannot prove a segment is safe to delete.
+func (s *StorageEngine) rehydrateCommittedOffsets(ctx context.Context) {
+	objects, err := s.objStore.List(ctx, offsetsPrefix)
+	if err != nil {
+		log.Printf("Retention: cannot read consumer offsets from %s: %v -- "+
+			"retention is disabled until offsets can be read", offsetsPrefix, err)
+		return
+	}
+
+	restored, skipped := 0, 0
+	for _, obj := range objects {
+		group, topicPartition, ok := parseOffsetKey(obj.Key)
+		if !ok {
+			skipped++
+			continue
+		}
+
+		rc, err := s.objStore.Get(ctx, obj.Key)
+		if err != nil {
+			skipped++
+			continue
+		}
+		raw, readErr := io.ReadAll(rc)
+		rc.Close()
+		if readErr != nil {
+			skipped++
+			continue
+		}
+		off, convErr := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+		if convErr != nil {
+			skipped++
+			continue
+		}
+
+		s.committedMu.Lock()
+		s.recordLocked(group, topicPartition, off)
+		s.committedMu.Unlock()
+		restored++
+	}
+
+	s.committedMu.Lock()
+	s.committedAuthoritative = true
+	groups := len(s.committedByGroup)
+	s.committedMu.Unlock()
+
+	if skipped > 0 {
+		log.Printf("Retention: %d committed offset object(s) could not be read and were skipped; "+
+			"retention will over-protect rather than risk deleting live data", skipped)
+	}
+	log.Printf("Retention: rehydrated %d committed offset(s) across %d group(s) from %s", restored, groups, offsetsPrefix)
+}
+
+// parseOffsetKey splits "_offsets/<group>/<topic>/<partition>" into its parts.
+// The partition is the final segment and the topic the one before it, so a
+// group name containing slashes still parses correctly.
+func parseOffsetKey(key string) (group, topicPartition string, ok bool) {
+	rest := strings.TrimPrefix(key, offsetsPrefix)
+	if rest == key {
+		return "", "", false
+	}
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) < 3 {
+		return "", "", false
+	}
+	partition := parts[len(parts)-1]
+	topic := parts[len(parts)-2]
+	group = strings.Join(parts[:len(parts)-2], "/")
+	if group == "" || topic == "" || partition == "" {
+		return "", "", false
+	}
+	return group, topic + "/" + partition, true
 }
 
 func (s *StorageEngine) LoadOffset(groupID, topic string, partition int32) (int64, error) {
 	key := fmt.Sprintf("_offsets/%s/%s/%d", groupID, topic, partition)
 
-	ctx := context.TODO()
+	ctx := context.Background()
 	rc, err := s.objStore.Get(ctx, key)
 	if err != nil {
 		// Assume not found if error (simplified)
@@ -687,6 +962,8 @@ func (s *StorageEngine) LoadOffset(groupID, topic string, partition int32) (int6
 	if err != nil {
 		return -1, err
 	}
+	// A commit read back from storage also constrains retention.
+	s.recordCommitted(groupID, topic, partition, offset)
 	return offset, nil
 }
 

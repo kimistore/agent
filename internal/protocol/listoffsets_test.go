@@ -44,7 +44,7 @@ func TestListOffsets(t *testing.T) {
 
 	// Write 5 batches to get HWM of 5
 	for i := 0; i < 5; i++ {
-		_, err := engine.Append(topic, partition, []byte("test-data"), 1)
+		_, err := engine.Append(topic, partition, []byte("test-data"), 1, true)
 		if err != nil {
 			t.Fatalf("Failed to append: %v", err)
 		}
@@ -61,13 +61,13 @@ func TestListOffsets(t *testing.T) {
 		// ReplicaId (int32) + TopicCount (int32) + Topic (string) + PartitionCount (int32)
 		// + Partition (int32) + Timestamp (int64) + MaxNumOffsets (int32)
 		reqEnc := NewEncoder()
-		reqEnc.Int32(-1)           // ReplicaId
-		reqEnc.Int32(1)            // Topic count
-		reqEnc.String(topic)       // Topic name
-		reqEnc.Int32(1)            // Partition count
-		reqEnc.Int32(partition)    // Partition
-		reqEnc.Int64(-1)           // Timestamp: -1 = latest
-		reqEnc.Int32(1)            // MaxNumOffsets (V0 only)
+		reqEnc.Int32(-1)        // ReplicaId
+		reqEnc.Int32(1)         // Topic count
+		reqEnc.String(topic)    // Topic name
+		reqEnc.Int32(1)         // Partition count
+		reqEnc.Int32(partition) // Partition
+		reqEnc.Int64(-1)        // Timestamp: -1 = latest
+		reqEnc.Int32(1)         // MaxNumOffsets (V0 only)
 
 		dec := NewDecoder(reqEnc.Bytes())
 		respEnc := NewEncoder()
@@ -118,13 +118,13 @@ func TestListOffsets(t *testing.T) {
 
 	t.Run("V0_Earliest", func(t *testing.T) {
 		reqEnc := NewEncoder()
-		reqEnc.Int32(-1)           // ReplicaId
-		reqEnc.Int32(1)            // Topic count
-		reqEnc.String(topic)       // Topic name
-		reqEnc.Int32(1)            // Partition count
-		reqEnc.Int32(partition)    // Partition
-		reqEnc.Int64(-2)           // Timestamp: -2 = earliest
-		reqEnc.Int32(1)            // MaxNumOffsets (V0 only)
+		reqEnc.Int32(-1)        // ReplicaId
+		reqEnc.Int32(1)         // Topic count
+		reqEnc.String(topic)    // Topic name
+		reqEnc.Int32(1)         // Partition count
+		reqEnc.Int32(partition) // Partition
+		reqEnc.Int64(-2)        // Timestamp: -2 = earliest
+		reqEnc.Int32(1)         // MaxNumOffsets (V0 only)
 
 		dec := NewDecoder(reqEnc.Bytes())
 		respEnc := NewEncoder()
@@ -135,12 +135,12 @@ func TestListOffsets(t *testing.T) {
 		}
 
 		respDec := NewDecoder(respBytes)
-		respDec.Int32() // topic count
+		respDec.Int32()  // topic count
 		respDec.String() // topic
-		respDec.Int32() // partition count
-		respDec.Int32() // partition
-		respDec.Int16() // error code
-		respDec.Int32() // offset count
+		respDec.Int32()  // partition count
+		respDec.Int32()  // partition
+		respDec.Int16()  // error code
+		respDec.Int32()  // offset count
 
 		offset, _ := respDec.Int64()
 		if offset != 0 {
@@ -151,12 +151,12 @@ func TestListOffsets(t *testing.T) {
 	t.Run("V1_Latest", func(t *testing.T) {
 		// Build ListOffsets V1 request (no MaxNumOffsets field)
 		reqEnc := NewEncoder()
-		reqEnc.Int32(-1)           // ReplicaId
-		reqEnc.Int32(1)            // Topic count
-		reqEnc.String(topic)       // Topic name
-		reqEnc.Int32(1)            // Partition count
-		reqEnc.Int32(partition)    // Partition
-		reqEnc.Int64(-1)           // Timestamp: -1 = latest
+		reqEnc.Int32(-1)        // ReplicaId
+		reqEnc.Int32(1)         // Topic count
+		reqEnc.String(topic)    // Topic name
+		reqEnc.Int32(1)         // Partition count
+		reqEnc.Int32(partition) // Partition
+		reqEnc.Int64(-1)        // Timestamp: -1 = latest
 
 		dec := NewDecoder(reqEnc.Bytes())
 		respEnc := NewEncoder()
@@ -211,12 +211,12 @@ func TestListOffsets(t *testing.T) {
 
 	t.Run("V1_Earliest", func(t *testing.T) {
 		reqEnc := NewEncoder()
-		reqEnc.Int32(-1)           // ReplicaId
-		reqEnc.Int32(1)            // Topic count
-		reqEnc.String(topic)       // Topic name
-		reqEnc.Int32(1)            // Partition count
-		reqEnc.Int32(partition)    // Partition
-		reqEnc.Int64(-2)           // Timestamp: -2 = earliest
+		reqEnc.Int32(-1)        // ReplicaId
+		reqEnc.Int32(1)         // Topic count
+		reqEnc.String(topic)    // Topic name
+		reqEnc.Int32(1)         // Partition count
+		reqEnc.Int32(partition) // Partition
+		reqEnc.Int64(-2)        // Timestamp: -2 = earliest
 
 		dec := NewDecoder(reqEnc.Bytes())
 		respEnc := NewEncoder()
@@ -227,13 +227,13 @@ func TestListOffsets(t *testing.T) {
 		}
 
 		respDec := NewDecoder(respBytes)
-		respDec.Int32() // throttle time
-		respDec.Int32() // topic count
+		respDec.Int32()  // throttle time
+		respDec.Int32()  // topic count
 		respDec.String() // topic
-		respDec.Int32() // partition count
-		respDec.Int32() // partition
-		respDec.Int16() // error code
-		respDec.Int64() // timestamp
+		respDec.Int32()  // partition count
+		respDec.Int32()  // partition
+		respDec.Int16()  // error code
+		respDec.Int64()  // timestamp
 
 		offset, _ := respDec.Int64()
 		if offset != 0 {
@@ -259,13 +259,13 @@ func TestListOffsets(t *testing.T) {
 		}
 
 		respDec := NewDecoder(respBytes)
-		respDec.Int32() // throttle time
-		respDec.Int32() // topic count
+		respDec.Int32()  // throttle time
+		respDec.Int32()  // topic count
 		respDec.String() // topic
-		respDec.Int32() // partition count
-		respDec.Int32() // partition
-		respDec.Int16() // error code
-		respDec.Int64() // timestamp
+		respDec.Int32()  // partition count
+		respDec.Int32()  // partition
+		respDec.Int16()  // error code
+		respDec.Int64()  // timestamp
 
 		offset, _ := respDec.Int64()
 		// Non-existent topic should return 0 (empty)

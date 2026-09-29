@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 
@@ -29,9 +30,13 @@ import (
 )
 
 type MetadataCache struct {
-	Topics      map[string]*TopicState          `json:"topics"`
+	Topics      map[string]*TopicState        `json:"topics"`
 	Coordinator *coordinator.CoordinatorState `json:"coordinator,omitempty"`
-	mu          sync.RWMutex
+	// Committed carries per-group consumer offsets so retention's log start
+	// survives a restart without re-reading every offset object. Object
+	// storage remains authoritative; this is a fast path on top of it.
+	Committed map[string]map[string]int64 `json:"committed_offsets,omitempty"`
+	mu        sync.RWMutex
 }
 
 type TopicState struct {
@@ -59,7 +64,6 @@ func NewMetadataCache() *MetadataCache {
 		Topics: make(map[string]*TopicState),
 	}
 }
-
 func (mc *MetadataCache) Load(walDir string) error {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
@@ -178,6 +182,24 @@ func (mc *MetadataCache) AddPartition(topic string, partition int32) {
 	}
 }
 
+// GetPartitions returns the known partitions for a topic. Retention uses this
+// rather than scanning the local WAL directory, so a topic whose segments have
+// all been offloaded (leaving no local directory) is still cleaned up.
+func (mc *MetadataCache) GetPartitions(topic string) []int32 {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	ts, ok := mc.Topics[topic]
+	if !ok {
+		return nil
+	}
+	parts := make([]int32, 0, len(ts.Partitions))
+	for p := range ts.Partitions {
+		parts = append(parts, p)
+	}
+	sort.Slice(parts, func(i, j int) bool { return parts[i] < parts[j] })
+	return parts
+}
+
 func (mc *MetadataCache) RemoveTopic(topic string) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
@@ -195,7 +217,7 @@ func (mc *MetadataCache) FromJSON(data []byte) error {
 	defer mc.mu.Unlock()
 
 	var state struct {
-		Topics      map[string]*TopicState          `json:"topics"`
+		Topics      map[string]*TopicState        `json:"topics"`
 		Coordinator *coordinator.CoordinatorState `json:"coordinator"`
 	}
 	if err := json.Unmarshal(data, &state); err != nil {

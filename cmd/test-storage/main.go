@@ -131,14 +131,14 @@ func main() {
 	fmt.Println("Writing messages...")
 	for i := 0; i < 10; i++ {
 		msg := []byte(fmt.Sprintf("msg-%d", i))
-		if _, err := engine.Append(topic, partition, msg, 1); err != nil {
+		if _, err := engine.Append(topic, partition, msg, 1, true); err != nil {
 			log.Fatal(err)
 		}
 	}
 
 	// 2. Write a large message to force roll (our limit is 1MB, so write 1.1MB)
 	largeMsg := make([]byte, 1153434) // ~1.1MB
-	if _, err := engine.Append(topic, partition, largeMsg, 1); err != nil {
+	if _, err := engine.Append(topic, partition, largeMsg, 1, true); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("Wrote large message to trigger roll.")
@@ -150,7 +150,7 @@ func main() {
 	// NEXT Append checks size and rolls.
 
 	// So we need ONE MORE append to trigger the roll of the large segment.
-	if _, err := engine.Append(topic, partition, []byte("trigger-roll"), 1); err != nil {
+	if _, err := engine.Append(topic, partition, []byte("trigger-roll"), 1, true); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("Wrote trigger message.")
@@ -158,13 +158,23 @@ func main() {
 	// Now the segment containing the large message (and the small ones) should be sealed as `000...00.log`
 	// (Check activeBaseOffset logic: first append set it to 0).
 
-	// Wait for uploader
+	// Wait for uploader (Poll MockStore instead of arbitrary sleep)
 	fmt.Println("Waiting for uploader...")
-	time.Sleep(5 * time.Second)
+	start := time.Now()
+	var count int
+	for time.Since(start) < 5*time.Second {
+		store.mu.Lock()
+		count = len(store.data)
+		store.mu.Unlock()
+		if count >= 2 { // Expected: at least 1 log segment + 1 index file
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// Check MockStore
 	store.mu.Lock()
-	count := len(store.data)
+	count = len(store.data)
 	store.mu.Unlock()
 
 	fmt.Printf("MockStore has %d objects.\n", count)

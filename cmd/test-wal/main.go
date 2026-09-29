@@ -41,7 +41,7 @@ func main() {
 
 	// Write
 	msg := []byte("Hello Kimistore!")
-	off, err := mgr.Append(topic, partition, msg, 1)
+	off, err := mgr.Append(topic, partition, msg, 1, true)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func main() {
 	}
 
 	// Write more
-	off2, _ := mgr.Append(topic, partition, []byte("Msg 2"), 1)
+	off2, _ := mgr.Append(topic, partition, []byte("Msg 2"), 1, true)
 	fmt.Printf("Appended at offset: %d\n", off2)
 
 	readMsg2, _ := mgr.Read(topic, partition, off2)

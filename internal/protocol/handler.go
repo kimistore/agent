@@ -19,6 +19,7 @@
 package protocol
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -261,7 +262,6 @@ func handleJoinGroup(dec *Decoder, enc *Encoder, version int16) ([]byte, error) 
 	if err != nil {
 		errorCode = ErrGroupAuthorizationFailed
 	}
-
 	// JoinGroup Response V0
 	enc.Int16(errorCode)
 	enc.Int32(generationID)
@@ -319,9 +319,22 @@ func handleSyncGroup(dec *Decoder, enc *Encoder, version int16) ([]byte, error) 
 	errorCode := int16(ErrNone)
 	if err != nil {
 		log.Printf("SyncGroup Error: %v", err)
-		errorCode = 25 // UnknownMemberId? or RebalanceInProgress?
-		// 25 = UnknownMemberId
-		// 27 = RebalanceInProgress
+		// Map coordinator outcomes onto the Kafka codes clients expect. The
+		// distinction matters: RebalanceInProgress tells the client to rejoin
+		// immediately, whereas UnknownMemberId makes it discard its member ID.
+		switch err {
+		case coordinator.ErrRebalanceInProgress:
+			errorCode = 27 // RebalanceInProgress
+		case coordinator.ErrMemberNotFound:
+			errorCode = 25 // UnknownMemberId
+		case coordinator.ErrSyncTimeout:
+			// 80 = UnstableOffsetCommitPhase in newer protocols; for the V0/V1
+			// range a RebalanceInProgress is the closest honest answer and
+			// makes the client back off and rejoin.
+			errorCode = 27
+		default:
+			errorCode = 25
+		}
 	}
 
 	// SyncGroup Response V0
@@ -339,7 +352,14 @@ func handleHeartbeat(dec *Decoder, enc *Encoder, version int16) ([]byte, error) 
 	err := GlobalCoordinator.Heartbeat(groupID, memberID, generationID)
 	errorCode := int16(ErrNone)
 	if err != nil {
-		errorCode = 27 // RebalanceInProgress usually triggers rejoin
+		// A member the reaper has already evicted should be told to rejoin
+		// rather than simply "in progress", so its client regenerates state
+		// and picks up a fresh assignment.
+		if errors.Is(err, coordinator.ErrMemberNotFound) {
+			errorCode = 25 // UnknownMemberId
+		} else {
+			errorCode = 27 // RebalanceInProgress
+		}
 	}
 
 	enc.Int16(errorCode)
@@ -350,7 +370,11 @@ func handleLeaveGroup(dec *Decoder, enc *Encoder, version int16) ([]byte, error)
 	groupID, _ := dec.String()
 	memberID, _ := dec.String()
 
-	_ = GlobalCoordinator.LeaveGroup(groupID, memberID)
+	// Leaving is best-effort: a client may leave after the reaper has already
+	// evicted it, and that is not an error worth failing the request over.
+	if err := GlobalCoordinator.LeaveGroup(groupID, memberID); err != nil {
+		log.Printf("LeaveGroup: %s/%s: %v", groupID, memberID, err)
+	}
 
 	enc.Int16(ErrNone)
 	return enc.Bytes(), nil
@@ -606,7 +630,6 @@ func handleMetadata(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ve
 
 	return enc.Bytes(), nil
 }
-
 
 func handleSaslHandshake(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
 	// SaslHandshake Request V0:

@@ -29,7 +29,7 @@ func main() {
 	batchSize := 100 // Send 100KB per write (approx)
 
 	startTime := time.Now()
-	
+
 	for totalSent < targetSize {
 		msgs := make([]kafka.Message, batchSize)
 		for i := 0; i < batchSize; i++ {
@@ -44,7 +44,7 @@ func main() {
 		}
 
 		totalSent += len(payload) * batchSize
-		
+
 		// Progress update every 100MB
 		if totalSent%(100*1024*1024) == 0 {
 			elapsed := time.Since(startTime)
@@ -52,6 +52,6 @@ func main() {
 			fmt.Printf("Sent %d MB (%.2f MB/s)\n", totalSent/1024/1024, rate)
 		}
 	}
-	
+
 	fmt.Printf("Done! Sent 1GB in %v\n", time.Since(startTime))
 }

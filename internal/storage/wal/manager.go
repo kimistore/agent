@@ -71,12 +71,14 @@ func (m *Manager) getPartitionWAL(topic string, partition int32) (*PartitionWAL,
 	return p, nil
 }
 
-func (m *Manager) Append(topic string, partition int32, batch []byte, recordCount int) (int64, error) {
+// Append writes a batch to the partition's WAL. sync=true fsyncs before
+// returning, making the returned offset safe to acknowledge to the client.
+func (m *Manager) Append(topic string, partition int32, batch []byte, recordCount int, sync bool) (int64, error) {
 	p, err := m.getPartitionWAL(topic, partition)
 	if err != nil {
 		return 0, err
 	}
-	return p.Append(batch, recordCount)
+	return p.Append(batch, recordCount, sync)
 }
 
 func (m *Manager) Read(topic string, partition int32, offset int64) ([]byte, error) {

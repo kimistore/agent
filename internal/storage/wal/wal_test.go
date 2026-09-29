@@ -44,7 +44,7 @@ func TestWALManager_AppendRead(t *testing.T) {
 
 	// Append 1
 	data1 := []byte("hello")
-	off1, err := mgr.Append(topic, partition, data1, 1)
+	off1, err := mgr.Append(topic, partition, data1, 1, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestWALManager_AppendRead(t *testing.T) {
 
 	// Append 2
 	data2 := []byte("world")
-	off2, err := mgr.Append(topic, partition, data2, 1)
+	off2, err := mgr.Append(topic, partition, data2, 1, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestPartitionWAL_Roll(t *testing.T) {
 	chunk := make([]byte, 500*1024)
 
 	// Write 1
-	if _, err := p.Append(chunk, 1); err != nil {
+	if _, err := p.Append(chunk, 1, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -116,7 +116,7 @@ func TestPartitionWAL_Roll(t *testing.T) {
 	// 2 * 512012 = 1024024. Just over 1MB?
 	// MaxSegmentSize = 1 * 1024 * 1024 = 1048576.
 	// So 2 chunks fit? 1024024 < 1048576. Yes.
-	if _, err := p.Append(chunk, 1); err != nil {
+	if _, err := p.Append(chunk, 1, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -127,12 +127,12 @@ func TestPartitionWAL_Roll(t *testing.T) {
 	}
 
 	// Write 3 (Should exceed max size but roll happens on NEXT write)
-	if _, err := p.Append(chunk, 1); err != nil {
+	if _, err := p.Append(chunk, 1, true); err != nil {
 		t.Fatal(err)
 	}
 
 	// Write 4 (Should trigger roll)
-	if _, err := p.Append(chunk, 1); err != nil {
+	if _, err := p.Append(chunk, 1, true); err != nil {
 		t.Fatal(err)
 	}
 

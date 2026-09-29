@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -69,8 +70,10 @@ func (m *MockStore) List(ctx context.Context, prefix string) ([]ObjectMetadata, 
 	m.Mu.Lock()
 	defer m.Mu.Unlock()
 	var res []ObjectMetadata
-	for _, v := range m.Meta {
-		res = append(res, v)
+	for k, v := range m.Meta {
+		if prefix == "" || strings.HasPrefix(k, prefix) {
+			res = append(res, v)
+		}
 	}
 	return res, nil
 }
@@ -106,9 +109,18 @@ func TestRetention_Size(t *testing.T) {
 	}
 	defer se.Close()
 
+	// The test controls its own store and knows no groups need protecting.
+	se.committedMu.Lock()
+	se.committedAuthoritative = true
+	se.committedMu.Unlock()
+
 	// Manually inject segments into S3
 	topic := "topic1"
 	partition := "0"
+
+	// Retention walks the topic/partition pairs known to the metadata cache.
+	se.metadataCache.AddTopic(topic)
+	se.metadataCache.AddPartition(topic, 0)
 
 	// Segment 1: 60 bytes. Offset 0.
 	key1 := fmt.Sprintf("%s/%s/%020d.log", topic, partition, 0)
@@ -147,23 +159,35 @@ func TestRetention_Time(t *testing.T) {
 	se, _ := NewStorageEngine(tmpDir, mockStore, "bucket", cfg)
 	defer se.Close()
 
+	se.committedMu.Lock()
+	se.committedAuthoritative = true
+	se.committedMu.Unlock()
+
 	topic := "topic1"
 	partition := "0"
+
+	se.metadataCache.AddTopic(topic)
+	se.metadataCache.AddPartition(topic, 0)
 
 	// Segment 1: Old (2 hours ago)
 	key1 := fmt.Sprintf("%s/%s/%020d.log", topic, partition, 0)
 	mockStore.Put(context.Background(), key1, io.LimitReader(&zeroReader{}, 10))
-	// Hack: Modify LastModified
+	// Hack: Modify LastModified under the lock so background rehydration
+	// does not race with it.
+	mockStore.Mu.Lock()
 	meta1 := mockStore.Meta[key1]
 	meta1.LastModified = time.Now().Add(-2 * time.Hour).Unix()
 	mockStore.Meta[key1] = meta1
+	mockStore.Mu.Unlock()
 
 	// Segment 2: New (30 mins ago)
 	key2 := fmt.Sprintf("%s/%s/%020d.log", topic, partition, 10)
 	mockStore.Put(context.Background(), key2, io.LimitReader(&zeroReader{}, 10))
+	mockStore.Mu.Lock()
 	meta2 := mockStore.Meta[key2]
 	meta2.LastModified = time.Now().Add(-30 * time.Minute).Unix()
 	mockStore.Meta[key2] = meta2
+	mockStore.Mu.Unlock()
 
 	se.applyRetention()
 
@@ -185,4 +209,87 @@ func (z *zeroReader) Read(p []byte) (n int, err error) {
 		p[i] = 0
 	}
 	return len(p), nil
+}
+
+func TestDeleteTopicS3Cleanup(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "delete_topic_cleanup")
+	defer os.RemoveAll(tmpDir)
+
+	mockStore := NewMockStore()
+
+	// Create engine
+	se, err := NewStorageEngine(tmpDir, mockStore, "bucket", RetentionConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer se.Close()
+
+	topic := "topic-to-delete"
+	partition := int32(0)
+
+	// Create topic
+	err = se.CreateTopic(topic, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Append some messages to trigger WAL file creation
+	_, err = se.Append(topic, partition, []byte("msg1"), 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Put some mocked objects directly into S3 for this topic
+	key1 := fmt.Sprintf("%s/%d/00000000000000000000.log", topic, partition)
+	key2 := fmt.Sprintf("%s/%d/00000000000000000000.index", topic, partition)
+	mockStore.Put(context.Background(), key1, strings.NewReader("log-data"))
+	mockStore.Put(context.Background(), key2, strings.NewReader("index-data"))
+
+	// Put an object for another topic that shouldn't be deleted
+	otherKey := "other-topic/0/00000000000000000000.log"
+	mockStore.Put(context.Background(), otherKey, strings.NewReader("other-log-data"))
+
+	// Verify they are in MockStore
+	mockStore.Mu.Lock()
+	if len(mockStore.Data) != 3 {
+		mockStore.Mu.Unlock()
+		t.Fatalf("Expected 3 objects in mock S3 store, got %d", len(mockStore.Data))
+	}
+	mockStore.Mu.Unlock()
+
+	// Call DeleteTopic
+	err = se.DeleteTopic(topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Since S3 deletion is asynchronous, wait for it with a timeout
+	start := time.Now()
+	for time.Since(start) < 2*time.Second {
+		mockStore.Mu.Lock()
+		_, hasKey1 := mockStore.Data[key1]
+		_, hasKey2 := mockStore.Data[key2]
+		mockStore.Mu.Unlock()
+
+		if !hasKey1 && !hasKey2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Assert S3 objects for deleted topic are cleaned up
+	mockStore.Mu.Lock()
+	defer mockStore.Mu.Unlock()
+
+	if _, ok := mockStore.Data[key1]; ok {
+		t.Errorf("Expected cold log object %s to be deleted from S3", key1)
+	}
+	if _, ok := mockStore.Data[key2]; ok {
+		t.Errorf("Expected cold index object %s to be deleted from S3", key2)
+	}
+
+	// Assert other topic object remains
+	if _, ok := mockStore.Data[otherKey]; !ok {
+		t.Errorf("Expected cold object of other topic %s to remain in S3", otherKey)
+	}
 }
