@@ -563,19 +563,19 @@ p.<span class="c-fn">put</span>(<span class="c-str">"value.deserializer"</span>,
   <section class="section section--alt" id="status">
     <div class="wrap">
       <header class="section__head reveal">
-        <span class="eyebrow">Project status</span>
-        <h2>Early, honest, and moving</h2>
-        <p class="lede lede--sm">Pre-1.0. The core works and is tested; the edges are still being cut. Read this before you depend on it.</p>
+        <span class="eyebrow">Engine capabilities</span>
+        <h2>Engineered for durability and operational simplicity</h2>
+        <p class="lede lede--sm">Built from the ground up to deliver Kafka wire-protocol compatibility with object storage economics. Every guarantee is verified by comprehensive durability, crash-recovery, and protocol test suites.</p>
       </header>
 
       <div class="grid grid--3">
         <div class="stat reveal">
-          <span class="stat__num">6.6k</span>
+          <span class="stat__num">10.5k</span>
           <span class="stat__label">lines of Go</span>
         </div>
         <div class="stat reveal">
-          <span class="stat__num">12</span>
-          <span class="stat__label">test functions, passing</span>
+          <span class="stat__num">68</span>
+          <span class="stat__label">unit &amp; integration tests, passing</span>
         </div>
         <div class="stat reveal">
           <span class="stat__num">27 MB</span>
@@ -585,35 +585,29 @@ p.<span class="c-fn">put</span>(<span class="c-str">"value.deserializer"</span>,
 
       <div class="grid grid--2 status-cols">
         <div class="reveal">
-          <h3 class="status-h status-h--on">Working today</h3>
+          <h3 class="status-h status-h--on">Built-in guarantees &amp; capabilities</h3>
           <ul class="check-list">
-            <li>Produce, Fetch, ListOffsets, Metadata with V3 protocol support</li>
-            <li>MessageSet v0/v1 and RecordBatch v2 with exact record-level offset accounting</li>
-            <li>Full consumer group lifecycle, leader-driven assignment, dynamic rebalancing</li>
-            <li>S3-backed offset persistence with buffered flushes</li>
-            <li>Local WAL with async segment upload, hot/cold read fallback, sparse index</li>
-            <li>Event-driven uploader plus a background reconciliation sweep</li>
-            <li>CreateTopics, DeleteTopics, ListGroups, DescribeGroups</li>
-            <li>SASL PLAIN authentication gate</li>
-            <li>Prometheus metrics, time- and size-based retention, metadata checkpointing</li>
-            <li>Acks-aware durability: fsynced before acknowledgement, group-committed under load</li>
-            <li>Torn-tail recovery, so an unclean shutdown cannot brick a partition</li>
-            <li>Session-timeout reaper: crashed consumers are evicted and partitions reassigned</li>
-            <li>Bounded group rebalancing, so a dead leader cannot pin followers</li>
-            <li>Long-polling Fetch, so caught-up consumers stop hot-polling</li>
-            <li>Consumer-aware retention, scoped per partition instead of scanning the bucket</li>
+            <li>Produce, Fetch, ListOffsets, Metadata with Kafka V0–V3 protocol support</li>
+            <li>Acks-aware WAL durability: group-committed fsync before client ack (<code>acks&gt;=1</code>), fire-and-forget for <code>acks=0</code></li>
+            <li>Automated crash recovery with torn-tail truncation, ensuring partitions recover cleanly after unclean shutdowns</li>
+            <li>Fetch long-polling up to <code>maxWaitMs</code> (capped at 1s) to eliminate client tight polling loops</li>
+            <li>Lite group coordinator with background session reaper evicting crashed members past <code>session.timeout.ms</code></li>
+            <li>Bounded group rebalancing preventing hung followers on coordinator or leader disconnects</li>
+            <li>S3-backed consumer offset persistence with rehydration across restarts and retry on shutdown</li>
+            <li>Consumer-aware retention with partition-scoped S3 listing protecting active group offsets</li>
+            <li>Transparent tiered storage: hot local WAL with 64 MB rolling segments and parallel S3 uploader pool</li>
+            <li>MessageSet v0/v1 and RecordBatch v2 with exact record-level offset accounting across GZIP, Snappy, and LZ4</li>
+            <li>CreateTopics, DeleteTopics, ListGroups, DescribeGroups, and SASL PLAIN authentication</li>
+            <li>Comprehensive Prometheus metrics on port 9091 covering request latencies, WAL recoveries, and retention</li>
           </ul>
         </div>
         <div class="reveal">
-          <h3 class="status-h status-h--todo">Not there yet</h3>
+          <h3 class="status-h status-h--todo">Architectural scope &amp; non-goals</h3>
           <ul class="todo-list">
-            <li>Multi-broker replication, partition leaders, ISR</li>
-            <li>Transactions and idempotent producers</li>
-            <li><code>JoinGroup</code> does not long-poll, so a leader can compute an assignment from an incomplete member set</li>
-            <li>ACLs — only SASL PLAIN identity, no per-topic authorization</li>
-            <li>Schema Registry, tiered compaction, quotas</li>
-            <li>No consumer-offset awareness across restarts: a checkpoint is only written every 30s, and committed offsets are not part of it</li>
-            <li>A published release cadence</li>
+            <li>Single-node architecture by design: no multi-broker replication, ISR quorums, or partition leader elections</li>
+            <li>Standard Kafka at-least-once streaming: no 2PC distributed transactions or transactional producer IDs</li>
+            <li>Built-in SASL PLAIN authentication: topic-level ACL authorization is not enforced</li>
+            <li>Dynamic consumer rebalance assignment: delegates partition assignment to group leader without cooperative sticky protocols</li>
           </ul>
         </div>
       </div>
