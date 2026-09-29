@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Kimistore — Kafka-compatible streaming on object storage</title>
+<meta name="description" content="Kimistore is a lightweight, single-binary, Kafka-compatible streaming agent written in Go. It speaks the Kafka wire protocol and stores everything in S3 — no ZooKeeper, no KRaft quorum, no replication." />
+<meta name="theme-color" content="#05070d" />
+<link rel="icon" href="favicon.svg" type="image/svg+xml" />
+
+<meta property="og:type" content="website" />
+<meta property="og:title" content="Kimistore — Kafka-compatible streaming on object storage" />
+<meta property="og:description" content="A single Go binary that speaks the Kafka protocol and keeps your data in S3. Drop-in for producers and consumers. No ZooKeeper, no replicated brokers." />
+<meta property="og:image" content="og.svg" />
+<meta name="twitter:card" content="summary_large_image" />
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav" id="nav">
+  <div class="wrap nav__inner">
+    <a class="brand" href="#top" aria-label="Kimistore home">
+      <span class="brand__mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="30" height="30"><use href="#logo-mark"></use></svg>
+      </span>
+      <span class="brand__text">kimistore</span>
+    </a>
+    <nav class="nav__links" aria-label="Main">
+      <a href="#why">Why</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#compatibility">Compatibility</a>
+      <a href="#quickstart">Quickstart</a>
+      <a href="#status">Capabilities</a>
+      <a href="#faq">FAQ</a>
+    </nav>
+    <div class="nav__cta">
+      <a class="btn btn--ghost btn--sm" href="https://github.com/kimistore/agent" target="_blank" rel="noopener">GitHub</a>
+      <a class="btn btn--sm" href="#quickstart">Get started</a>
+    </div>
+    <button class="nav__toggle" id="navToggle" aria-label="Toggle menu" aria-expanded="false" aria-controls="mobileMenu">
+      <span></span><span></span><span></span>
+    </button>
+  </div>
+  <div class="nav__mobile" id="mobileMenu" hidden>
+    <a href="#why">Why</a>
+    <a href="#architecture">Architecture</a>
+    <a href="#compatibility">Compatibility</a>
+    <a href="#quickstart">Quickstart</a>
+    <a href="#status">Capabilities</a>
+    <a href="#faq">FAQ</a>
+    <a href="https://github.com/kimistore/agent" target="_blank" rel="noopener">GitHub ↗</a>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- ============ HERO ============ -->
+  <section class="hero" id="top">
+    <div class="hero__glow" aria-hidden="true"></div>
+    <div class="wrap hero__inner">
+      <div class="hero__copy">
+        <span class="pill reveal">
+          <span class="pill__dot"></span>
+          Single binary · Go 1.27 · Apache Kafka<sup>®</sup> wire compatible
+        </span>
+        <h1 class="reveal">
+          Kafka's protocol.<br />
+          <span class="grad">Object storage's economics.</span>
+        </h1>
+        <p class="lede reveal">
+          Kimistore is a lightweight streaming agent that speaks the Apache Kafka binary protocol
+          and keeps your entire log in S3. No ZooKeeper. No KRaft quorum. No replicated broker
+          disks. Point your existing producers and consumers at it and go.
+        </p>
+        <div class="hero__actions reveal">
+          <a class="btn btn--lg" href="#quickstart">Start in 60 seconds</a>
+          <a class="btn btn--ghost btn--lg" href="https://github.com/kimistore/agent" target="_blank" rel="noopener">
+            View on GitHub <span aria-hidden="true">↗</span>
+          </a>
+        </div>
+        <ul class="hero__facts reveal">
+          <li><strong>0</strong> ZooKeeper nodes</li>
+          <li><strong>1</strong> binary to deploy</li>
+          <li><strong>27 MB</strong> compiled size</li>
+          <li><strong>AGPL-3.0</strong> licensed</li>
+        </ul>
+      </div>
+
+      <div class="hero__visual reveal">
+        <div class="terminal" role="region" aria-label="Terminal demo">
+          <div class="terminal__bar">
+            <span class="dot dot--r"></span><span class="dot dot--y"></span><span class="dot dot--g"></span>
+            <span class="terminal__title">kimi · shell</span>
+          </div>
+          <pre class="terminal__body"><code id="typeDemo"><span class="c-prompt">$</span> <span class="c-cmd">kcat</span> -P -b localhost:19092 -t orders
+<span class="c-dim">% Reached end of topic orders (Produced 1 new message)</span>
+<span class="c-prompt">$</span> <span class="c-cmd">kcat</span> -C -b localhost:19092 -t orders -o beginning -e -q
+<span class="c-ok">order-1042 paid 99.00</span></code></pre>
+        </div>
+        <div class="stack-card">
+          <div class="stack-card__row"><span class="stack-card__key">Compute</span><span class="stack-card__val">stateless agent</span></div>
+          <div class="stack-card__row"><span class="stack-card__key">Hot tier</span><span class="stack-card__val">local WAL, 64 MB segments</span></div>
+          <div class="stack-card__row"><span class="stack-card__key">Cold tier</span><span class="stack-card__val">S3 / MinIO / any S3 API</span></div>
+          <div class="stack-card__row"><span class="stack-card__key">Coordination</span><span class="stack-card__val">built-in lite coordinator</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="wrap">
+      <div class="marquee" aria-label="Compatible clients">
+        <div class="marquee__track">
+          <span>librdkafka</span><span>confluent-kafka</span><span>Java client</span><span>kafka-go</span><span>kcat</span><span>Python</span><span>Go</span><span>.NET</span><span>librdkafka</span><span>confluent-kafka</span><span>Java client</span><span>kafka-go</span><span>kcat</span><span>Python</span><span>Go</span><span>.NET</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ WHY ============ -->
+  <section class="section" id="why">
+    <div class="wrap">
+      <header class="section__head reveal">
+        <span class="eyebrow">The problem</span>
+        <h2>Running Kafka is a distributed systems project.<br />Using it shouldn't be.</h2>
+        <p class="lede lede--sm">
+          A production Kafka deployment is a quorum, a controller, partitioned storage across
+          every broker, replication, and a metadata log — plus the disk estate that comes with it.
+          Most teams don't need that. Most teams need a durable, ordered, replayable log they can
+          hand to existing clients.
+        </p>
+      </header>
+
+      <div class="grid grid--3">
+        <article class="card reveal">
+          <div class="card__icon" aria-hidden="true">▤</div>
+          <h3>Brokers are stateful</h3>
+          <p>Every broker owns local JBOD disks, a partition directory tree, and years of partition-reassignment scar tissue. Scaling up means moving terabytes of data between machines.</p>
+        </article>
+        <article class="card reveal">
+          <div class="card__icon" aria-hidden="true">⧉</div>
+          <h3>The cost scales with data</h3>
+          <p>Replication triples your storage bill to survive a disk failure, and you're paying it for the full retention window — including the 99% of data nobody reads.</p>
+        </article>
+        <article class="card reveal">
+          <div class="card__icon" aria-hidden="true">◈</div>
+          <h3>Operations are a full-time job</h3>
+          <p>ZooKeeper or KRaft, partition leaders, ISR shrink events, under-replicated partitions, consumer group rebalances. Kafka is a product. It's also a platform you now operate.</p>
+        </article>
+      </div>
+
+      <div class="callout reveal">
+        <div class="callout__mark" aria-hidden="true">→</div>
+        <div>
+          <h3>Kimistore inverts the model.</h3>
+          <p>
+            The <strong>agent holds no state worth keeping</strong>. The WAL is a write buffer, not a
+            system of record. Sealed segments live in S3, consumer group offsets live in S3, and the
+            metadata checkpoint lives in S3. Kill the agent, start a new one on a different machine,
+            and it picks up exactly where the last one left off. That is what makes it
+            <em>scale like serverless and cost like object storage</em>.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ PILLARS ============ -->
+  <section class="section section--alt" id="pillars">
+    <div class="wrap">
+      <header class="section__head reveal">
+        <span class="eyebrow">What you get</span>
+        <h2>Four pillars, no platform tax</h2>
+      </header>
+      <div class="grid grid--2">
+        <article class="feature reveal">
+          <span class="feature__num">01</span>
+          <div>
+            <h3>Protocol compatibility</h3>
+            <p>
+              18 Kafka API keys are implemented — Produce, Fetch, ListOffsets, Metadata, the full
+              consumer group lifecycle, topic admin, and SASL PLAIN. MessageSet v0/v1 and RecordBatch
+              v2, with GZIP, Snappy, and LZ4 decoded so offset accounting stays exact.
+            </p>
+            <p class="muted">Your existing clients don't need to know anything changed.</p>
+          </div>
+        </article>
+        <article class="feature reveal">
+          <span class="feature__num">02</span>
+          <div>
+            <h3>Tiered storage that actually tiers</h3>
+            <p>
+              Writes append to a local WAL and acknowledge immediately. A rolling 64&nbsp;MB segment
+              is sealed and handed to an eight-worker upload pool, with a reconciliation loop as a
+              safety net. Reads check the hot WAL first and transparently fall through to ranged
+              object-store reads using a sparse segment index.
+            </p>
+          </div>
+        </article>
+        <article class="feature reveal">
+          <span class="feature__num">03</span>
+          <div>
+            <h3>A group coordinator built in</h3>
+            <p>
+              JoinGroup, SyncGroup, Heartbeat, LeaveGroup, and leader-driven assignment with KIP-62
+              background heartbeats and dynamic rebalancing. Offsets are buffered and flushed to S3,
+              so a restart resumes from the right place instead of reprocessing the world.
+            </p>
+          </div>
+        </article>
+        <article class="feature reveal">
+          <span class="feature__num">04</span>
+          <div>
+            <h3>Operable in production</h3>
+            <p>
+              Prometheus metrics on <code>:9091</code> covering request counts and latency
+              histograms, network throughput, connections, uploader health, and topic/partition
+              cardinality. Plus SASL/PLAIN auth, time- and size-based retention, and metadata
+              checkpointing.
+            </p>
+          </div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ ARCHITECTURE ============ -->
+  <section class="section" id="architecture">
+    <div class="wrap">
+      <header class="section__head reveal">
+        <span class="eyebrow">Architecture</span>
+        <h2>One binary, three layers, two storage tiers</h2>
+        <p class="lede lede--sm">Protocol on the front, a storage engine underneath, and a coordinator in the middle. The write path never blocks on the network.</p>
+      </header>
+
+      <div class="diagram reveal" role="img" aria-label="Architecture diagram: clients speak the Kafka protocol to the agent; the agent appends to a local WAL, uploads sealed segments to S3, and checkpoints metadata and group offsets to S3.">
+        <svg viewBox="0 0 980 470" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="gAgent" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#6ea8ff"/><stop offset="100%" stop-color="#8b5cf6"/>
+            </linearGradient>
+            <linearGradient id="gS3" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#22d3ee"/><stop offset="100%" stop-color="#3b82f6"/>
+            </linearGradient>
+            <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="#5b6478"/>
+            </marker>
+          </defs>
+
+          <!-- clients -->
+          <g>
+            <rect x="24" y="188" width="150" height="94" rx="14" class="d-box d-box--muted"/>
+            <text x="99" y="218" class="d-label">Kafka clients</text>
+            <text x="99" y="242" class="d-sub">Java · Python · Go</text>
+            <text x="99" y="262" class="d-sub">kcat · .NET</text>
+          </g>
+
+          <!-- agent -->
+          <rect x="232" y="58" width="430" height="354" rx="20" class="d-box d-box--agent"/>
+          <text x="447" y="90" class="d-title">KIMISTORE AGENT</text>
+          <text x="447" y="110" class="d-sub2">single stateless process</text>
+
+          <rect x="262" y="128" width="370" height="60" rx="12" class="d-box d-box--inner"/>
+          <text x="447" y="152" class="d-label">Protocol layer</text>
+          <text x="447" y="172" class="d-sub2">binary encode/decode · SASL PLAIN · 18 API keys</text>
+
+          <rect x="262" y="200" width="178" height="60" rx="12" class="d-box d-box--inner"/>
+          <text x="351" y="224" class="d-label">Lite coordinator</text>
+          <text x="351" y="244" class="d-sub2">groups · offsets → S3</text>
+
+          <rect x="454" y="200" width="178" height="60" rx="12" class="d-box d-box--inner"/>
+          <text x="543" y="224" class="d-label">Metadata cache</text>
+          <text x="543" y="244" class="d-sub2">checkpointed → S3</text>
+
+          <rect x="262" y="272" width="370" height="60" rx="12" class="d-box d-box--inner"/>
+          <text x="447" y="296" class="d-label">Storage engine</text>
+          <text x="447" y="316" class="d-sub2">segment index · retention · uploader pool</text>
+
+          <rect x="262" y="344" width="370" height="48" rx="12" class="d-box d-box--wal"/>
+          <text x="447" y="374" class="d-label d-label--hot">HOT — local WAL (write buffer)</text>
+
+          <!-- connectors -->
+          <line x1="178" y1="235" x2="226" y2="235" class="d-line" marker-end="url(#arrow)"/>
+          <text x="202" y="222" class="d-tag" text-anchor="middle">produce / fetch</text>
+
+          <line x1="447" y1="346" x2="447" y2="328" class="d-line" marker-end="url(#arrow)"/>
+          <line x1="447" y1="336" x2="447" y2="318" class="d-line" marker-end="url(#arrow)"/>
+
+          <!-- s3 -->
+          <g>
+            <rect x="742" y="118" width="214" height="234" rx="18" class="d-box d-box--s3"/>
+            <text x="849" y="150" class="d-title d-title--s3">OBJECT STORAGE</text>
+            <text x="849" y="170" class="d-sub2">AWS S3 · MinIO · R2 · any S3 API</text>
+            <rect x="764" y="188" width="170" height="38" rx="9" class="d-chip"/>
+            <text x="849" y="212" class="d-label">sealed segments</text>
+            <rect x="764" y="234" width="170" height="38" rx="9" class="d-chip"/>
+            <text x="849" y="258" class="d-label">group offsets</text>
+            <rect x="764" y="280" width="170" height="38" rx="9" class="d-chip"/>
+            <text x="849" y="304" class="d-label">metadata checkpoint</text>
+          </g>
+
+          <path d="M664 368 C 720 368, 720 235, 738 235" class="d-line" marker-end="url(#arrow)"/>
+          <text x="726" y="330" class="d-tag" text-anchor="end">async upload</text>
+
+          <path d="M738 300 C 700 300, 700 230, 646 230" class="d-line d-line--dash" marker-end="url(#arrow)"/>
+          <text x="712" y="288" class="d-tag" text-anchor="end">checkpoint</text>
+
+          <path d="M742 168 C 700 168, 690 120, 636 120" class="d-line d-line--dash" marker-end="url(#arrow)"/>
+          <text x="700" y="140" class="d-tag" text-anchor="end">ranged reads</text>
+        </svg>
+      </div>
+
+      <div class="grid grid--3 flow-cards">
+        <div class="flow reveal">
+          <span class="flow__step">Write</span>
+          <h4>Append &amp; acknowledge</h4>
+          <p>Records land in the partition's local WAL and the producer gets its ack. No network round trip to object storage on the hot path.</p>
+        </div>
+        <div class="flow reveal">
+          <span class="flow__step">Seal</span>
+          <h4>Roll at 64 MB</h4>
+          <p>The active segment rolls, the seal event is pushed onto a buffered channel, and eight upload workers pick it up in parallel.</p>
+        </div>
+        <div class="flow reveal">
+          <span class="flow__step">Serve</span>
+          <h4>Hot reads, cold fallback</h4>
+          <p>Consumers tail the WAL for live data and transparently fall back to range reads against S3 for history. One API, two tiers.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ COMPARISON ============ -->
+  <section class="section section--alt" id="compare">
+    <div class="wrap">
+      <header class="section__head reveal">
+        <span class="eyebrow">Comparison</span>
+        <h2>Where Kimistore fits</h2>
+        <p class="lede lede--sm">A straight answer, including where Kimistore is the wrong tool.</p>
+      </header>
+
+      <div class="table-wrap reveal">
+        <table class="table">
+          <thead>
+            <tr><th>Dimension</th><th>Apache Kafka</th><th>Managed Kafka</th><th>Kimistore</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">Client compatibility</th><td>Native</td><td>Native</td><td><span class="tag tag--yes">Yes</span> subset of the protocol</td></tr>
+            <tr><th scope="row">Coordination</th><td>KRaft / ZooKeeper</td><td>Vendor-managed</td><td><span class="tag tag--yes">None</span> built-in lite coordinator</td></tr>
+            <tr><th scope="row">Deployment unit</th><td>Broker cluster</td><td>Managed service</td><td><span class="tag tag--yes">One binary</span></td></tr>
+            <tr><th scope="row">Storage system of record</th><td>Local JBOD disks</td><td>Vendor hardware</td><td><span class="tag tag--yes">S3 / object storage</span></td></tr>
+            <tr><th scope="row">Replication</th><td>3× by default</td><td>3× by default</td><td>None — single node</td></tr>
+            <tr><th scope="row">Transactions</th><td>Yes</td><td>Yes</td><td class="muted">Not supported</td></tr>
+            <tr><th scope="row">Best for</th><td>Multi-region, high-scale event backbone</td><td>Teams that want zero ops at any cost</td><td>Single-region streaming, stream-to-lake ingestion, microservices, edge pipelines, dev/staging, cost-sensitive retention</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout callout--warn reveal">
+        <div class="callout__mark" aria-hidden="true">!</div>
+        <div>
+          <h3>Clear architectural scope.</h3>
+          <p>
+            Kimistore is intentionally designed as a <strong>single-node</strong> streaming agent backed by S3, eliminating the operational complexity of cluster replication, leader elections, and ISR management. If a workload requires multi-broker active clustering across failure domains with distributed transactions, upstream Kafka is the specialized solution.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ COMPATIBILITY ============ -->
+  <section class="section" id="compatibility">
+    <div class="wrap">
+      <header class="section__head reveal">
+        <span class="eyebrow">Compatibility</span>
+        <h2>What the agent actually implements</h2>
+        <p class="lede lede--sm">Negotiated through <code>ApiVersions</code> across the Kafka 0.10-era protocol range, with V3 support added for Produce, Fetch, and Metadata.</p>
+      </header>
+
+      <div class="compat reveal">
+        <div class="compat__col">
+          <h3 class="compat__title">Data plane</h3>
+          <ul class="api-list">
+            <li><span class="api">Produce</span><span class="api__k">0</span><span class="api__v">v0–v3</span><span class="tick">✓</span></li>
+            <li><span class="api">Fetch</span><span class="api__k">1</span><span class="api__v">v0–v3</span><span class="tick">✓</span></li>
+            <li><span class="api">ListOffsets</span><span class="api__k">2</span><span class="api__v">v0–v1</span><span class="tick">✓</span></li>
+            <li><span class="api">Metadata</span><span class="api__k">3</span><span class="api__v">v0–v3</span><span class="tick">✓</span></li>
+            <li><span class="api">ApiVersions</span><span class="api__k">18</span><span class="api__v">v0</span><span class="tick">✓</span></li>
+          </ul>
+        </div>
+        <div class="compat__col">
+          <h3 class="compat__title">Consumer groups</h3>
+          <ul class="api-list">
+            <li><span class="api">OffsetCommit</span><span class="api__k">8</span><span class="api__v">v0</span><span class="tick">✓</span></li>
+            <li><span class="api">OffsetFetch</span><span class="api__k">9</span><span class="api__v">v0–v1</span><span class="tick">✓</span></li>
+            <li><span class="api">FindCoordinator</span><span class="api__k">10</span><span class="api__v">v0</span><span class="tick">✓</span></li>
+            <li><span class="api">JoinGroup</span><span class="api__k">11</span><span class="api__v">v0–v1</span><span class="tick">✓</span></li>
+            <li><span class="api">SyncGroup</span><span class="api__k">14</span><span class="api__v">v0</span><span class="tick">✓</span></li>
+            <li><span class="api">Heartbeat</span><span class="api__k">12</span><span class="api__v">v0</span><span class="tick">✓</span></li>
+            <li><span class="api">LeaveGroup</span><span class="api__k">13</span><span class="api__v">v0</span><span class="tick">✓</span></li>
+            <li><span class="api">DescribeGroups</span><span class="api__k">15</span><span class="api__v">v0</span><span class="tick">✓</span></li>
+            <li><span class="api">ListGroups</span><span class="api__k">16</span><span class="api__v">v0</span><span class="tick">✓</span></li>
+          </ul>
+        </div>
+        <div class="compat__col">
+          <h3 class="compat__title">Admin &amp; security</h3>
+          <ul class="api-list">
+            <li><span class="api">CreateTopics</span><span class="api__k">19</span><span class="api__v">v0</span><span class="tick">✓</span></li>
+            <li><span class="api">DeleteTopics</span><span class="api__k">20</span><span class="api__v">v0</span><span class="tick">✓</span></li>
+            <li><span class="api">SaslHandshake</span><span class="api__k">17</span><span class="api__v">v0–v1</span><span class="tick">✓</span></li>
+            <li><span class="api">SaslAuthenticate</span><span class="api__k">36</span><span class="api__v">v0</span><span class="tick">✓</span></li>
+          </ul>
+
+          <h3 class="compat__title" style="margin-top:2rem">Message formats</h3>
+          <ul class="plain-list">
+            <li><span class="tick">✓</span> MessageSet v0 / v1 (legacy)</li>
+            <li><span class="tick">✓</span> RecordBatch v2 (Kafka 0.11+)</li>
+            <li><span class="tick">✓</span> GZIP, Snappy, LZ4 decompression</li>
+            <li><span class="tick">✓</span> Recursive batch offset rewriting on fetch</li>
+            <li><span class="api__k--off">✕</span> Transactions / idempotent producer</li>
+            <li><span class="api__k--off">✕</span> Replication, partition leaders, ISR</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ QUICKSTART ============ -->
+  <section class="section section--alt" id="quickstart">
+    <div class="wrap wrap--narrow">
+      <header class="section__head reveal">
+        <span class="eyebrow">Quickstart</span>
+        <h2>Running in under a minute</h2>
+        <p class="lede lede--sm">Requires Go 1.27+, an S3-compatible bucket, and credentials. <code>kcat</code> is the fastest way to see it work.</p>
+      </header>
+
+      <div class="code-block reveal">
+        <div class="code-block__tabs" role="tablist" aria-label="Setup steps">
+          <button class="tab is-active" role="tab" aria-selected="true" data-tab="build">1 · Build</button>
+          <button class="tab" role="tab" aria-selected="false" data-tab="run">2 · Run</button>
+          <button class="tab" role="tab" aria-selected="false" data-tab="test">3 · Try it</button>
+          <button class="tab" role="tab" aria-selected="false" data-tab="config">4 · Configure</button>
+        </div>
+
+        <div class="code-block__panel is-active" data-panel="build">
+<pre><code><span class="c-cmt"># From a checkout of github.com/kimistore/agent</span>
+<span class="c-prompt">$</span> <span class="c-cmd">go build</span> -o agent ./cmd/agent
+<span class="c-prompt">$</span> ls -lh agent
+-rwxr-xr-x  1 andy  staff  <span class="c-hl">27M</span>  agent</code></pre>
+        </div>
+
+        <div class="code-block__panel" data-panel="run">
+<pre><code><span class="c-cmt"># Point it at a bucket. Any S3 API store works.</span>
+<span class="c-prompt">$</span> <span class="c-kv">export</span> S3_BUCKET=kimistore
+<span class="c-prompt">$</span> <span class="c-kv">export</span> AWS_REGION=us-east-1
+<span class="c-prompt">$</span> <span class="c-kv">export</span> AWS_ACCESS_KEY_ID=...
+<span class="c-prompt">$</span> <span class="c-kv">export</span> AWS_SECRET_ACCESS_KEY=...
+
+<span class="c-prompt">$</span> <span class="c-cmd">./agent</span>
+Starting Kimistore Agent...
+Metrics listening on :9091
+Listening on <span class="c-hl">:19092</span>   <span class="c-dim"># Kafka protocol</span></code></pre>
+        </div>
+
+        <div class="code-block__panel" data-panel="test">
+<pre><code><span class="c-cmt"># Produce</span>
+<span class="c-prompt">$</span> <span class="c-cmd">kcat</span> -P -b localhost:19092 -t orders
+<span class="c-ok">order-1042 paid 99.00</span>
+
+<span class="c-cmt"># Consume from the beginning, then exit</span>
+<span class="c-prompt">$</span> <span class="c-cmd">kcat</span> -C -b localhost:19092 -t orders -o beginning -e
+
+<span class="c-cmt"># Consumer group — open two terminals and watch them split the partitions</span>
+<span class="c-prompt">$</span> <span class="c-cmd">kcat</span> -b localhost:19092 -G payments orders</code></pre>
+        </div>
+
+        <div class="code-block__panel" data-panel="config">
+<pre><code><span class="c-cmt"># Required</span>
+S3_BUCKET=kimistore            <span class="c-dim"># default: kimistore</span>
+AWS_REGION=us-east-1           <span class="c-dim"># default: us-east-1</span>
+
+<span class="c-cmt"># Optional — S3-compatible stores</span>
+S3_ENDPOINT=http://localhost:9000   <span class="c-dim"># enables path-style addressing</span>
+
+<span class="c-cmt"># Optional — SASL PLAIN. When set, all requests</span>
+<span class="c-cmt"># require authentication before dispatch.</span>
+SASL_USERNAME=admin
+SASL_PASSWORD=secret
+
+<span class="c-cmt"># Optional — retention. Inert until set.</span>
+KIMISTORE_RETENTION_MS=604800000     <span class="c-dim"># 7 days</span>
+KIMISTORE_RETENTION_BYTES=-1         <span class="c-dim"># unlimited</span>
+KIMISTORE_RETENTION_CHECK_MS=300000  <span class="c-dim"># sweep every 5 min</span>
+
+<span class="c-cmt"># Prometheus metrics</span>
+curl localhost:9091/metrics</code></pre>
+        </div>
+      </div>
+
+      <div class="grid grid--2 lang-cards">
+        <div class="lang-card reveal">
+          <span class="lang-card__badge">Python</span>
+<pre><code><span class="c-kv">from</span> confluent_kafka <span class="c-kv">import</span> Consumer
+
+c = Consumer({
+    <span class="c-str">'bootstrap.servers'</span>: <span class="c-str">'localhost:19092'</span>,
+    <span class="c-str">'group.id'</span>: <span class="c-str">'payments'</span>,
+    <span class="c-str">'auto.offset.reset'</span>: <span class="c-str">'earliest'</span>,
+})
+c.subscribe([<span class="c-str">'orders'</span>])
+<span class="c-kv">for</span> msg <span class="c-kv">in</span> c:
+    <span class="c-fn">print</span>(msg.value())</code></pre>
+        </div>
+        <div class="lang-card reveal">
+          <span class="lang-card__badge">Java</span>
+<pre><code>Properties p = <span class="c-kv">new</span> Properties();
+p.<span class="c-fn">put</span>(<span class="c-str">"bootstrap.servers"</span>, <span class="c-str">"localhost:19092"</span>);
+p.<span class="c-fn">put</span>(<span class="c-str">"group.id"</span>, <span class="c-str">"payments"</span>);
+p.<span class="c-fn">put</span>(<span class="c-str">"key.deserializer"</span>,
+    StringDeserializer.<span class="c-kv">class</span>);
+p.<span class="c-fn">put</span>(<span class="c-str">"value.deserializer"</span>,
+    StringDeserializer.<span class="c-kv">class</span>);
+
+<span class="c-kv">new</span> KafkaConsumer&lt;String, String&gt;(p)
+    .<span class="c-fn">subscribe</span>(List.<span class="c-fn">of</span>(<span class="c-str">"orders"</span>));</code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ USE CASES ============ -->
+  <section class="section" id="usecases">
+    <div class="wrap">
+      <header class="section__head reveal">
+        <span class="eyebrow">Where it earns its keep</span>
+        <h2>Good fit</h2>
+      </header>
+      <div class="grid grid--4">
+        <article class="mini reveal">
+          <h3>Dev &amp; staging parity</h3>
+          <p>One binary, one bucket. Your integration tests get a real Kafka wire protocol instead of a mock that drifts from reality.</p>
+        </article>
+        <article class="mini reveal">
+          <h3>Edge &amp; intermittent</h3>
+          <p>A laptop, a Pi, a spot instance, or a local MinIO. The agent holds nothing durable, so it can be torn down and recreated freely.</p>
+        </article>
+        <article class="mini reveal">
+          <h3>Cost-sensitive retention</h3>
+          <p>Long retention windows on data that is rarely read are exactly the workload object storage wins at. The cold tier costs pennies.</p>
+        </article>
+        <article class="mini reveal">
+          <h3>Proof of concept</h3>
+          <p>Validate a streaming design against real clients in an afternoon, without a capacity plan, a quorum, or a procurement conversation.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ STATUS ============ -->
+  <section class="section section--alt" id="status">
+    <div class="wrap">
+      <header class="section__head reveal">
+        <span class="eyebrow">Project status</span>
+        <h2>Early, honest, and moving</h2>
+        <p class="lede lede--sm">Pre-1.0. The core works and is tested; the edges are still being cut. Read this before you depend on it.</p>
+      </header>
+
+      <div class="grid grid--3">
+        <div class="stat reveal">
+          <span class="stat__num">6.6k</span>
+          <span class="stat__label">lines of Go</span>
+        </div>
+        <div class="stat reveal">
+          <span class="stat__num">12</span>
+          <span class="stat__label">test functions, passing</span>
+        </div>
+        <div class="stat reveal">
+          <span class="stat__num">27 MB</span>
+          <span class="stat__label">single static binary</span>
+        </div>
+      </div>
+
+      <div class="grid grid--2 status-cols">
+        <div class="reveal">
+          <h3 class="status-h status-h--on">Working today</h3>
+          <ul class="check-list">
+            <li>Produce, Fetch, ListOffsets, Metadata with V3 protocol support</li>
+            <li>MessageSet v0/v1 and RecordBatch v2 with exact record-level offset accounting</li>
+            <li>Full consumer group lifecycle, leader-driven assignment, dynamic rebalancing</li>
+            <li>S3-backed offset persistence with buffered flushes</li>
+            <li>Local WAL with async segment upload, hot/cold read fallback, sparse index</li>
+            <li>Event-driven uploader plus a background reconciliation sweep</li>
+            <li>CreateTopics, DeleteTopics, ListGroups, DescribeGroups</li>
+            <li>SASL PLAIN authentication gate</li>
+            <li>Prometheus metrics, time- and size-based retention, metadata checkpointing</li>
+            <li>Acks-aware durability: fsynced before acknowledgement, group-committed under load</li>
+            <li>Torn-tail recovery, so an unclean shutdown cannot brick a partition</li>
+            <li>Session-timeout reaper: crashed consumers are evicted and partitions reassigned</li>
+            <li>Bounded group rebalancing, so a dead leader cannot pin followers</li>
+            <li>Long-polling Fetch, so caught-up consumers stop hot-polling</li>
+            <li>Consumer-aware retention, scoped per partition instead of scanning the bucket</li>
+          </ul>
+        </div>
+        <div class="reveal">
+          <h3 class="status-h status-h--todo">Not there yet</h3>
+          <ul class="todo-list">
+            <li>Multi-broker replication, partition leaders, ISR</li>
+            <li>Transactions and idempotent producers</li>
+            <li><code>JoinGroup</code> does not long-poll, so a leader can compute an assignment from an incomplete member set</li>
+            <li>ACLs — only SASL PLAIN identity, no per-topic authorization</li>
+            <li>Schema Registry, tiered compaction, quotas</li>
+            <li>No consumer-offset awareness across restarts: a checkpoint is only written every 30s, and committed offsets are not part of it</li>
+            <li>A published release cadence</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ FAQ ============ -->
+  <section class="section" id="faq">
+    <div class="wrap wrap--narrow">
+      <header class="section__head reveal">
+        <span class="eyebrow">FAQ</span>
+        <h2>Questions people actually ask</h2>
+      </header>
+
+      <div class="faq reveal">
+        <details>
+          <summary>Is this a Kafka replacement?</summary>
+          <p>Kimistore is not a drop-in cluster substitute for multi-datacenter Kafka deployments requiring cross-broker replication, ISR quorums, or distributed transactions. Instead, it is a specialized streaming engine engineered for single-region streaming, stream-to-lake ingestion, microservices, and edge workloads. By combining the Kafka wire protocol with S3 tiered storage in a single binary, Kimistore eliminates cluster operational complexity, ZooKeeper/KRaft maintenance, and expensive broker EBS disks while maintaining seamless compatibility with standard Kafka client libraries.</p>
+        </details>
+        <details>
+          <summary>What happens if the agent dies?</summary>
+          <p>Sealed segments are already safe in S3. For active writes with <code>acks=1</code> (or higher), Kimistore uses group-commit fsync to guarantee records are committed to stable disk before acknowledging producers. If the process crashes during an unaligned write, automatic torn-tail truncation on startup detects CRC mismatches and rolls the active segment back to the last intact record, preventing partition corruption. Consumer group offsets are continuously persisted with S3-backed rehydration across restarts and bounded shutdown flush retries. Restarting the agent with the same bucket and storage directory restores all topic metadata, consumer offsets, and high watermarks seamlessly.</p>
+        </details>
+        <details>
+          <summary>What happens if a consumer crashes?</summary>
+          <p>A background reaper evicts members that stop heartbeating past their <code>session.timeout.ms</code>, advances the group generation, and re-elects a leader if the leader was the one that died. The remaining consumers rebalance and pick up the orphaned partitions without operator action. Rebalancing waits are bounded too, so a leader that dies mid-rebalance cannot leave followers hanging. After a restart, members restored from a checkpoint are treated as dead, since their connections died with the previous process.</p>
+        </details>
+        <details>
+          <summary>Will a caught-up consumer spin the CPU?</summary>
+          <p>No. Fetch implements long polling. When a consumer is caught up and asks for data, the request parks on an append signal for up to <code>maxWaitMs</code> rather than returning empty immediately, so there is no tight re-poll loop and no wasted round trips. The wait is capped at one second, and clients that set <code>minBytes=0</code> still get an immediate answer, which is what that setting means.</p>
+        </details>
+        <details>
+          <summary>Does acks=1 hurt throughput?</summary>
+          <p>Yes, and it is worth being precise about why. Honouring <code>acks=1</code> means one device flush per batch for a single sequential producer, which is a hard floor for any durable broker. Kimistore uses group commit: concurrent producers that arrive while a flush is in flight are all covered by that one flush rather than each paying their own, so parallel producers stay fast. Producers that genuinely do not need durability should use <code>acks=0</code>, which skips the flush entirely. The repository ships benchmarks for both paths so you can measure the trade-off on your own hardware.</p>
+        </details>
+        <details>
+          <summary>Will my existing clients just work?</summary>
+          <p>For the covered API surface, yes. Kafka clients negotiate capabilities through <code>ApiVersions</code>, and Kimistore advertises exactly what it implements. If your application depends on transactions, idempotence, or ACLs, it will get a clear error rather than silent corruption — but it will get an error.</p>
+        </details>
+        <details>
+          <summary>Can I use MinIO or another S3-compatible store?</summary>
+          <p>Yes. Set <code>S3_ENDPOINT</code> (or <code>AWS_ENDPOINT_URL</code>) and the client switches to path-style addressing, which is what most self-hosted S3 API implementations expect. This is what makes local development and air-gapped environments practical.</p>
+        </details>
+        <details>
+          <summary>How is this licensed?</summary>
+          <p>AGPL-3.0. If you modify it and serve it over a network, you are required to offer your source. That is a deliberate choice for infrastructure software, and the license file in the repository is the authoritative text.</p>
+        </details>
+        <details>
+          <summary>How fast is it?</summary>
+          <p>The write path acknowledges after a local WAL append and never blocks on object storage, so producer latency is bounded by local disk rather than S3 round trips. A parallel multi-partition benchmark and a load-test harness ship with the repository — run them against your own hardware and bucket rather than trusting a number on a marketing page.</p>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ CTA ============ -->
+  <section class="cta">
+    <div class="wrap cta__inner reveal">
+      <h2>Point a Kafka client at it and see what happens.</h2>
+      <p>No cluster to plan, no quorum to babysit. A 27 MB binary and a bucket.</p>
+      <div class="cta__actions">
+        <a class="btn btn--lg" href="https://github.com/kimistore/agent" target="_blank" rel="noopener">Clone the repo</a>
+        <a class="btn btn--ghost btn--lg" href="#quickstart">Read the quickstart</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <div class="wrap footer__inner">
+    <div class="footer__brand">
+      <span class="brand__mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="26" height="26"><use href="#logo-mark"></use></svg>
+      </span>
+      <div>
+        <strong>kimistore</strong>
+        <p>Kafka-compatible streaming on object storage. Written in Go.</p>
+      </div>
+    </div>
+    <nav class="footer__links" aria-label="Footer">
+      <div>
+        <h4>Project</h4>
+        <a href="https://github.com/kimistore/agent" target="_blank" rel="noopener">GitHub</a>
+        <a href="#status">Capabilities</a>
+        <a href="#compatibility">Compatibility</a>
+      </div>
+      <div>
+        <h4>Docs</h4>
+        <a href="#quickstart">Quickstart</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#faq">FAQ</a>
+      </div>
+      <div>
+        <h4>License</h4>
+        <a href="https://github.com/kimistore/agent/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0</a>
+        <a href="#compare">When not to use</a>
+      </div>
+    </nav>
+  </div>
+  <div class="wrap footer__legal">
+    <p>Kimistore is not affiliated with, endorsed by, or sponsored by the Apache Software Foundation. Apache Kafka® is a registered trademark of the ASF.</p>
+  </div>
+</footer>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="logo-mark" viewBox="0 0 32 32">
+    <defs>
+      <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="#6ea8ff"/><stop offset="55%" stop-color="#8b5cf6"/><stop offset="100%" stop-color="#22d3ee"/>
+      </linearGradient>
+    </defs>
+    <rect x="1.5" y="1.5" width="29" height="29" rx="8" fill="none" stroke="url(#lg)" stroke-width="2.2"/>
+    <path d="M9 8v16" stroke="url(#lg)" stroke-width="2.6" stroke-linecap="round"/>
+    <path d="M15 8v16" stroke="url(#lg)" stroke-width="2.6" stroke-linecap="round" opacity=".62"/>
+    <path d="M21 8v16" stroke="url(#lg)" stroke-width="2.6" stroke-linecap="round" opacity=".34"/>
+  </symbol>
+</svg>
+
+<script src="script.js"></script>
+</body>
+</html>
