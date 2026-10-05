@@ -53,6 +53,7 @@ const (
 	ApiKeyApiVersions      = 18
 	ApiKeyCreateTopics     = 19
 	ApiKeyDeleteTopics     = 20
+	ApiKeyInitProducerID   = 22
 	ApiKeySaslAuthenticate = 36
 )
 
@@ -62,6 +63,11 @@ const (
 	ErrUnknownTopicOrPartition    = 3
 	ErrNotLeaderForPartition      = 6
 	ErrRequestTimedOut            = 7
+	ErrOutOfOrderSequence         = 45
+	ErrDuplicateSequence          = 46
+	ErrInvalidProducerEpoch       = 47
+	ErrUnknownProducerID          = 59
+	ErrFencedInstanceID           = 78
 	ErrGroupAuthorizationFailed   = 30
 	ErrClusterAuthorizationFailed = 31
 	ErrUnsupportedVersion         = 35
@@ -196,6 +202,7 @@ var supportedAPIVersions = map[int16]int16{
 	ApiKeyDescribeGroups:   0,
 	ApiKeySaslHandshake:    1,
 	ApiKeySaslAuthenticate: 0,
+	ApiKeyInitProducerID:   1,
 }
 
 var apiNames = map[int16]string{
@@ -205,6 +212,7 @@ var apiNames = map[int16]string{
 	ApiKeySyncGroup: "SyncGroup", ApiKeyHeartbeat: "Heartbeat", ApiKeyLeaveGroup: "LeaveGroup",
 	ApiKeyCreateTopics: "CreateTopics", ApiKeyDeleteTopics: "DeleteTopics", ApiKeyListGroups: "ListGroups",
 	ApiKeyDescribeGroups: "DescribeGroups", ApiKeySaslHandshake: "SaslHandshake", ApiKeySaslAuthenticate: "SaslAuthenticate",
+	ApiKeyInitProducerID: "InitProducerId",
 }
 
 // ApiName is the human-readable name of an API key.
@@ -416,6 +424,8 @@ func HandleRequest(ctx context.Context, data []byte, store *storage.StorageEngin
 		resp, errProc = handleListGroups(dec, enc, store, apiVersion)
 	case ApiKeyDescribeGroups:
 		resp, errProc = handleDescribeGroups(dec, enc, store, apiVersion)
+	case ApiKeyInitProducerID:
+		resp, errProc = handleInitProducerId(ctx, dec, enc, store, apiVersion)
 	default:
 		errProc = fmt.Errorf("unsupported api key: %d", apiKey)
 	}

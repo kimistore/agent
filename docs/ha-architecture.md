@@ -293,8 +293,16 @@ Ordered cheapest-risk-first. Each phase is independently shippable.
 > `KIMISTORE_FLUSH_INTERVAL_MS` (default 1000ms), and the uploader advances a
 > per-partition durable watermark that only moves contiguously. The wait is
 > bounded by the producer's timeout (capped at 30s) and returns
-> `REQUEST_TIMED_OUT` on expiry rather than a false ack. Idempotent producers
-> (phase 6) are still required to make retries safe.
+> `REQUEST_TIMED_OUT` on expiry rather than a false ack.
+>
+> **Phase 6 is implemented.** `InitProducerId` allocates an id from a persisted
+> monotonic allocator, and produce batches carrying a producer id, epoch and
+> sequence are validated and deduplicated: a retried batch is answered with the
+> offset it already occupies rather than appended again. This closes the
+> duplicate window Phase 1 opened. Recent sequence state is rebuilt from the
+> local WAL tail on restart; a fresh-machine restart resets it. Transactions
+> remain unimplemented. Validated against franz-go (the client Mimir uses),
+> including a forced timeout-and-retry that asserts the retry is deduplicated.
 
 Pull **6** forward to sit immediately with **1** where possible: shipping D2
 without idempotence substitutes a worse failure mode for the one it removes.

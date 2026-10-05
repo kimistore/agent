@@ -183,6 +183,19 @@ var (
 		Help: "Active segments sealed to satisfy a pending acks=all durability wait",
 	})
 
+	// Idempotent producers. ProducerDuplicates is the number of retried
+	// batches recognised and answered with their original offset instead of
+	// being appended a second time.
+	ProducerIDsAllocated = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_producer_ids_allocated_total",
+		Help: "Producer ids handed out by InitProducerId",
+	})
+
+	ProducerDuplicates = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_producer_duplicate_batches_total",
+		Help: "Idempotent produce batches recognised as retries and not appended again",
+	})
+
 	// These will be registered manually via callbacks
 	TopicCount     prometheus.GaugeFunc
 	PartitionCount prometheus.GaugeFunc

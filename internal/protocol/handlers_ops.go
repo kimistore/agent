@@ -40,7 +40,8 @@ var maxProduceTimeout = 30 * time.Second
 // The distinction that matters is retriability: REQUEST_TIMED_OUT tells the
 // producer the record may or may not be stored and that retrying is correct,
 // whereas the generic code tells it the request failed for a reason a retry
-// will not fix.
+// will not fix. The producer-sequence codes are what an idempotent client
+// uses to decide whether to re-send, re-init or fail.
 func produceError(err error) int16 {
 	switch {
 	case errors.Is(err, storage.ErrDurableTimeout):
@@ -51,9 +52,51 @@ func produceError(err error) int16 {
 		// Another agent owns the log, so this broker is the wrong one to
 		// retry against until routing exists (phase 3).
 		return ErrNotLeaderForPartition
+	case errors.Is(err, storage.ErrUnknownProducer):
+		return ErrUnknownProducerID
+	case errors.Is(err, storage.ErrFencedProducerEpoch):
+		return ErrInvalidProducerEpoch
+	case errors.Is(err, storage.ErrOutOfOrderSequence):
+		return ErrOutOfOrderSequence
+	case errors.Is(err, storage.ErrDuplicateSequence):
+		return ErrDuplicateSequence
 	default:
 		return ErrUnknown
 	}
+}
+
+// handleInitProducerId allocates a producer id for an idempotent producer.
+//
+// The agent does not implement transactions, so a transactional producer is
+// given an id but will fail when it tries to open a transaction. Idempotent,
+// non-transactional producers -- what Grafana Mimir uses -- work.
+func handleInitProducerId(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
+	// V0-V1 Request: transactional_id (nullable string) | transaction_timeout_ms (int32).
+	if _, err := dec.String(); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Int32(); err != nil {
+		return nil, err
+	}
+
+	pid, err := store.AllocateProducerID(ctx)
+
+	// V1+ Response leads with throttle_time_ms; v0 does not have it.
+	if version >= 1 {
+		enc.Int32(0)
+	}
+	if err != nil {
+		log.Printf("InitProducerId: could not allocate a producer id: %v", err)
+		enc.Int16(ErrUnknown)
+		enc.Int64(-1)
+		enc.Int16(-1)
+		return enc.Bytes(), nil
+	}
+	log.Printf("InitProducerId: allocated producer id %d", pid)
+	enc.Int16(ErrNone)
+	enc.Int64(pid)
+	enc.Int16(0) // epoch
+	return enc.Bytes(), nil
 }
 
 func handleProduce(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16, _ ServerConfig) ([]byte, error) {
@@ -189,7 +232,17 @@ func handleProduce(ctx context.Context, dec *Decoder, enc *Encoder, store *stora
 				recordCount = 1
 			}
 
-			offset, err := store.AppendContext(ctx, topic, partition, batchData, recordCount, durable)
+			var offset int64
+			// A batch carrying a producer id is idempotent: deduplicate it
+			// against the producer's sequence state rather than appending a
+			// retry a second time. A batch with a producer id of -1 has no
+			// sequence to reconcile and takes the plain path.
+			if pb, idempotent := wal.ProducerBatchHeaderOf(batchData); idempotent {
+				offset, _, err = store.AppendIdempotentContext(ctx, topic, partition, batchData, recordCount, durable,
+					pb.ProducerID, pb.Epoch, pb.BaseSequence)
+			} else {
+				offset, err = store.AppendContext(ctx, topic, partition, batchData, recordCount, durable)
+			}
 			if err == nil && awaitObjectStore {
 				// The record is in the local WAL. Do not acknowledge the offset
 				// until the segment holding it is in object storage, so the

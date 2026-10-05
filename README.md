@@ -99,7 +99,15 @@ The log position and the checkpoint are not bucket-global singletons, so a secon
 * A background flush loop seals the active segment of any partition whose `acks=all` producers are waiting, every `KIMISTORE_FLUSH_INTERVAL_MS`. That interval is both the coalescing window for object-store PUTs and the upper bound on the extra ack latency.
 * The uploader reports each stored segment's offset range back to the engine, which advances a per-partition durable watermark. Waiters are released when it covers their offset.
 * The watermark only moves contiguously: if the upload pool finishes a later segment first, it is held until the gap ahead of it fills, so a producer can never be acknowledged against a hole.
-* If the segment does not reach object storage within the producer's own timeout (capped at 30s), the produce returns `REQUEST_TIMED_OUT` rather than a false acknowledgement. The record is still in the local WAL, so a retry may duplicate it until idempotent producers (phase 6) land.
+* If the segment does not reach object storage within the producer's own timeout (capped at 30s), the produce returns `REQUEST_TIMED_OUT` rather than a false acknowledgement. The record is still in the local WAL, so the client retries; an idempotent producer's retry is deduplicated (see 2f), and a non-idempotent one may duplicate it.
+
+### 2f. Idempotent Producers
+`InitProducerId` is implemented, so an idempotence-enabled client (Grafana Mimir's franz-go distributor, for one) keeps idempotence on and produces batches carrying a producer id, epoch and sequence number.
+
+* Each partition tracks, per producer, the epoch, the next expected sequence and the offsets its recent batches were assigned (the last five, as Kafka does). A retried batch is recognised by its base sequence and answered with the offset it already occupies instead of being appended a second time. This is what closes the duplicate window that `acks=all` opens when an ack times out.
+* A stale epoch is fenced (`INVALID_PRODUCER_EPOCH`); a sequence ahead of the expected one is rejected (`OUT_OF_ORDER_SEQUENCE_NUMBER`) unless it is merely pipelined out of order, in which case it waits briefly for the gap to fill.
+* Producer ids come from a persisted monotonic allocator, so a restart cannot reissue an id and mistake a new producer for an old one. Recent sequence state is rebuilt from the local WAL tail on startup, so a retry after a same-machine restart is still deduplicated. After a fresh-machine restart the state resets and an idempotent retry can duplicate; Mimir tolerates that, and it is the documented limit of this phase.
+* Transactions (`AddPartitionsToTxn` and friends) are not implemented. A transactional producer gets an id but fails when it opens a transaction.
 
 ## 📡 Supported Kafka APIs
 
@@ -121,9 +129,10 @@ The following Kafka API Keys are currently implemented:
 | **DescribeGroups** | 15 | Get detailed group/member info. | ✅ Active |
 | **ListGroups** | 16 | List active consumer groups. | ✅ Active |
 | **ApiVersions** | 18 | Negotiate protocol support. | ✅ Active (V0) |
-| *any other key* | — | Answered `UNSUPPORTED_VERSION`, connection preserved | ✅ |
 | **CreateTopics** | 19 | Create new topics. | ✅ Active |
 | **DeleteTopics** | 20 | Delete topics. | ✅ Active |
+| **InitProducerId** | 22 | Allocate an idempotent producer id. | ✅ Active (V0-V1) |
+| *any other key* | — | Answered `UNSUPPORTED_VERSION`, connection preserved | ✅ |
 
 ## 🛠 Usage
 

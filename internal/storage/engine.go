@@ -134,6 +134,23 @@ type StorageEngine struct {
 	waiters   map[string]int64
 	durableCh chan struct{}
 
+	// producerStatesMu guards the map of per-partition idempotent producer
+	// state. Each value carries its own lock, so appends to different
+	// partitions do not serialise on one mutex. See producer.go.
+	producerStatesMu sync.Mutex
+	producerStates   map[string]*partitionProducerState
+
+	// producerIDMu guards the monotonic producer id allocator. It is
+	// persisted, so a restart cannot reissue an id and mistake a new
+	// producer for an old one.
+	producerIDMu   sync.Mutex
+	nextProducerID int64
+
+	// producerDedups counts retried batches recognised and answered rather
+	// than appended. Exposed so a test can assert the duplicate window was
+	// actually exercised, not merely that the log happened to be short.
+	producerDedups atomic.Int64
+
 	// dataCh is a broadcast latch signalled on every successful append, so a
 	// long-polling Fetch can park until there is something to read instead of
 	// returning empty immediately and being re-polled at full speed. Guarded
@@ -226,6 +243,8 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 		durable:          make(map[string]*durableState),
 		waiters:          make(map[string]int64),
 		durableCh:        make(chan struct{}),
+		producerStates:   make(map[string]*partitionProducerState),
+		nextProducerID:   1,
 	}
 	for _, opt := range opts {
 		opt(se)
@@ -331,6 +350,12 @@ func (s *StorageEngine) restoreDurableState(ctx context.Context) error {
 		log.Printf("Warning: could not recover log end offsets from object storage: %v", err)
 	}
 	s.applySeeds()
+	// The producer id allocator must be loaded before any produce can run, or
+	// a restart could reissue an id and a new producer would be mistaken for
+	// an old one. The sequence state is then rebuilt from the local WAL tail
+	// so a retried batch after a restart is still recognised as a duplicate.
+	s.loadProducerIDSeq(ctx)
+	s.recoverProducerState(ctx)
 	return nil
 }
 
@@ -345,6 +370,13 @@ func (s *StorageEngine) Append(topic string, partition int32, batch []byte, reco
 // AppendContext is Append with a caller context, so a produce request whose
 // client has gone away stops costing a durable write.
 func (s *StorageEngine) AppendContext(ctx context.Context, topic string, partition int32, batch []byte, recordCount int, sync bool) (int64, error) {
+	return s.appendCore(ctx, topic, partition, batch, recordCount, sync)
+}
+
+// appendCore is the write path shared by the idempotent and non-idempotent
+// producers. It assigns an offset and updates the durable position; producer
+// sequence accounting is layered on top by AppendIdempotentContext.
+func (s *StorageEngine) appendCore(ctx context.Context, topic string, partition int32, batch []byte, recordCount int, sync bool) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return -1, err
 	}
@@ -370,20 +402,26 @@ func (s *StorageEngine) AppendContext(ctx context.Context, topic string, partiti
 	s.ensureDurable(topic, partition, s.metadataCache.LogEndOffset(topic, partition))
 
 	offset, err := s.walMgr.Append(topic, partition, batch, recordCount, sync)
-	if err == nil && ctx.Err() != nil {
+	if err != nil {
+		return -1, err
+	}
+
+	// The record is in the log, so the durable position must reflect it even
+	// if the client has already gone away: a stale log end offset is what
+	// makes the next append collide with this one.
+	s.metadataCache.AdvancePartition(topic, partition, offset+int64(recordCount))
+	s.markManifestDirty(topic, partition)
+	// Wake any long-polling Fetch requests. Signalled after the write so
+	// a woken reader is guaranteed to observe the new high watermark.
+	s.signalData()
+
+	if ctx.Err() != nil {
 		// The client is gone. The record is already in the log, so it cannot
 		// be rolled back; abandoning the response is the only correct
 		// outcome, and the caller reports a cancelled request.
 		return offset, ctx.Err()
 	}
-	if err == nil {
-		s.metadataCache.AdvancePartition(topic, partition, offset+int64(recordCount))
-		s.markManifestDirty(topic, partition)
-		// Wake any long-polling Fetch requests. Signalled after the write so
-		// a woken reader is guaranteed to observe the new high watermark.
-		s.signalData()
-	}
-	return offset, err
+	return offset, nil
 }
 
 // signalData broadcasts that new data is available.

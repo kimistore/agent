@@ -295,9 +295,9 @@ func TestUnsupportedVersionKeepsConnection(t *testing.T) {
 func TestUnknownAPIIsRefused(t *testing.T) {
 	se := testStore(t)
 
-	// ApiKey 22 is InitProducerId, which a client with idempotence enabled
-	// sends. It is not implemented, but the connection must survive.
-	dec := dispatch(t, se, testConfig(), 22, 0, nil)
+	// ApiKey 23 is AddPartitionsToTxn, the first request a transactional
+	// producer sends. It is not implemented, but the connection must survive.
+	dec := dispatch(t, se, testConfig(), 23, 0, nil)
 	code, _ := dec.Int16()
 	if code != ErrUnsupportedVersion {
 		t.Errorf("error code = %d, want %d", code, ErrUnsupportedVersion)

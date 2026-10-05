@@ -19,6 +19,7 @@ This server implements a subset of the Kafka Protocol (primarily V0-V2). It is d
     | JoinGroup | 0-1 |
     | SyncGroup / Heartbeat / LeaveGroup | 0 |
     | CreateTopics / DeleteTopics | 0 |
+    | InitProducerId | 0-1 |
     | ListGroups / DescribeGroups | 0 |
     | SaslHandshake / SaslAuthenticate | 0-1 / 0 |
 *   **Message Format**:
@@ -49,7 +50,8 @@ offer:
     a background flush seals and uploads a waiting partition every
     `KIMISTORE_FLUSH_INTERVAL_MS`, which is both the coalescing window for
     object-store PUTs and the extra ack latency. `acks=all` without idempotent
-    producers can duplicate a retried batch; idempotence is phase 6.
+    producers can duplicate a retried batch. With an idempotent producer the
+    retry is deduplicated; see "Idempotent producers" below.
 *   **Consumer Groups**: Features a built-in "Lite" Group Coordinator supporting:
     *   Dynamic partition assignment and load balancing (`JoinGroup`, `SyncGroup`, `LeaveGroup`).
     *   Background session/heartbeat tracking (`Heartbeat`).
@@ -107,9 +109,12 @@ counter; if yours does, the label names the API and version it is insisting
 on.
 
 ### Limitations (What WON'T work)
-1.  **Transactions/Idempotency**: Transactional producing (`InitProducerId`,
-    transaction markers) is not implemented. A client that enables
-    idempotence gets `UNSUPPORTED_VERSION` rather than a dropped connection.
+1.  **Transactions**: Transactional producing (`AddPartitionsToTxn`, transaction
+    markers, `EndTxn`) is not implemented, and a transactional producer will
+    fail when it opens a transaction. Idempotent (non-transactional) producing
+    **is** supported: `InitProducerId` allocates an id, and produce batches are
+    deduplicated by producer id, epoch and sequence. Producer state is rebuilt
+    from the local WAL tail on restart, so a fresh-machine restart resets it.
 2.  **Replication**: Multi-broker data replication (partition leaders and ISRs)
     is not implemented. The agent operates as a single-node broker.
 3.  **Flexible (tagged-field) message versions**: Metadata v9+, Fetch v12+ and
@@ -173,6 +178,7 @@ kcat -b localhost:19092 -G my-group my-topic
 | | Offset Commit | ✅ Supported | Group progress committed/loaded from S3 |
 | **Durability** | Local Persistence | ✅ Supported | Synchronous WAL |
 | | Acked-write fsync | ✅ Supported | Group-committed; `acks=1` is local, `acks=all` waits for object storage |
+| | Idempotent producer | ✅ Supported | `InitProducerId`; duplicate retries answered with their original offset |
 | | S3 Offload | ✅ Supported | Asynchronous upload |
 | | S3 Recovery | ✅ Supported | Transparent fallback to S3 |
 | **Durability** | Log position across restart | ✅ Supported | checkpoint + manifest + segment-tail recovery |

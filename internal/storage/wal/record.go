@@ -67,6 +67,9 @@ const (
 	rbCRC             = 17
 	rbAttributes      = 21
 	rbLastOffsetDelta = 23
+	rbProducerID      = 43
+	rbProducerEpoch   = 51
+	rbBaseSequence    = 53
 	rbRecordsCount    = 57
 
 	// recordBatchMagicV2 is the only magic byte value a RecordBatch can carry.
@@ -116,6 +119,52 @@ func parseRecordBatch(b []byte) (recordBatchInfo, error) {
 		Attributes:      attrs,
 		Compressed:      attrs&0x07 != 0,
 	}, nil
+}
+
+// ProducerBatchHeader is the idempotence-relevant subset of a v2 RecordBatch:
+// which producer wrote it, at which epoch, and the sequence its first record
+// carries.
+type ProducerBatchHeader struct {
+	ProducerID   int64
+	Epoch        int16
+	BaseSequence int32
+	Records      int32
+}
+
+// ProducerBatchHeaderOf extracts a producer batch's idempotence header from a
+// produced record blob.
+//
+// It accepts both encodings the produce path sees: a bare RecordBatch and a
+// RecordBatch wrapped in a message set entry. ok is false for a legacy
+// message, an unparseable batch, or a batch whose producer id is -1 -- a
+// producer that is not idempotent and therefore has no sequence state to
+// reconcile.
+func ProducerBatchHeaderOf(data []byte) (ProducerBatchHeader, bool) {
+	batch := data
+	if !isRecordBatch(batch) {
+		if len(data) < msgSetEntryHeaderLen {
+			return ProducerBatchHeader{}, false
+		}
+		size := int32(binary.BigEndian.Uint32(data[8:12]))
+		if size < 0 || msgSetEntryHeaderLen+int(size) > len(data) {
+			return ProducerBatchHeader{}, false
+		}
+		batch = data[msgSetEntryHeaderLen : msgSetEntryHeaderLen+int(size)]
+		if !isRecordBatch(batch) {
+			return ProducerBatchHeader{}, false
+		}
+	}
+
+	pid := int64(binary.BigEndian.Uint64(batch[rbProducerID : rbProducerID+8]))
+	if pid < 0 {
+		return ProducerBatchHeader{}, false
+	}
+	return ProducerBatchHeader{
+		ProducerID:   pid,
+		Epoch:        int16(binary.BigEndian.Uint16(batch[rbProducerEpoch : rbProducerEpoch+2])),
+		BaseSequence: int32(binary.BigEndian.Uint32(batch[rbBaseSequence : rbBaseSequence+4])),
+		Records:      int32(binary.BigEndian.Uint32(batch[rbRecordsCount : rbRecordsCount+4])),
+	}, true
 }
 
 // setRecordBatchBaseOffset re-addresses a RecordBatch to a new base offset.
