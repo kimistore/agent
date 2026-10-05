@@ -206,3 +206,20 @@ kcat -C -b localhost:19092 -t test-topic
 # Run multiple instances in separate terminals to see load balancing
 kcat -b localhost:19092 -G my-group test-topic
 ```
+
+## High availability
+
+The agent is currently **one writer per bucket**: it holds a writer lease in
+object storage and refuses to start when another live agent already holds it.
+
+The design for making a set of agents share one bucket is in
+[`docs/ha-architecture.md`](docs/ha-architecture.md). Its §13 is a handoff
+with the current status, key files and where to start. As of today:
+
+- **Shipped:** per-partition manifests and per-agent checkpoints (phase 0);
+  `acks=all` waits until its segment is in object storage (phase 1); idempotent
+  producers with duplicate-retry deduplication (phase 6).
+- **Not started:** per-partition ownership (phase 2), routing and leader-aware
+  `Metadata` (phase 3), graceful handover (phase 4), group coordination HA
+  (phase 5). Until phase 3, `Metadata` still reports a single broker with the
+  same leader for every partition.

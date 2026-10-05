@@ -1,6 +1,7 @@
 # Kimistore High Availability — Architecture Design
 
-Status: **design / proposal** (no code in this document is implemented)
+Status: **partially implemented.** Phases 0, 1 and 6 are on `main`; phases 2–5
+are designed but not built. See §13 for the handoff.
 Scope: single-region HA for the `kimistore-agent`. Supersedes the ad-hoc
 roadmap discussed earlier.
 
@@ -304,8 +305,9 @@ Ordered cheapest-risk-first. Each phase is independently shippable.
 > remain unimplemented. Validated against franz-go (the client Mimir uses),
 > including a forced timeout-and-retry that asserts the retry is deduplicated.
 
-Pull **6** forward to sit immediately with **1** where possible: shipping D2
-without idempotence substitutes a worse failure mode for the one it removes.
+Phase **6 was pulled forward** to land immediately with **1**: shipping D2
+without idempotence substitutes a worse failure mode for the one it removes,
+so the two are done together (commits `67bafd0` and `702b28a`).
 
 ### Sequencing dependency
 
@@ -349,3 +351,127 @@ multi-owner.
    `LeaderEpoch`, or route on `Leader` alone until the protocol work lands.
 5. **Routing table TTL vs. failover time.** Tune against the measured
    crash-takeover RTO from Phase 4.
+
+---
+
+## 13. Implementation handoff
+
+Written so the next session can start without re-deriving any of this.
+
+### 13.1 Where things stand
+
+| Phase | State | Commit | New surface |
+|---|---|---|---|
+| 0 — per-partition manifests, per-agent checkpoints | ✅ on `main` | `a9127c8` | `_topics/<t>/_manifest/<p>`, `_agents/<id>/checkpoint.json`, `KIMISTORE_AGENT_ID` |
+| 1 — `acks=all` waits for object storage (D2) | ✅ on `main` | `67bafd0` | `KIMISTORE_FLUSH_INTERVAL_MS`, durable watermark, `REQUEST_TIMED_OUT` |
+| 6 — idempotent producer + sequence dedup | ✅ on `main` | `702b28a` | `InitProducerId` (22), producer state, `_producers/_seq` |
+| 2 — per-partition ownership + epoch in segment keys | ⬜ next | — | `_owners/<t>/<p>` |
+| 3 — liveness + routing tables, leader-aware `Metadata` | ⬜ | — | `_agents/<id>/routing` |
+| 4 — graceful drain/handover vs crash takeover | ⬜ | — | — |
+| 5 — HRW group coordination | ⬜ | — | — |
+
+Phases 0/1/6 are the ones that make the **current single-writer agent** correct
+under failure; they are done. Phases 2–5 are the multi-agent work and are not
+started. Until phase 3 ships, the agent is still **one writer per bucket** (the
+writer lease), and `Metadata` still reports a single broker with leader `Node 0`
+for every partition.
+
+### 13.2 Key files
+
+| Concern | File |
+|---|---|
+| Durable position, checkpoint, write path, upload | `internal/storage/engine.go` |
+| Per-partition manifests + legacy migration | `internal/storage/partition_manifest.go` |
+| D2 durable watermark + flush loop | `internal/storage/durable.go` |
+| Idempotent producer state + allocator + WAL-tail recovery | `internal/storage/producer.go` |
+| Writer lease / fencing token | `internal/storage/lease.go` |
+| RecordBatch parsing (incl. producer header) | `internal/storage/wal/record.go` |
+| Segment roll, explicit flush, upload task | `internal/storage/wal/partition.go`, `manager.go` |
+| Protocol dispatch, API versions, error codes | `internal/protocol/handler.go` |
+| Produce + InitProducerId handlers | `internal/protocol/handlers_ops.go` |
+| Config | `internal/config/config.go` |
+| Metrics | `internal/metrics/metrics.go` |
+
+### 13.3 Phase 2 — where to start
+
+The goal: one writer per **(topic, partition)**, fenced, so more than one agent
+can serve one bucket. It reuses the existing lease primitive at a narrower
+scope.
+
+1. Replace the bucket-global writer lease as the *only* fence with a per-partition
+   claim at `_owners/<topic>/<partition>` = `{agent, epoch, expires}`, acquired
+   with the same CAS helper the lease uses (`ConditionalObjectStore.PutVersion`).
+   Keep the bucket-global lease for now as a coarse guard; phase 3 removes the
+   need for it.
+2. Put the ownership **epoch in the segment key**:
+   `topic/partition/<baseOffset>-e<epoch>.log`. A stale owner's upload then
+   cannot collide with, or overwrite, the new owner's. `_owners` is written
+   rarely, so the CAS is off the append hot path.
+3. Epoch must be **monotonic per partition** and never reset, for the same
+   reason the lease epoch is not reset across restarts (see `lease.go` release
+   tombstone) — it is stamped into the manifest and compared on recovery.
+4. `recoverManifest` / `loadPartitionManifests` already compare `WriterEpoch`
+   against the local epoch and return `errSuperseded`; extend the same check to
+   the per-partition ownership epoch.
+
+Do not start phase 3 until a single agent can still own everything under the
+new scheme (phase 2 is shippable alone).
+
+### 13.4 Phase 3 — the hinge
+
+- Publish `_agents/<id>/routing` (owned partitions + epochs) and discover the
+  union into a cached routing view.
+- Rewrite `handleMetadata`: brokers = live agents; per partition, `Leader` =
+  owner node id and `LeaderEpoch` = ownership epoch (`Metadata` v7+ for the
+  epoch; today's ceiling is v6, see open risk 4). Unowned partition →
+  `LEADER_NOT_AVAILABLE (5)`.
+- Owner-scoped reads: serve the local (hot) WAL only for owned partitions; a
+  non-owned partition may be read cold from S3 but must never answer from a
+  stale local WAL.
+- `NOT_LEADER_OR_FOLLOWER` for a produce/fetch to a partition this agent does
+  not own. `produceError` in `handlers_ops.go` already has a slot for the lease
+  case; narrow it to the partition check.
+- Long-poll keeps working only if clients reach the owner, which is exactly why
+  routing is load-bearing for latency and not just for safety (§5.3).
+
+### 13.5 Decisions made during implementation (refinements to this doc)
+
+- **`KIMISTORE_AGENT_ID` defaults to the hostname, not the lease holder.** The
+  checkpoint key must be stable across a restart; the lease holder is
+  `hostname/pid` on purpose because it needs per-process uniqueness. Two
+  identities, two jobs.
+- **D2 fragments small synchronous writes.** A producer that writes one record
+  and waits cannot coalesce, so each ack seals its own segment object. Batched
+  or concurrent producers amortise this; the default 1s flush interval means a
+  low-rate synchronous producer costs ~1 PUT/s/partition. Accepted, not a bug.
+- **Producer state is recovered from the local WAL tail only.** A same-machine
+  restart dedups; a fresh-machine restart resets producer state and an
+  idempotent retry can duplicate. Documented in README §2f; Mimir tolerates it.
+- **The "offset monotonic guard" from phase 6 was read as:** a deduplicated
+  batch is answered with its original offset (never a fresh one), and
+  `MetadataCache.AdvancePartition` only ever moves the log end forward. If a
+  stronger guarantee is wanted (reject a *lower* consumer commit), that is not
+  implemented — Kafka permits lowering commits, so it was left conformant.
+- **Mimir's e2e does not enable idempotence.** Its distributor never sends
+  `InitProducerId`, so `test/mimir-e2e.sh` cannot exercise phase 6. That is why
+  `github.com/twmb/franz-go` is now a test dependency; see
+  `internal/server/franz_idempotence_test.go`, including the forced
+  timeout-and-retry that asserts the retry is deduplicated.
+- **Deleting a topic also deletes its `_topics/<t>/…` manifests**, which live
+  outside the topic's data prefix (`engine.go`, `asyncDeleteTopicFromS3`).
+
+### 13.6 Verification commands
+
+```bash
+go build ./...
+go vet ./...
+go test -race ./...
+golangci-lint run ./...
+go build -o agent ./cmd/agent && ./test/mimir-e2e.sh   # needs Docker
+```
+
+### 13.7 Outstanding operational item
+
+The GitHub Actions workflow (`.github/workflows/ci.yml`) has **never run
+remotely**. Watch the first push-triggered run and the nightly/manual Mimir job;
+the lint and e2e jobs in particular have only ever been run locally.
