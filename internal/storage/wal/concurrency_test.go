@@ -31,7 +31,7 @@ import (
 // duplicate offset or a gap.
 func TestAppend_ConcurrentSyncIsContiguous(t *testing.T) {
 	dir := t.TempDir()
-	pw, err := NewPartitionWAL(dir, "concurrent", 0, nil)
+	pw, err := NewPartitionWAL(dir, "concurrent", 0, 0, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestAppend_ConcurrentSyncIsContiguous(t *testing.T) {
 func TestAppend_ConcurrentSyncThenRecover(t *testing.T) {
 	dir := t.TempDir()
 
-	pw, err := NewPartitionWAL(dir, "recover", 0, nil)
+	pw, err := NewPartitionWAL(dir, "recover", 0, 0, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestAppend_ConcurrentSyncThenRecover(t *testing.T) {
 	pw.Close()
 
 	// Reopen: everything acknowledged must be recoverable.
-	pw2, err := NewPartitionWAL(dir, "recover", 0, nil)
+	pw2, err := NewPartitionWAL(dir, "recover", 0, 0, nil)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestAppend_ConcurrentSyncWithRolls(t *testing.T) {
 	MaxSegmentSize = 8 * 1024
 	defer func() { MaxSegmentSize = orig }()
 
-	pw, err := NewPartitionWAL(dir, "rolls", 0, func(UploadTask) {})
+	pw, err := NewPartitionWAL(dir, "rolls", 0, 0, func(UploadTask) {})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

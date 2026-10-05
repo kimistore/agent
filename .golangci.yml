@@ -1,0 +1,54 @@
+# golangci-lint configuration (schema v2).
+#
+# Deliberately small: the linters here are the ones that catch real defects in
+# this codebase (unbounded object-store calls, ignored errors, leaked response
+# bodies, contexts replaced mid-call), not a long list of style rules that would
+# need suppressing everywhere.
+
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - bodyclose      # object-store bodies must be closed or the request leaks
+    - contextcheck   # contexts must be threaded, not replaced mid-call
+    - errcheck       # a dropped storage error is a data loss bug here
+    - govet
+    - ineffassign
+    - misspell
+    - noctx          # HTTP calls without a context
+    - staticcheck
+    - unconvert
+    - unused
+
+  settings:
+    errcheck:
+      # Log and metric side effects are the intended way to report a
+      # non-fatal storage error, so discarding one is allowed when explicit.
+      check-blank: false
+    staticcheck:
+      checks:
+        - all
+        - -ST1000 # package comments
+        - -ST1003 # initialisms in names
+        - -ST1020 # comment on exported function
+        - -ST1021 # comment on exported type
+
+  exclusions:
+    rules:
+      # Test doubles and fixtures legitimately ignore errors, and a test
+      # harness dialing a loopback listener has no request to cancel.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - bodyclose
+          - noctx
+          - contextcheck
+
+formatters:
+  enable:
+    - gofmt

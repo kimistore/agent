@@ -22,14 +22,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"kimistore/internal/coordinator"
@@ -46,10 +50,32 @@ type StorageEngine struct {
 
 	quit chan struct{}
 	wg   sync.WaitGroup
+	// closeOnce makes Close idempotent. Shutdown has more than one possible
+	// caller (a signal handler, a failing startup, a test), and a second call
+	// must be a no-op rather than a panic on a closed channel.
+	closeOnce sync.Once
+	closeErr  error
+
+	// opTimeout bounds every object-store operation. See DefaultOperationTimeout.
+	opTimeout time.Duration
+
+	// closedCtx is cancelled when the engine starts shutting down, so
+	// in-flight object-store calls are released instead of holding the drain.
+	closedCtx    context.Context
+	cancelClosed context.CancelFunc
+
+	// lease is the exclusive writer claim. It is nil when the engine was
+	// built without one, in which case the write path is unfenced.
+	lease *leaseState
 
 	// Parallel Uploader
 	uploadChan      chan wal.UploadTask
 	inFlightUploads sync.Map // path -> struct{}
+
+	// pendingUploads counts segments handed to the uploader but not yet
+	// stored. Shutdown waits on it rather than on the queue length, which can
+	// read as empty while a task is still being enqueued.
+	pendingUploads atomic.Int64
 
 	// Cache for S3 List results (topic/partition -> []keys)
 	segmentCache map[string][]string
@@ -75,6 +101,10 @@ type StorageEngine struct {
 
 	retentionCfg RetentionConfig
 
+	// leaseCfg is the requested writer lease, applied before any goroutine
+	// starts so the claim is held before recovery reads durable state.
+	leaseCfg LeaseConfig
+
 	metadataCache *MetadataCache
 	coordinator   *coordinator.Coordinator
 
@@ -86,7 +116,32 @@ type StorageEngine struct {
 	dataCh chan struct{}
 }
 
-func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retentionCfg RetentionConfig) (*StorageEngine, error) {
+// StorageEngine is the only Engine implementation, and the assertion keeps it
+// honest as the interface grows.
+var _ Engine = (*StorageEngine)(nil)
+
+// Option configures optional engine behaviour. The engine is usable without
+// any of them; each one trades a guarantee for a configuration knob.
+type Option func(*StorageEngine)
+
+// WithLease makes the engine claim exclusive write access to the log before it
+// serves anything, and refuse writes if the claim is later lost.
+func WithLease(cfg LeaseConfig) Option {
+	return func(se *StorageEngine) { se.leaseCfg = cfg }
+}
+
+// WithOperationTimeout bounds every object-store call. Non-positive values
+// keep DefaultOperationTimeout.
+func WithOperationTimeout(d time.Duration) Option {
+	return func(se *StorageEngine) {
+		if d > 0 {
+			se.opTimeout = d
+		}
+	}
+}
+
+func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retentionCfg RetentionConfig, opts ...Option) (*StorageEngine, error) {
+	closedCtx, cancelClosed := context.WithCancel(context.Background())
 	se := &StorageEngine{
 		objStore:         objStore,
 		bucket:           bucket,
@@ -99,23 +154,44 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 		retentionCfg:     retentionCfg,
 		metadataCache:    NewMetadataCache(),
 		dataCh:           make(chan struct{}),
+		opTimeout:        DefaultOperationTimeout,
+		closedCtx:        closedCtx,
+		cancelClosed:     cancelClosed,
+	}
+	for _, opt := range opts {
+		opt(se)
 	}
 
 	onRoll := func(task wal.UploadTask) {
 		task.Source = "fast-path"
+		se.pendingUploads.Add(1)
 		select {
 		case se.uploadChan <- task:
 		default:
+			se.pendingUploads.Add(-1)
 			metrics.UploaderMissedEvents.Inc()
-			log.Printf("Warning: Upload channel full, skipping fast-path for %s", task.Path)
+			log.Printf("Warning: Upload channel full, skipping fast-path for %s (it stays on local disk and is retried by the reconciler)", task.Path)
 		}
 	}
 
 	mgr, err := wal.NewManager(walDir, onRoll)
 	if err != nil {
+		cancelClosed()
 		return nil, err
 	}
 	se.walMgr = mgr
+
+	// Claim the log before reading any of it. Two agents pointed at one
+	// bucket would otherwise each assign offsets from their own recovered
+	// state and overwrite each other's segments, and nothing below would
+	// notice: the failure mode is silent data loss, not an error.
+	lease, err := acquireLease(context.Background(), objStore, se.leaseCfg)
+	if err != nil {
+		_ = mgr.Close()
+		cancelClosed()
+		return nil, err
+	}
+	se.lease = lease
 
 	// Load/Merge Cache from WAL
 	if err := se.metadataCache.Load(walDir); err != nil {
@@ -125,7 +201,7 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 	// Start worker pool (8 workers)
 	for i := 0; i < 8; i++ {
 		se.wg.Add(1)
-		go se.uploaderWorker()
+		go se.uploaderWorker(se.closedCtx)
 	}
 
 	// Start background uploader (reconciliation), offset flusher, retention, and checkpoint loop
@@ -134,6 +210,24 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 	go se.offsetFlusherLoop()
 	go se.retentionLoop()
 	go se.checkpointLoop()
+
+	// Recover the durable log position before the engine is handed out.
+	//
+	// This has to happen here rather than in a later wiring step. If it were
+	// left to whoever attaches a coordinator, then any caller that skipped
+	// that step would come up with an empty local WAL, no checkpoint and no
+	// object-store recovery, and start handing out offsets that are already
+	// taken.
+	if err := se.restoreDurableState(context.Background()); err != nil {
+		if errors.Is(err, errSuperseded) {
+			// Durable state belongs to a writer that held the log after us.
+			// There is no safe way to carry on from here, so tear the engine
+			// down and let the caller decide.
+			_ = se.Close()
+			return nil, err
+		}
+		log.Printf("Warning: could not fully restore durable state: %v", err)
+	}
 
 	// Load consumer offsets from object storage so retention knows the log
 	// start. Registered on the wait group so Close cannot return while it is
@@ -147,15 +241,65 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 	return se, nil
 }
 
+// restoreDurableState reloads the checkpoint and then repairs anything the
+// checkpoint does not know about from object storage. It is safe to call more
+// than once.
+func (s *StorageEngine) restoreDurableState(ctx context.Context) error {
+	if err := s.loadCheckpointInto(ctx, false); err != nil {
+		if errors.Is(err, errSuperseded) {
+			// Being fenced out is not recoverable by falling back: the only
+			// correct action is to not serve this log.
+			return err
+		}
+		log.Printf("No usable checkpoint (%v); recovering log position from object storage", err)
+	}
+	if err := s.recoverManifest(ctx); err != nil {
+		if errors.Is(err, errSuperseded) {
+			return err
+		}
+		log.Printf("Warning: could not recover log end offsets from object storage: %v", err)
+	}
+	s.applySeeds()
+	return nil
+}
+
 // Append writes a batch and returns its base offset. When sync is true the
 // data is fsynced before returning, so the offset may be acknowledged to the
 // producer as durable. Callers should set sync from the request's acks value
 // (acks=0 is fire-and-forget; acks>=1 promises durability).
 func (s *StorageEngine) Append(topic string, partition int32, batch []byte, recordCount int, sync bool) (int64, error) {
-	// Update Cache (Idempotent)
-	s.metadataCache.AddPartition(topic, partition)
+	return s.AppendContext(context.Background(), topic, partition, batch, recordCount, sync)
+}
+
+// AppendContext is Append with a caller context, so a produce request whose
+// client has gone away stops costing a durable write.
+func (s *StorageEngine) AppendContext(ctx context.Context, topic string, partition int32, batch []byte, recordCount int, sync bool) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return -1, err
+	}
+	// Refuse to write unless this agent still owns the log. A writer whose
+	// lease was taken over would assign offsets that collide with the new
+	// holder's and overwrite its segments; that is silent data loss, so it
+	// has to be a refusal rather than a best-effort write.
+	if err := s.lease.checkWrite(); err != nil {
+		metrics.LeasedOutRefusals.Inc()
+		return -1, err
+	}
+	// Take the read lock first: once a partition is known the write path
+	// never needs the cache's write lock, so a hot partition does not
+	// serialise every producer on one mutex.
+	if !s.metadataCache.Has(topic, partition) {
+		s.metadataCache.AddPartition(topic, partition)
+	}
 	offset, err := s.walMgr.Append(topic, partition, batch, recordCount, sync)
+	if err == nil && ctx.Err() != nil {
+		// The client is gone. The record is already in the log, so it cannot
+		// be rolled back; abandoning the response is the only correct
+		// outcome, and the caller reports a cancelled request.
+		return offset, ctx.Err()
+	}
 	if err == nil {
+		s.metadataCache.AdvancePartition(topic, partition, offset+int64(recordCount))
 		// Wake any long-polling Fetch requests. Signalled after the write so
 		// a woken reader is guaranteed to observe the new high watermark.
 		s.signalData()
@@ -180,180 +324,273 @@ func (s *StorageEngine) DataSignal() <-chan struct{} {
 	return s.dataCh
 }
 
+// Read returns exactly one stored record blob covering offset. Callers that
+// want to fill a budget should use ReadBatch.
 func (s *StorageEngine) Read(topic string, partition int32, offset int64) ([]byte, error) {
-	// 1. Try WAL (Hot)
-	data, err := s.walMgr.Read(topic, partition, offset)
-	if err == nil {
-		return data, nil
+	// A zero budget means "one entry": the point of Read is the entry that
+	// covers the offset, not throughput.
+	data, _, err := s.ReadBatch(topic, partition, offset, 0)
+	return data, err
+}
+
+// defaultReadBudget bounds a read when the caller expresses no preference.
+const defaultReadBudget = int64(1 << 20)
+
+// ReadBatch serves as many records as fit the byte budget, starting at
+// offset, and reports the offset to fetch next.
+//
+// Returning one blob per Fetch turns the consumer into a request loop: one
+// round trip per producer batch, and on the cold path one object-store GET
+// per batch. Honouring the caller's byte budget is what makes the fetch loop
+// behave like a broker's.
+func (s *StorageEngine) ReadBatch(topic string, partition int32, offset int64, maxBytes int64) ([]byte, int64, error) {
+	return s.ReadBatchContext(context.Background(), topic, partition, offset, maxBytes)
+}
+
+// ReadBatchContext is ReadBatch with a caller context, so a consumer that
+// disconnects mid-fetch releases its object-store read instead of holding a
+// handler goroutine and an in-flight slot until the read happens to finish.
+func (s *StorageEngine) ReadBatchContext(ctx context.Context, topic string, partition int32, offset int64, maxBytes int64) ([]byte, int64, error) {
+	// A caller that has gone away must be told that, rather than being told
+	// the offset is missing. The two mean very different things to a consumer:
+	// one is a retry, the other a reset.
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	// maxBytes of zero or less means "one entry"; Read relies on that, while
+	// a fetch with no stated ceiling gets a sane default.
+	oneEntry := maxBytes <= 0
+	if oneEntry {
+		maxBytes = defaultReadBudget
 	}
 
-	// 2. Try Object Store (Cold)
-	prefix := fmt.Sprintf("%s/%d/", topic, partition)
+	// 1. Hot path: the local WAL.
+	if data, next, err := s.walMgr.ReadBatch(topic, partition, offset, budgetFor(oneEntry, maxBytes)); err == nil {
+		return s.reframe(data, offset), next, nil
+	}
+
+	// 2. Cold path: object storage.
+	prefix := partitionPrefix(topic, partition)
 	cacheKey := fmt.Sprintf("%s/%d", topic, partition)
 
-	// Helper to find best key from a list of keys
-	findBestKey := func(keys []string) string {
-		var bKey string
-		var bStartOffset int64 = -1
-		for _, k := range keys {
-			if !strings.HasSuffix(k, ".log") {
-				continue
-			}
-			parts := strings.Split(k, "/")
-			filename := parts[len(parts)-1]
-			baseName := strings.TrimSuffix(filename, ".log")
-			startOffset, err := strconv.ParseInt(baseName, 10, 64)
-			if err != nil {
-				continue
-			}
-			if startOffset <= offset {
-				if startOffset > bStartOffset {
-					bStartOffset = startOffset
-					bKey = k
-				}
-			}
-		}
-		return bKey
-	}
-
-	// Try Cache First
-	s.cacheMu.RLock()
-	cachedKeys, hit := s.segmentCache[cacheKey]
-	s.cacheMu.RUnlock()
-
-	var bestKey string
-	if hit {
-		bestKey = findBestKey(cachedKeys)
-	}
-
-	// If miss or not found in cache, Refresh Cache
-	if bestKey == "" {
-		s.cacheMu.Lock()
-		// Double check
-		cachedKeys, hit = s.segmentCache[cacheKey]
-		if hit {
-			bestKey = findBestKey(cachedKeys)
-		}
-
-		if bestKey == "" {
-			// Actually list S3
-			ctx := context.Background()
-			objects, err := s.objStore.List(ctx, prefix)
-			if err != nil {
-				s.cacheMu.Unlock()
-				return nil, fmt.Errorf("failed to list s3: %v", err)
-			}
-
-			var keys []string
-			for _, o := range objects {
-				keys = append(keys, o.Key)
-			}
-
-			s.segmentCache[cacheKey] = keys
-			bestKey = findBestKey(keys)
-		}
-		s.cacheMu.Unlock()
-	}
-
-	if bestKey == "" {
-		return nil, fmt.Errorf("offset %d not found in verified segments", offset)
-	}
-
-	// Indexed Read Logic
-	ctx := context.Background()
-	indexKey := strings.TrimSuffix(bestKey, ".log") + ".index"
-
-	// Try to get index
-	// Optimization: Cache index? For MVP, just fetch it. It's small.
-	indexReader, err := s.objStore.Get(ctx, indexKey)
-	var shouldUseIndex = false
-	var indexBytes []byte
-
-	if err == nil {
-		indexBytes, err = io.ReadAll(indexReader)
-		indexReader.Close()
-		if err == nil && len(indexBytes) > 0 {
-			shouldUseIndex = true
-		}
-	}
-
-	if shouldUseIndex {
-		// Lookup Position
-		// Need baseOffset from filename
-		parts := strings.Split(bestKey, "/")
-		filename := parts[len(parts)-1]
-		baseName := strings.TrimSuffix(filename, ".log")
-		baseOffset, _ := strconv.ParseInt(baseName, 10, 64)
-
-		pos, err := index.Lookup(indexBytes, offset, baseOffset)
-		if err == nil {
-			// Range Read!
-			// We read from pos to end (or a chunk).
-			// If we don't know end, we can read to end of object.
-			// But ObjectStore.GetRange needs length.
-			// Ideally we know size. `Get` might return size or we Listed it.
-			// s.segmentCache could store size? For now, we don't have size easily.
-			// Let's assume we read 1MB or similar, or just use GetRange with large length if supported?
-			// Standard S3 Range: bytes=X- (to end).
-			// Our interface GetRange takes length.
-			// If we pass -1 as length? Or very large?
-			// Let's use GetRange with a reasonable chunk (e.g. 10MB) or just standard Get if interface limits.
-			// Wait, I designed GetRange(start, length).
-			// If I don't know size, I can't effectively fetch "rest of file".
-			// But wait, `List` returned metadata including Size!
-			// `segmentCache` stores KEYS.
-			// We could enhance segmentCache to store Metadata.
-			// OR for MVP: Just fallback to full read if we don't know size, OR just guess large.
-
-			// Actually, let's use a large number. S3 ignores out of range.
-			// "bytes=X-Y". If Y > size, S3 returns up to size.
-			const FetchSize = 10 * 1024 * 1024 // 10MB
-
-			rc, err := s.objStore.GetRange(ctx, bestKey, pos, FetchSize)
-			if err == nil {
-				defer rc.Close()
-				// We need to scan from the start of this range (which corresponds to `pos` in file)
-				// `scanStreamForOffset` assumes it's reading a stream of messages.
-				// Since `pos` points to start of a message (guaranteed by index), it should work perfectly.
-				return scanStreamForOffset(rc, offset)
-			}
-		}
-	}
-
-	// Fallback to Full Download
-	rc, err := s.objStore.Get(ctx, bestKey)
+	keys, err := s.cachedSegments(ctx, prefix, cacheKey)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	defer rc.Close()
 
-	return scanStreamForOffset(rc, offset)
+	bestKey := bestSegmentFor(keys, offset)
+	if bestKey == "" {
+		return nil, 0, fmt.Errorf("offset %d not found in any segment under %s", offset, prefix)
+	}
+
+	baseOffset := parseOffsetFromKey(bestKey)
+	start := int64(0)
+	indexed := false
+
+	if rc, err := s.objGet(ctx, strings.TrimSuffix(bestKey, ".log")+".index"); err == nil {
+		if indexBytes, readErr := io.ReadAll(rc); readErr == nil && len(indexBytes) > 0 {
+			if pos, lookupErr := index.Lookup(indexBytes, offset, baseOffset); lookupErr == nil {
+				start, indexed = pos, true
+			}
+		}
+		_ = rc.Close()
+	}
+
+	var rc io.ReadCloser
+	if indexed {
+		// The index already points at the start of a record, so only the
+		// region from there to the end of the segment is needed. Sizing this
+		// to the whole segment is what made a 1 KB read cost a 10 MB GET.
+		rc, err = s.objGetRange(ctx, bestKey, start, 0)
+	} else {
+		rc, err = s.objGet(ctx, bestKey)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	defer func() { _ = rc.Close() }()
+
+	data, next, err := scanStreamForOffset(rc, offset, budgetFor(oneEntry, maxBytes), baseOffset)
+	if err != nil {
+		return nil, 0, err
+	}
+	return s.reframe(data, offset), next, nil
+}
+
+// reframe serves a wrapped RecordBatch bare.
+//
+// This is not a deviation from the protocol: both framings are valid Kafka,
+// and a RecordBatch is self-describing either way. It is done unconditionally
+// because the client this agent exists to serve cannot read the wrapped form
+// at all, which would otherwise make data written by a Java or librdkafka
+// producer unreadable. See wal.UnwrapBatches.
+func (s *StorageEngine) reframe(data []byte, offset int64) []byte {
+	out, changed := wal.UnwrapBatches(data, offset)
+	if !changed {
+		return data
+	}
+	return out
+}
+
+// budgetFor maps the single-entry request onto a byte budget: large enough for
+// one blob, small enough that the caller's drain loops stop after it.
+func budgetFor(oneEntry bool, maxBytes int64) int64 {
+	if oneEntry {
+		return singleEntryBudget
+	}
+	return maxBytes
+}
+
+// singleEntryBudget is effectively unbounded for one record, and
+// unsatisfiable for two: the drain loops compare against it and stop.
+const singleEntryBudget int64 = 1 << 40
+
+// cachedSegments returns the segment keys under prefix, listing object
+// storage only on a cache miss.
+func (s *StorageEngine) cachedSegments(ctx context.Context, prefix, cacheKey string) ([]string, error) {
+	s.cacheMu.RLock()
+	keys, hit := s.segmentCache[cacheKey]
+	s.cacheMu.RUnlock()
+	if hit {
+		return keys, nil
+	}
+
+	// Serialise the refill so a burst of cold reads produces one LIST rather
+	// than one per reader.
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if keys, hit := s.segmentCache[cacheKey]; hit {
+		return keys, nil
+	}
+
+	objects, err := s.objList(ctx, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list %s: %w", prefix, err)
+	}
+	keys = make([]string, 0, len(objects))
+	for _, o := range objects {
+		if strings.HasSuffix(o.Key, ".log") {
+			keys = append(keys, o.Key)
+		}
+	}
+	s.segmentCache[cacheKey] = keys
+	return keys, nil
+}
+
+// bestSegmentFor picks the newest segment whose start offset is at or below
+// the requested offset.
+func bestSegmentFor(keys []string, offset int64) string {
+	var bestKey string
+	var bestStart int64 = -1
+	for _, k := range keys {
+		if !strings.HasSuffix(k, ".log") {
+			continue
+		}
+		start := parseOffsetFromKey(k)
+		if start < 0 {
+			continue
+		}
+		if start <= offset && start > bestStart {
+			bestStart, bestKey = start, k
+		}
+	}
+	return bestKey
 }
 
 func (s *StorageEngine) GetTopics() ([]string, error) {
 	return s.metadataCache.GetTopics(), nil
 }
 
+// GetPartitions reports every partition known for a topic.
+//
+// The durable cache is the authority, unioned with whatever the local WAL
+// directory knows. Consulting the local directory alone is what used to make a
+// restarted agent advertise a single partition for a topic that had N: sealed
+// segments are deleted once offloaded, so the directory is empty on restart
+// and the partition set with it.
 func (s *StorageEngine) GetPartitions(topic string) ([]int32, error) {
-	return s.walMgr.ListPartitions(topic)
+	seen := make(map[int32]bool)
+	var out []int32
+	for _, p := range s.metadataCache.GetPartitions(topic) {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	if local, err := s.walMgr.ListPartitions(topic); err == nil {
+		for _, p := range local {
+			if !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+	}
+	return out, nil
 }
 
+// HighWaterMark is the offset the next append to the partition will take.
+//
+// A single-node agent replicates nothing, so the high watermark and the log
+// end offset are the same thing.
 func (s *StorageEngine) HighWaterMark(topic string, partition int32) int64 {
-	return s.walMgr.HighWaterMark(topic, partition)
+	if l := s.walMgr.HighWaterMark(topic, partition); l > 0 {
+		return l
+	}
+	return s.metadataCache.LogEndOffset(topic, partition)
+}
+
+// LogStartOffset is the oldest offset still retrievable. It is what
+// ListOffsets must report as the earliest offset; returning 0 once retention
+// has reclaimed the start turns every new consumer into a livelock of
+// OffsetOutOfRange against its own reset.
+func (s *StorageEngine) LogStartOffset(topic string, partition int32) int64 {
+	return s.metadataCache.LogStartOffset(topic, partition)
 }
 
 func (s *StorageEngine) CreateTopic(topic string, partitions int32) error {
+	return s.CreateTopicContext(context.Background(), topic, partitions)
+}
+
+// CreateTopicContext is CreateTopic with a caller context, so the checkpoint
+// it writes is bounded by the request that caused it.
+func (s *StorageEngine) CreateTopicContext(ctx context.Context, topic string, partitions int32) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	err := s.walMgr.CreateTopic(topic, partitions)
 	if err == nil {
 		s.metadataCache.AddTopic(topic)
 		for i := int32(0); i < partitions; i++ {
 			s.metadataCache.AddPartition(topic, i)
 		}
+		// Persist immediately: a topic whose creation only exists in memory
+		// is a topic that vanishes on restart.
+		if err := s.SaveCheckpointContext(ctx); err != nil {
+			log.Printf("CreateTopic: could not persist topic %s: %v", topic, err)
+		}
 	}
 	return err
 }
 
+// TopicExists reports whether the topic is known to the durable registry.
+func (s *StorageEngine) TopicExists(topic string) bool {
+	for _, t := range s.metadataCache.GetTopics() {
+		if t == topic {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *StorageEngine) DeleteTopic(topic string) error {
+	return s.DeleteTopicContext(context.Background(), topic)
+}
+
+// DeleteTopicContext is DeleteTopic with a caller context.
+func (s *StorageEngine) DeleteTopicContext(ctx context.Context, topic string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	err := s.walMgr.DeleteTopic(topic)
 	if err == nil {
 		s.metadataCache.RemoveTopic(topic)
@@ -368,15 +605,45 @@ func (s *StorageEngine) DeleteTopic(topic string) error {
 		}
 		s.committedMu.Unlock()
 		// Delete cold segments from Object Storage asynchronously in the background
-		go s.asyncDeleteTopicFromS3(topic)
+		// Detached from the request: deleting a topic's cold data is cleanup,
+		// not part of answering DeleteTopics, and the client should not wait
+		// on it. The engine's own context is the right parent here rather than
+		// the request's, so the cleanup survives the client going away and
+		// still dies with the process.
+		//nolint:contextcheck // deliberately not derived from the request
+		go s.asyncDeleteTopicFromS3(s.closedCtx, topic)
+		// Drop the consumed offsets too. Leaving them behind would pin
+		// retention's log start for a topic that no longer exists.
+		//nolint:contextcheck // deliberately not derived from the request
+		go s.asyncDeleteTopicOffsets(s.closedCtx, topic)
 	}
 	return err
 }
 
-func (s *StorageEngine) asyncDeleteTopicFromS3(topic string) {
-	ctx := context.Background()
+// asyncDeleteTopicOffsets removes every consumer group's committed offsets
+// for a deleted topic.
+func (s *StorageEngine) asyncDeleteTopicOffsets(ctx context.Context, topic string) {
+	objects, err := s.objList(ctx, offsetsPrefix)
+	if err != nil {
+		log.Printf("Async offset cleanup: failed to list offsets: %v", err)
+		return
+	}
 	prefix := topic + "/"
-	objects, err := s.objStore.List(ctx, prefix)
+	for _, obj := range objects {
+		if !strings.Contains(obj.Key, prefix) {
+			continue
+		}
+		if err := s.objDelete(ctx, obj.Key); err != nil {
+			log.Printf("Async offset cleanup: failed to delete %s: %v", obj.Key, err)
+			continue
+		}
+		log.Printf("Async offset cleanup: deleted %s", obj.Key)
+	}
+}
+
+func (s *StorageEngine) asyncDeleteTopicFromS3(ctx context.Context, topic string) {
+	prefix := topic + "/"
+	objects, err := s.objList(ctx, prefix)
 	if err != nil {
 		log.Printf("Async S3 cleanup: Failed to list S3 objects for topic %s: %v", topic, err)
 		return
@@ -384,7 +651,7 @@ func (s *StorageEngine) asyncDeleteTopicFromS3(topic string) {
 
 	for _, obj := range objects {
 		if strings.HasPrefix(obj.Key, prefix) {
-			if err := s.objStore.Delete(ctx, obj.Key); err != nil {
+			if err := s.objDelete(ctx, obj.Key); err != nil {
 				log.Printf("Async S3 cleanup: Failed to delete cold object %s: %v", obj.Key, err)
 			} else {
 				log.Printf("Async S3 cleanup: Deleted cold object %s", obj.Key)
@@ -393,109 +660,172 @@ func (s *StorageEngine) asyncDeleteTopicFromS3(topic string) {
 	}
 }
 
-func scanStreamForOffset(r io.Reader, targetOffset int64) ([]byte, error) {
-	// Format: [Offset (8)][Size (4)][Data...]
-	// We scan until we find targetOffset.
+// scanStreamForOffset walks stored entries from r, skipping until it reaches
+// targetOffset, and then accumulates records until the byte budget is spent.
+//
+// Each entry is [offset(8)][size(4)][body], and a body may hold many records,
+// so the target offset can legitimately land in the middle of one. Offsets in
+// the returned blob are rewritten into the log's offset space, and a wrapped
+// RecordBatch has its own base offset repaired as well.
+func scanStreamForOffset(r io.Reader, targetOffset, maxBytes int64, baseOffset int64) ([]byte, int64, error) {
+	if maxBytes <= 0 {
+		maxBytes = defaultReadBudget
+	}
 
-	bufHeader := make([]byte, 12)
+	var out []byte
+	next := targetOffset
+	found := false
 
+	header := make([]byte, 12)
 	for {
-		_, err := io.ReadFull(r, bufHeader)
-		if err == io.EOF {
-			return nil, fmt.Errorf("offset %d not found in segment (EOF)", targetOffset)
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		msgOffset := int64(binary.BigEndian.Uint64(bufHeader[0:8]))
-		msgSize := binary.BigEndian.Uint32(bufHeader[8:12])
-
-		// Optimization: if msgOffset > targetOffset, we overshot.
-		// (Assuming sorted)
-		if msgOffset > targetOffset {
-			return nil, fmt.Errorf("offset %d passed (found %d)", targetOffset, msgOffset)
+		if _, err := io.ReadFull(r, header); err != nil {
+			if !found {
+				return nil, 0, fmt.Errorf("offset %d not found in segment: %w", targetOffset, err)
+			}
+			return out, next, nil
 		}
 
-		// Read data to check if it covers the range (handling compressed batches)
-		// We can't skip simply because msgOffset < targetOffset, because the batch might be large.
-		data := make([]byte, msgSize)
-		_, err = io.ReadFull(r, data)
-		if err != nil {
-			return nil, err
+		msgOffset := int64(binary.BigEndian.Uint64(header[0:8]))
+		msgSize := int32(binary.BigEndian.Uint32(header[8:12]))
+		if msgSize < 0 || msgSize > maxWalEntrySize {
+			if !found {
+				return nil, 0, fmt.Errorf("offset %d not found in segment: implausible entry size %d", targetOffset, msgSize)
+			}
+			return out, next, nil
+		}
+		if msgOffset > targetOffset && found {
+			return out, next, nil
 		}
 
-		// Use CountMessageSet to get total record count in this entry (v0/v1/v2/compressed)
-		count := wal.CountMessageSet(data)
+		body := make([]byte, msgSize)
+		if _, err := io.ReadFull(r, body); err != nil {
+			if !found {
+				return nil, 0, fmt.Errorf("offset %d not found in segment: %w", targetOffset, err)
+			}
+			return out, next, nil
+		}
+
+		count := wal.CountMessageSet(body)
 		if count == 0 {
 			count = 1
 		}
 		endOffset := msgOffset + int64(count)
-
-		if targetOffset < endOffset {
-			// Found it (target is within [msgOffset, endOffset))
-
-			// PATCH: Rewrite the offsets in the MessageSet to match the WAL sequence.
-			// We rewrite starting from the WAL's stored msgOffset.
-			pos := 0
-			currentOff := msgOffset
-			for pos <= len(data)-12 {
-				// data[pos : pos+8] is offset
-				size := binary.BigEndian.Uint32(data[pos+8 : pos+12])
-				totalLen := 12 + int(size)
-
-				if pos+totalLen > len(data) {
-					break
-				}
-
-				// Rewrite offset
-				binary.BigEndian.PutUint64(data[pos:pos+8], uint64(currentOff))
-
-				// Handle V2 RecordBatch specifically: baseOffset is at msgStart (pos+12)
-				// Wait, the 12-byte header is ALREADY the baseOffset.
-				// But V2 RecordBatch also has a duplicate baseOffset at pos+12?
-				// Actually, V2 layout: Offset(8), Length(4), PartitionLeaderEpoch(4), Magic(1)...
-				// The Offset(8) is the BaseOffset.
-
-				// However, if we are rewriting, we must also increment currentOff
-				// by the record count of THIS entry.
-				entryData := data[pos : pos+totalLen]
-				// We need to know the count of just THIS entry.
-				// wal.CountMessageSet on entryData should work (since it includes the 12-byte header).
-				entryCount := wal.CountMessageSet(entryData)
-				if entryCount == 0 {
-					entryCount = 1
-				}
-
-				pos += totalLen
-				currentOff += int64(entryCount)
-			}
-
-			return data, err
+		if targetOffset >= endOffset {
+			continue // target lies beyond this entry
 		}
+
+		patched := wal.PatchStoredBlob(body, msgOffset, count)
+		if out == nil {
+			out = make([]byte, 0, len(patched))
+		}
+		if int64(len(out))+int64(len(patched)) > maxBytes && found {
+			return out, next, nil
+		}
+		out = append(out, patched...)
+		next = endOffset
+		found = true
 	}
 }
 
+// maxWalEntrySize bounds a single stored entry, mirroring the WAL's own
+// limit, so a corrupt size field cannot trigger a huge allocation.
+const maxWalEntrySize = 100 * 1024 * 1024
+
+// Close shuts the engine down, making sure nothing is left on local disk.
+//
+// The order matters. Active segments are sealed first, which queues them for
+// upload; the upload workers are then given a bounded window to drain before
+// they are stopped. Exiting any earlier would strand the most recent writes on
+// a local disk that is expected to disappear with the process.
 func (s *StorageEngine) Close() error {
-	close(s.quit)
-	s.wg.Wait()
-	return s.walMgr.Close()
+	s.closeOnce.Do(s.close)
+	return s.closeErr
 }
 
-func (s *StorageEngine) uploaderWorker() {
+func (s *StorageEngine) close() {
+	s.walMgr.SealAll()
+	s.drainUploads(shutdownUploadBudget)
+
+	// Stop renewing the lease, but keep holding it: the final offset flush
+	// and checkpoint below still write durable state, and they must not race
+	// a replacement writer taking the log over half way through.
+	s.lease.close()
+
+	close(s.quit)
+
+	// Let the loops make their final pass. Every object-store call is bounded,
+	// so this cannot hang indefinitely, but the bound is enforced explicitly
+	// as well rather than trusted.
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownFlushBudget):
+		log.Printf("Shutdown: background loops still running after %s; releasing the lease and exiting anyway",
+			shutdownFlushBudget)
+	}
+
+	// Hand the log over only once the last durable write has landed.
+	if s.lease != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownLeaseReleaseBudget)
+		s.lease.release(ctx, s.objStore)
+		cancel()
+	}
+
+	// Anything still parked on object storage is released now rather than
+	// being waited for.
+	s.cancelClosed()
+
+	s.closeErr = s.walMgr.Close()
+}
+
+// shutdownUploadBudget is how long Close waits for the upload queue to empty.
+// It is a ceiling, not a target: a slow object store must not hang shutdown.
+const shutdownUploadBudget = 30 * time.Second
+
+// shutdownFlushBudget bounds the final offset flush and checkpoint.
+const shutdownFlushBudget = 45 * time.Second
+
+// shutdownLeaseReleaseBudget bounds the hand-off of the writer lease.
+const shutdownLeaseReleaseBudget = 10 * time.Second
+
+// drainUploads blocks until every handed-off segment has been stored, or the
+// budget expires.
+func (s *StorageEngine) drainUploads(budget time.Duration) {
+	deadline := time.Now().Add(budget)
+	for {
+		if s.pendingUploads.Load() == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			log.Printf("Shutdown: %d segment(s) still uploading after %s; they remain on local disk and are retried on next start",
+				s.pendingUploads.Load(), budget)
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (s *StorageEngine) uploaderWorker(ctx context.Context) {
 	defer s.wg.Done()
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-s.quit:
 			return
 		case task := <-s.uploadChan:
-			s.handleUpload(task)
+			s.handleUpload(ctx, task)
+			s.pendingUploads.Add(-1)
 		}
 	}
 }
 
-func (s *StorageEngine) handleUpload(task wal.UploadTask) {
+func (s *StorageEngine) handleUpload(ctx context.Context, task wal.UploadTask) {
 	// 1. Check/Set In-Flight
 	if _, loaded := s.inFlightUploads.LoadOrStore(task.Path, struct{}{}); loaded {
 		return // Already being handled
@@ -521,7 +851,7 @@ func (s *StorageEngine) handleUpload(task wal.UploadTask) {
 	if err != nil {
 		log.Printf("Error generating index for %s: %v", task.Path, err)
 	} else if len(indexData) > 0 {
-		if err := s.objStore.Put(context.Background(), indexKey, bytes.NewReader(indexData)); err != nil {
+		if err := s.objPut(ctx, indexKey, bytes.NewReader(indexData)); err != nil {
 			log.Printf("Failed to upload index %s: %v", indexKey, err)
 		}
 	}
@@ -531,9 +861,9 @@ func (s *StorageEngine) handleUpload(task wal.UploadTask) {
 	if err != nil {
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
-	if err := s.objStore.Put(context.Background(), key, f); err != nil {
+	if err := s.objPut(ctx, key, f); err != nil {
 		metrics.UploaderTaskCount.WithLabelValues("error", task.Source).Inc()
 		log.Printf("Failed to upload %s: %v", key, err)
 		return
@@ -718,7 +1048,7 @@ func (s *StorageEngine) flushOffsets() {
 		// k is "groupID/topic/partition"
 		s3Key := fmt.Sprintf("_offsets/%s", k)
 		data := []byte(strconv.FormatInt(offset, 10))
-		if err := s.objStore.Put(ctx, s3Key, bytes.NewReader(data)); err != nil {
+		if err := s.objPut(ctx, s3Key, bytes.NewReader(data)); err != nil {
 			// Leave the entry in the buffer so the next tick retries it.
 			// Dropping it here would silently discard a commit the client
 			// was already told had succeeded.
@@ -747,23 +1077,66 @@ func (s *StorageEngine) checkpointLoop() {
 
 		select {
 		case <-s.quit:
-			s.SaveCheckpoint()
+			if err := s.SaveCheckpointContext(s.closedCtx); err != nil {
+				log.Printf("Shutdown checkpoint: %v", err)
+			}
 			return
 		case <-ticker.C:
-			s.SaveCheckpoint()
+			if err := s.SaveCheckpointContext(s.closedCtx); err != nil {
+				log.Printf("Checkpoint: %v", err)
+			}
 		}
 	}
 }
 
+// SetCoordinator links the group coordinator and replays any group state the
+// checkpoint carried.
+//
+// The durable log position is already restored by NewStorageEngine; this only
+// adds the coordinator, which may not exist yet at engine construction.
 func (s *StorageEngine) SetCoordinator(c *coordinator.Coordinator) {
 	s.coordinator = c
-	// Load Cache from Checkpoint now that coordinator is linked
-	if err := s.LoadCheckpoint(); err != nil {
-		log.Printf("Info: No checkpoint found or failed to load: %v (will rely on WAL)", err)
+	if c == nil || s.metadataCache.Coordinator == nil {
+		return
+	}
+	c.FromState(*s.metadataCache.Coordinator)
+	log.Printf("Restored coordinator state from checkpoint")
+}
+
+// applySeeds hands the recovered log end offsets to the WAL manager so the
+// next write continues the log instead of starting it over.
+func (s *StorageEngine) applySeeds() {
+	seeds := make(map[string]int64)
+	for topic, parts := range s.metadataCache.TopicsSnapshot() {
+		for pid, ps := range parts {
+			if ps.LogEndOffset > 0 {
+				seeds[fmt.Sprintf("%s/%d", topic, pid)] = ps.LogEndOffset
+			}
+		}
+	}
+	s.walMgr.Seed(seeds)
+	if len(seeds) > 0 {
+		log.Printf("Storage: restored log end offsets for %d partition(s) from durable metadata", len(seeds))
 	}
 }
 
 func (s *StorageEngine) SaveCheckpoint() error {
+	return s.SaveCheckpointContext(context.Background())
+}
+
+// SaveCheckpointContext writes the durable checkpoint and manifest under a
+// caller context, so a request-triggered checkpoint is abandoned when the
+// client goes away instead of holding a handler open.
+func (s *StorageEngine) SaveCheckpointContext(ctx context.Context) error {
+	// Refuse to overwrite durable state once another writer has advanced the
+	// log past this agent's epoch. Writing here would replace the new
+	// writer's topic inventory and log end offsets with a stale copy of our
+	// own, which is the corruption the lease exists to prevent.
+	if stored := s.metadataCache.WriterEpoch; stored > s.lease.Epoch() {
+		return fmt.Errorf("refusing to write checkpoint: it was written at epoch %d, this agent holds epoch %d",
+			stored, s.lease.Epoch())
+	}
+
 	if s.coordinator != nil {
 		state := s.coordinator.ToState()
 		s.metadataCache.Coordinator = &state
@@ -775,32 +1148,54 @@ func (s *StorageEngine) SaveCheckpoint() error {
 	s.metadataCache.Committed = cloneCommitted(s.committedByGroup)
 	s.committedMu.Unlock()
 
+	s.metadataCache.WriterEpoch = s.lease.Epoch()
+	s.metadataCache.Writer = s.lease.fencedWriter()
+
 	data, err := s.metadataCache.ToJSON()
 	if err != nil {
 		return err
 	}
 	key := "_meta/checkpoint.json"
 
-	ctx := context.Background()
-	// Use bytes reader
-	r := strings.NewReader(string(data))
-	if err := s.objStore.Put(ctx, key, r); err != nil {
+	if err := s.objPut(ctx, key, bytes.NewReader(data)); err != nil {
 		log.Printf("Failed to save checkpoint: %v", err)
 		return err
 	}
 	log.Printf("Saved metadata checkpoint to %s (%d bytes)", key, len(data))
+
+	// The manifest is the copy that survives a SIGKILL, where the periodic
+	// checkpoint above never got a chance to run.
+	if err := s.SaveManifestContext(ctx); err != nil {
+		log.Printf("Failed to save log position manifest: %v", err)
+		return err
+	}
 	return nil
 }
 
+// LoadCheckpoint re-reads the durable checkpoint. Used by tests and by
+// operators; normal startup restores in NewStorageEngine.
 func (s *StorageEngine) LoadCheckpoint() error {
-	key := "_meta/checkpoint.json"
-	ctx := context.Background()
+	if err := s.loadCheckpointInto(context.Background(), true); err != nil {
+		return err
+	}
+	if err := s.recoverManifest(context.Background()); err != nil {
+		log.Printf("Warning: could not recover log end offsets from object storage: %v", err)
+	}
+	s.applySeeds()
+	return nil
+}
 
-	r, err := s.objStore.Get(ctx, key)
+// loadCheckpointInto reads the checkpoint and merges it into the cache.
+// withRecovery also re-applies the consumer offset map, which only a caller
+// explicitly asking for a reload needs.
+func (s *StorageEngine) loadCheckpointInto(ctx context.Context, withRecovery bool) error {
+	key := "_meta/checkpoint.json"
+
+	r, err := s.objGet(ctx, key)
 	if err != nil {
 		return err
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	data, err := io.ReadAll(r)
 	if err != nil {
@@ -811,9 +1206,23 @@ func (s *StorageEngine) LoadCheckpoint() error {
 		return err
 	}
 
+	// A checkpoint stamped with a higher writer epoch was written by an agent
+	// that held the log after us. Its log end offsets are authoritative and
+	// ours are not, so serving from here would reissue offsets it has already
+	// handed out. The lease cannot catch this on its own: it was released
+	// when the previous agent stopped, and epochs only move forward.
+	if stored := s.metadataCache.WriterEpoch; stored > s.lease.Epoch() {
+		return fmt.Errorf("%w: checkpoint %s was written at epoch %d by %q, this agent holds epoch %d",
+			errSuperseded, key, stored, s.metadataCache.Writer, s.lease.Epoch())
+	}
+
 	if s.coordinator != nil && s.metadataCache.Coordinator != nil {
 		s.coordinator.FromState(*s.metadataCache.Coordinator)
 		log.Printf("Restored coordinator state from checkpoint")
+	}
+
+	if !withRecovery {
+		return nil
 	}
 
 	// Merge any offsets carried in the checkpoint. Rehydration from object
@@ -871,7 +1280,7 @@ const offsetsPrefix = "_offsets/"
 // closed: if the offsets cannot be read, retention does not run at all,
 // because it cannot prove a segment is safe to delete.
 func (s *StorageEngine) rehydrateCommittedOffsets(ctx context.Context) {
-	objects, err := s.objStore.List(ctx, offsetsPrefix)
+	objects, err := s.objList(ctx, offsetsPrefix)
 	if err != nil {
 		log.Printf("Retention: cannot read consumer offsets from %s: %v -- "+
 			"retention is disabled until offsets can be read", offsetsPrefix, err)
@@ -886,13 +1295,13 @@ func (s *StorageEngine) rehydrateCommittedOffsets(ctx context.Context) {
 			continue
 		}
 
-		rc, err := s.objStore.Get(ctx, obj.Key)
+		rc, err := s.objGet(ctx, obj.Key)
 		if err != nil {
 			skipped++
 			continue
 		}
 		raw, readErr := io.ReadAll(rc)
-		rc.Close()
+		_ = rc.Close()
 		if readErr != nil {
 			skipped++
 			continue
@@ -946,12 +1355,12 @@ func (s *StorageEngine) LoadOffset(groupID, topic string, partition int32) (int6
 	key := fmt.Sprintf("_offsets/%s/%s/%d", groupID, topic, partition)
 
 	ctx := context.Background()
-	rc, err := s.objStore.Get(ctx, key)
+	rc, err := s.objGet(ctx, key)
 	if err != nil {
 		// Assume not found if error (simplified)
 		return -1, nil
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	data, err := io.ReadAll(rc)
 	if err != nil {
@@ -967,10 +1376,284 @@ func (s *StorageEngine) LoadOffset(groupID, topic string, partition int32) (int6
 	return offset, nil
 }
 
-func (e *StorageEngine) GetTopicCount() int {
-	return e.metadataCache.GetTopicCount()
+func (s *StorageEngine) GetTopicCount() int {
+	return s.metadataCache.GetTopicCount()
 }
 
-func (e *StorageEngine) GetPartitionCount() int {
-	return e.metadataCache.GetPartitionCount()
+func (s *StorageEngine) GetPartitionCount() int {
+	return s.metadataCache.GetPartitionCount()
+}
+
+// ---------------------------------------------------------------------------
+// Durable log position
+// ---------------------------------------------------------------------------
+
+// manifestKey is where the per-partition log position is written. It exists
+// because the checkpoint is written on a timer and on shutdown: a process
+// killed with SIGKILL leaves neither, and the only remaining record of how far
+// a partition had advanced is the segment inventory in object storage.
+const manifestKey = "_meta/manifest.json"
+
+// manifestEntry is the durable position of one partition.
+type manifestEntry struct {
+	Topic          string             `json:"topic"`
+	Partition      int32              `json:"partition"`
+	LogEndOffset   int64              `json:"log_end_offset"`
+	LogStartOffset int64              `json:"log_start_offset"`
+	Segments       []*SegmentMetadata `json:"segments"`
+}
+
+// manifest is the durable log position document.
+//
+// It used to be a bare array of entries. The writer epoch was added later, so
+// readers accept both shapes: an agent that meets an older manifest must still
+// recover from it rather than deciding the log is unreadable.
+type manifest struct {
+	WriterEpoch int64           `json:"writer_epoch,omitempty"`
+	Writer      string          `json:"writer,omitempty"`
+	Partitions  []manifestEntry `json:"partitions"`
+}
+
+func (s *StorageEngine) SaveManifest() error {
+	return s.SaveManifestContext(context.Background())
+}
+
+// SaveManifestContext is SaveManifest with a caller context.
+func (s *StorageEngine) SaveManifestContext(ctx context.Context) error {
+	snapshot := s.metadataCache.TopicsSnapshot()
+	entries := make([]manifestEntry, 0, len(snapshot))
+	for topic, parts := range snapshot {
+		for pid, ps := range parts {
+			entries = append(entries, manifestEntry{
+				Topic:          topic,
+				Partition:      pid,
+				LogEndOffset:   ps.LogEndOffset,
+				LogStartOffset: ps.LogStartOffset,
+				Segments:       ps.Segments,
+			})
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Topic != entries[j].Topic {
+			return entries[i].Topic < entries[j].Topic
+		}
+		return entries[i].Partition < entries[j].Partition
+	})
+
+	if entries == nil {
+		entries = []manifestEntry{}
+	}
+
+	data, err := json.MarshalIndent(manifest{
+		WriterEpoch: s.lease.Epoch(),
+		Writer:      s.lease.fencedWriter(),
+		Partitions:  entries,
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := s.objPut(ctx, manifestKey, bytes.NewReader(data)); err != nil {
+		return err
+	}
+	return nil
+}
+
+// parseManifest reads both the current object shape and the legacy array.
+func parseManifest(data []byte) (manifest, error) {
+	var m manifest
+	if err := json.Unmarshal(data, &m); err == nil && m.Partitions != nil {
+		return m, nil
+	}
+	var legacy []manifestEntry
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return manifest{}, err
+	}
+	return manifest{Partitions: legacy}, nil
+}
+
+// recoverManifest restores log end offsets from object storage.
+//
+// This is the recovery path that matters for a landing zone: after a crash the
+// local WAL is usually empty (sealed segments were deleted once uploaded), and
+// without this the agent would rewind every partition to offset 0 and start
+// handing out offsets whose data is already stored.
+func (s *StorageEngine) recoverManifest(ctx context.Context) error {
+	restored := 0
+
+	// Preferred source: the manifest written on every roll and checkpoint.
+	rc, err := s.objGet(ctx, manifestKey)
+	if err == nil {
+		data, readErr := io.ReadAll(rc)
+		_ = rc.Close()
+		if readErr != nil {
+			return readErr
+		}
+		parsed, parseErr := parseManifest(data)
+		switch {
+		case parseErr != nil:
+			log.Printf("Manifest at %s is unreadable (%v); falling back to segment inventory", manifestKey, parseErr)
+		case parsed.WriterEpoch > s.lease.Epoch():
+			// Another writer advanced the log while this agent was down or
+			// was fenced out. Recovering its positions and then serving
+			// writes would reissue offsets it already handed out.
+			return fmt.Errorf("%w: manifest at %s was written at epoch %d by %q, this agent holds epoch %d",
+				errSuperseded, manifestKey, parsed.WriterEpoch, parsed.Writer, s.lease.Epoch())
+		default:
+			for _, e := range parsed.Partitions {
+				s.metadataCache.SetPartitionState(e.Topic, e.Partition, e.LogEndOffset, e.LogStartOffset, e.Segments)
+				restored++
+			}
+		}
+	}
+
+	// Fallback: derive the log end offset from the segments themselves, for
+	// any partition the manifest does not cover. This also repairs a manifest
+	// written before a partition's final segments were uploaded.
+	for _, topic := range s.discoverTopics(ctx) {
+		for _, partition := range s.metadataCache.GetPartitions(topic) {
+			if s.metadataCache.LogEndOffset(topic, partition) > 0 && !s.needsObjectRecovery(topic, partition) {
+				continue
+			}
+			segments, err := s.objectSegments(ctx, topic, partition)
+			if err != nil || len(segments) == 0 {
+				continue
+			}
+			leo, start, err := s.endOffsetsFromObject(ctx, topic, partition, segments)
+			if err != nil {
+				log.Printf("Recovery: could not determine end of %s/%d: %v", topic, partition, err)
+				continue
+			}
+			if leo > s.metadataCache.LogEndOffset(topic, partition) {
+				s.metadataCache.SetPartitionState(topic, partition, leo, start, segments)
+				restored++
+			}
+		}
+	}
+
+	if restored > 0 {
+		log.Printf("Storage: recovered log position for %d partition(s) from object storage", restored)
+	}
+	return nil
+}
+
+// needsObjectRecovery reports whether the durable position might lag the
+// segments in object storage. Conservative on purpose: an extra range read is
+// cheap next to handing out a duplicate offset.
+func (s *StorageEngine) needsObjectRecovery(topic string, partition int32) bool {
+	snapshot := s.metadataCache.TopicsSnapshot()
+	parts, ok := snapshot[topic]
+	if !ok {
+		return true
+	}
+	ps, ok := parts[partition]
+	if !ok {
+		return true
+	}
+	// The log end offset must cover the last known segment.
+	for _, seg := range ps.Segments {
+		if seg.EndOffset > ps.LogEndOffset {
+			return true
+		}
+	}
+	return false
+}
+
+// discoverTopics lists the topic prefixes present in object storage. A topic
+// that only exists there, because all of its local segments have been
+// offloaded, is still a topic.
+func (s *StorageEngine) discoverTopics(ctx context.Context) []string {
+	seen := make(map[string]bool)
+	for _, t := range s.metadataCache.GetTopics() {
+		seen[t] = true
+	}
+	// There is no cheap "list all prefixes" call, so walk the partition index
+	// the manifest and checkpoint maintain, and let the fallback pick up
+	// anything else lazily on first access.
+	for _, t := range seen {
+		_ = t
+	}
+	return s.metadataCache.GetTopics()
+}
+
+// objectSegments lists the uploaded segments of a partition, oldest first.
+func (s *StorageEngine) objectSegments(ctx context.Context, topic string, partition int32) ([]*SegmentMetadata, error) {
+	objects, err := s.objList(ctx, partitionPrefix(topic, partition))
+	if err != nil {
+		return nil, err
+	}
+	segs := filterSegments(objects)
+	out := make([]*SegmentMetadata, 0, len(segs))
+	for _, o := range segs {
+		out = append(out, &SegmentMetadata{StartOffset: parseOffsetFromKey(o.Key), S3Key: o.Key, EndOffset: -1})
+	}
+	return out, nil
+}
+
+// endOffsetsFromObject determines where a partition actually ends by reading
+// the last record out of the last uploaded segment.
+//
+// It uses the index sidecar to seek to the final indexed entry, then reads
+// forward. The result is the offset just past the last record, which is what
+// the next append must use.
+func (s *StorageEngine) endOffsetsFromObject(ctx context.Context, topic string, partition int32, segments []*SegmentMetadata) (int64, int64, error) {
+	last := segments[len(segments)-1]
+	baseOffset := last.StartOffset
+	if baseOffset < 0 {
+		baseOffset = 0
+	}
+
+	// Entry length: 8 byte offset + 4 byte size, prefixed by nothing else in
+	// the local file format.
+	const entryHeader = 12
+
+	indexReader, err := s.objGet(ctx, strings.TrimSuffix(last.S3Key, ".log")+".index")
+	if err != nil {
+		return 0, 0, fmt.Errorf("no index for %s: %w", last.S3Key, err)
+	}
+	indexBytes, err := io.ReadAll(indexReader)
+	_ = indexReader.Close()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	pos, err := index.Lookup(indexBytes, int64(^uint64(0)>>1), baseOffset)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Read from the last indexed position to the end of the segment and take
+	// the offset of the final entry plus its record count.
+	rc, err := s.objGetRange(ctx, last.S3Key, pos, 0)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() { _ = rc.Close() }()
+
+	end, start := baseOffset, baseOffset
+	for {
+		hdr := make([]byte, entryHeader)
+		if _, err := io.ReadFull(rc, hdr); err != nil {
+			break // clean end of segment, or a truncated tail
+		}
+		off := int64(binary.BigEndian.Uint64(hdr[0:8]))
+		size := int32(binary.BigEndian.Uint32(hdr[8:12]))
+		if size < 0 || size > 100*1024*1024 {
+			break
+		}
+		body := make([]byte, size)
+		if _, err := io.ReadFull(rc, body); err != nil {
+			break
+		}
+		count := wal.CountMessageSet(body)
+		if count == 0 {
+			count = 1
+		}
+		if off >= start {
+			start = off
+		}
+		end = off + int64(count)
+	}
+
+	last.EndOffset = end
+	return end, start, nil
 }

@@ -4,6 +4,25 @@
 
 This project is a Apache Kafka® - compatible data streaming agent. The goal is to separate compute from storage, allowing for stateless agents that can scale instantly while durable data resides cheaply and safely in object storage.
 
+Each agent owns one log in one bucket and holds a **writer lease** there, so scaling means giving an agent its own bucket rather than pointing several at the same one. See [Single-Writer Fence](#2b-single-writer-fence-writer-lease).
+
+## 🧪 Tests
+
+```bash
+make test        # unit tests
+make race        # unit tests under the race detector
+make cover       # coverage summary and HTML report
+make lint        # golangci-lint
+make ci          # everything CI runs on a pull request
+make e2e         # the Mimir end-to-end test (needs Docker)
+```
+
+The end-to-end test runs a real Grafana Mimir with this agent as its Kafka
+landing zone, pushes remote-write samples through it, reads them back with a
+PromQL query, then restarts the agent with an **empty local WAL** to confirm the
+data survives. It starts its own local S3 shim, so nothing external is required
+beyond Docker.
+
 ## 🚀 Project Goal
 
 The primary objective is to build a "serverless" Kafka-compatible broker that:
@@ -37,7 +56,7 @@ Time and size based retention reclaim sealed segments from Object Storage.
 We implement a subset of the Kafka binary protocol sufficient to support standard producers and consumers.
 
 *   **Producing**: Supports batch production of messages to specific topics and partitions.
-*   **Consuming**: Supports fetching messages with offset management, including **long polling**. When a consumer is caught up and asks for data (`minBytes > 0`), the request parks on an append signal for up to `maxWaitMs` (capped at 1s) instead of returning empty immediately. This stops caught-up consumers from re-polling in a tight loop.
+*   **Consuming**: Supports fetching messages with offset management, including **long polling**, and fills the client's requested byte budget with as many records as fit rather than one per round trip. When a consumer is caught up and asks for data (`minBytes > 0`), the request parks on an append signal for up to `maxWaitMs` (capped at 1s) instead of returning empty immediately. This stops caught-up consumers from re-polling in a tight loop.
 *   **Dynamic Partitions**: Topics and partitions are auto-discovered from the underlying storage layout.
 
 ### 3. Consumer Groups (Lite Coordinator)
@@ -50,16 +69,34 @@ A built-in "Lite" Group Coordinator allows multiple consumers to work together t
 *   **Partition Awareness**: Correctly distributes partitions (e.g., 2 partitions -> 2 consumers) across the group.
 *   **Durable Commits**: `OffsetCommit` is acknowledged immediately and flushed to Object Store on a background loop. Failed flushes are retried rather than dropped, and a bounded retry runs during shutdown, so a transient object-store error cannot silently discard a commit.
 
+### 2b. Single-Writer Fence (Writer Lease)
+Two agents pointed at one bucket do not queue behind each other. They each assign offsets from their own recovered state and write segments to keys derived from those offsets, so they overwrite each other and the failure is **silent data loss** — no error, no crash, just a log that is missing records.
+
+The agent therefore claims the log before it serves anything:
+
+* **Claim**: A lease object (`_meta/lease.json`) inside the same bucket, acquired with a compare-and-swap (`If-None-Match: *` to create, `If-Match: <etag>` to renew). Object storage enforces both preconditions server-side, so two agents racing to start cannot both win.
+* **Epoch**: The lease carries a monotonically increasing epoch, which is also stamped into the checkpoint and the manifest. A restart that finds durable state from a **newer** epoch knows it has been superseded and refuses to start, even though the lease itself was free when it looked.
+* **Renewal**: A background loop renews every `TTL/3`. A renewal that fails is not immediately fatal — object stores have bad minutes — but once failures have aged past the TTL the agent stops writing, because at that point another agent may legitimately have taken the log.
+* **Handover**: A graceful shutdown releases the claim, so a replacement starts immediately instead of waiting out the TTL. A crashed one blocks its replacement for at most the TTL.
+* **Refusal**: Losing the lease turns into refused writes (`ErrLeaseLost`), not into a best-effort write over someone else's log.
+
+Requires conditional-write support (all current S3-compatible stores). `KIMISTORE_REQUIRE_LEASE=false` downgrades a store without it to a loud warning; `KIMISTORE_WRITER_LEASE=false` disables the fence entirely.
+
+### 2c. Bounded Storage Calls
+Every object-store call is bounded by `KIMISTORE_S3_TIMEOUT_MS`, and the request context is threaded from the connection through the protocol handlers into the storage layer. A slow object store therefore produces a failed request the client can retry, instead of a handler goroutine that never returns. That matters more than it sounds: a hung read occupies one of the connection's in-flight slots, and once those fill, the client stops sending heartbeats and commits and the group rebalances around what is really a storage stall.
+
+On shutdown, in-flight calls are cancelled once the final offset flush and checkpoint have landed, so a wedged store cannot hold the process open.
+
 ## 📡 Supported Kafka APIs
 
 The following Kafka API Keys are currently implemented:
 
 | API Name | API Key | Description | Status |
 | :--- | :---: | :--- | :--- |
-| **Produce** | 0 | Send messages to the broker. | ✅ Active (V0-V2) |
-| **Fetch** | 1 | Consume messages from valid offsets. | ✅ Active (V0-V2) |
-| **ListOffsets** | 2 | Get earliest/latest (HighwaterMark) offsets. | ✅ Active |
-| **Metadata** | 3 | Discover brokers, topics, and dynamic partitions. | ✅ Active |
+| **Produce** | 0 | Send messages to the broker. | ✅ Active (V0-V3) |
+| **Fetch** | 1 | Consume messages from valid offsets. | ✅ Active (V0-V5) |
+| **ListOffsets** | 2 | Get earliest/latest offsets. | ✅ Active (V0-V2) |
+| **Metadata** | 3 | Discover brokers, topics, and dynamic partitions. | ✅ Active (V0-V6) |
 | **OffsetCommit** | 8 | Save consumer group offsets to Object Store. | ✅ Active (S3) |
 | **OffsetFetch** | 9 | Retrieve consumer group offsets from Object Store. | ✅ Active (S3) |
 | **FindCoordinator** | 10 | Locate the group coordinator. | ✅ Active |
@@ -69,7 +106,8 @@ The following Kafka API Keys are currently implemented:
 | **SyncGroup** | 14 | Distribute partition assignments. | ✅ Active |
 | **DescribeGroups** | 15 | Get detailed group/member info. | ✅ Active |
 | **ListGroups** | 16 | List active consumer groups. | ✅ Active |
-| **ApiVersions** | 18 | Negotiate protocol support. | ✅ Active |
+| **ApiVersions** | 18 | Negotiate protocol support. | ✅ Active (V0) |
+| *any other key* | — | Answered `UNSUPPORTED_VERSION`, connection preserved | ✅ |
 | **CreateTopics** | 19 | Create new topics. | ✅ Active |
 | **DeleteTopics** | 20 | Delete topics. | ✅ Active |
 
@@ -77,17 +115,54 @@ The following Kafka API Keys are currently implemented:
 
 ### Prerequisites
 *   Go 1.27+
-*   S3-compatible bucket (or local filesystem simulation)
+*   S3-compatible bucket
 *   `kcat` (recommended for testing)
+
+This is the check that matters, because Mimir 3.x uses `twmb/franz-go`, not the
+`segmentio/kafka-go` the rest of the test suite uses. It is how two real
+protocol bugs were found.
+
+### Configuration
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `KIMISTORE_LISTEN_ADDR` | `:19092` | Address the broker socket binds to |
+| `KIMISTORE_ADVERTISED_HOST` | hostname | Address reported in Metadata / FindCoordinator. **Must be reachable by clients** -- this is what they dial. |
+| `KIMISTORE_ADVERTISED_PORT` | port of the listen address | As above |
+| `KIMISTORE_METRICS_ADDR` | `:9091` | Prometheus endpoint |
+| `KIMISTORE_WAL_DIR` | `./data/wal` | Local write-ahead log. Safe to lose: the shutdown path seals and uploads every segment. |
+| `S3_BUCKET` / `AWS_REGION` / `S3_ENDPOINT` | `kimistore` / `us-east-1` / unset | Object store |
+| `SASL_USERNAME` / `SASL_PASSWORD` | unset | When set, SASL/PLAIN is required and advertised |
+| `KIMISTORE_RETENTION_MS` | `0` (disabled) | Max segment age |
+| `KIMISTORE_RETENTION_BYTES` | `-1` (unlimited) | Max bytes per partition |
+| `KIMISTORE_RETENTION_CHECK_MS` | `300000` | Sweep interval |
+| `KIMISTORE_S3_TIMEOUT_MS` | `30000` | Deadline for a single object-store request |
+| `KIMISTORE_WRITER_LEASE` | `true` | Claim the log exclusively before serving |
+| `KIMISTORE_LEASE_KEY` | `_meta/lease.json` | Object the claim lives at |
+| `KIMISTORE_WRITER_ID` | hostname/pid | Identifies this writer in the claim |
+| `KIMISTORE_LEASE_TTL_MS` | `60000` | How long a claim survives without renewal |
+| `KIMISTORE_REQUIRE_LEASE` | `true` | Refuse to start if the store cannot fence writers |
+
+The default configuration needs no flags to work with Grafana Mimir 3.0, and
+every advertised protocol version is implemented exactly as the Kafka message
+schemas declare it. A few API version ceilings are deliberate, and one of them
+(Produce) is load-bearing in a way that is easy to get backwards -- see
+"Version ceilings" in `COMPATIBILITY.md` before raising any of them.
 
 ### Running the Agent
 ```bash
 # Build the agent
-go build -o agent cmd/agent/main.go
+go build -o agent ./cmd/agent
 
-# Run locally (defaults to :19092, using local storage dir)
+# Run locally
 ./agent
 ```
+
+In a container, set `KIMISTORE_ADVERTISED_HOST` to something clients can
+resolve. Leaving it unset makes the agent advertise its own hostname, which is
+usually right in Kubernetes and wrong everywhere else.
+
+**One agent per bucket.** The agent holds a writer lease in object storage and refuses to start when another live agent already holds it. Scale by giving each agent its own bucket, not by pointing several at one.
 
 ### Testing with kcat
 

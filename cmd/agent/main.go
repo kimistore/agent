@@ -20,14 +20,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
+	"strings"
 	"syscall"
-	"time"
 
+	"kimistore/internal/config"
 	"kimistore/internal/metrics"
 	"kimistore/internal/protocol"
 	"kimistore/internal/server"
@@ -43,24 +44,22 @@ func main() {
 	// Setup Storage
 	ctx := context.Background()
 
-	bucket := os.Getenv("S3_BUCKET")
-	if bucket == "" {
-		bucket = "kimistore"
+	cfg := config.FromEnv()
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("Invalid configuration: %v", err)
 	}
-	region := os.Getenv("AWS_REGION")
-	if region == "" {
-		region = "us-east-1"
-	}
-	store, err := s3.NewStore(ctx, bucket, region)
+	cfg.Log()
+
+	store, err := s3.NewStoreWithTimeout(ctx, cfg.S3Bucket, cfg.S3Region, cfg.S3Timeout)
 	if err != nil {
 		log.Fatalf("Failed to init S3: %v", err)
 	}
 
-	walDir := "./data/wal"
+	walDir := cfg.WALDir
 	retentionCfg := storage.RetentionConfig{
-		RetentionBytes: envInt64("KIMISTORE_RETENTION_BYTES", -1),
-		RetentionTime:  time.Duration(envInt64("KIMISTORE_RETENTION_MS", 0)) * time.Millisecond,
-		CheckInterval:  time.Duration(envInt64("KIMISTORE_RETENTION_CHECK_MS", 300_000)) * time.Millisecond,
+		RetentionBytes: cfg.Retention.RetentionBytes,
+		RetentionTime:  cfg.Retention.RetentionTime,
+		CheckInterval:  cfg.Retention.CheckInterval,
 	}
 	if retentionCfg.RetentionTime > 0 || retentionCfg.RetentionBytes > 0 {
 		log.Printf("Retention enabled: time=%s bytes=%d checkEvery=%s",
@@ -69,8 +68,27 @@ func main() {
 		log.Println("Retention disabled (set KIMISTORE_RETENTION_MS and/or KIMISTORE_RETENTION_BYTES to enable)")
 	}
 
-	engine, err := storage.NewStorageEngine(walDir, store, bucket, retentionCfg)
+	engine, err := storage.NewStorageEngine(walDir, store, cfg.S3Bucket, retentionCfg,
+		storage.WithLease(storage.LeaseConfig{
+			Enabled: cfg.Lease.Enabled,
+			Key:     cfg.Lease.Key,
+			Holder:  cfg.Lease.Holder,
+			TTL:     cfg.Lease.TTL,
+			Require: cfg.RequireLease,
+		}),
+		storage.WithOperationTimeout(cfg.S3Timeout),
+	)
 	if err != nil {
+		// A lease refusal and a superseded-writer refusal are both "another
+		// agent owns this log" and both are fatal. Serving anyway would
+		// reissue offsets that are already taken and overwrite the segments
+		// behind them, which is silent data loss rather than a failed start.
+		switch {
+		case errors.Is(err, storage.ErrLeaseHeld):
+			log.Fatalf("Another agent already holds the writer lease for this bucket: %v", err)
+		case strings.Contains(err.Error(), "newer writer"):
+			log.Fatalf("Refusing to start: %v", err)
+		}
 		log.Fatalf("Failed to init storage engine: %v", err)
 	}
 
@@ -86,9 +104,9 @@ func main() {
 	// Start Metrics Server
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.Handler())
-	metricsSrv := &http.Server{Addr: ":9091", Handler: metricsMux}
+	metricsSrv := &http.Server{Addr: cfg.MetricsAddr, Handler: metricsMux}
 	go func() {
-		log.Println("Metrics listening on :9091")
+		log.Printf("Metrics listening on %s", cfg.MetricsAddr)
 		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			// Do not Fatalf here: os.Exit would skip the deferred offset
 			// flush and checkpoint below.
@@ -96,9 +114,24 @@ func main() {
 		}
 	}()
 
-	saslUser := os.Getenv("SASL_USERNAME")
-	saslPassword := os.Getenv("SASL_PASSWORD")
-	srv := server.NewServer(":19092", engine, saslUser, saslPassword)
+	log.Printf("Auto-create topics: %v (partitions per new topic: %d)", cfg.AutoCreateTopics, cfg.AutoCreatePartitions)
+	log.Printf("Protocol versions advertised: %s", protocol.AdvertisedVersions(cfg.SASLUsername != ""))
+	for _, key := range []int16{protocol.ApiKeyProduce, protocol.ApiKeyMetadata, protocol.ApiKeyHeartbeat} {
+		if reason := protocol.VersionCeilingReason(key); reason != "" {
+			log.Printf("  %s ceiling: %s", protocol.ApiName(key), reason)
+		}
+	}
+
+	srv := server.NewServer(cfg.ListenAddr, engine, protocol.ServerConfig{
+		Auth: protocol.AuthConfig{
+			Username: cfg.SASLUsername,
+			Password: cfg.SASLPassword,
+		},
+		AdvertisedHost:       cfg.AdvertisedHost,
+		AdvertisedPort:       cfg.AdvertisedPort,
+		AutoCreateTopics:     cfg.AutoCreateTopics,
+		AutoCreatePartitions: cfg.AutoCreatePartitions,
+	})
 
 	// Post-init metrics wiring if needed (e.g. if engine is tailored)
 	// For now we'll do a simple lazy approach or just pass a closure if engine supports it.
@@ -117,7 +150,7 @@ func main() {
 		}
 	}()
 
-	log.Println("Listening on :19092")
+	log.Printf("Listening on %s", cfg.ListenAddr)
 
 	// Wait for interrupt signal to gracefully shutdown the server
 	quit := make(chan os.Signal, 1)
@@ -144,18 +177,4 @@ func main() {
 	}
 	protocol.GlobalCoordinator.Close()
 	log.Println("Shutdown complete.")
-}
-
-// envInt64 reads an integer environment variable, falling back to def.
-func envInt64(name string, def int64) int64 {
-	raw := os.Getenv(name)
-	if raw == "" {
-		return def
-	}
-	v, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		log.Printf("Invalid %s=%q, using default %d", name, raw, def)
-		return def
-	}
-	return v
 }

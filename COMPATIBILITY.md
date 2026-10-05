@@ -3,10 +3,36 @@
 This server implements a subset of the Kafka Protocol (primarily V0-V2). It is designed to be compatible with standard Kafka clients and supports both **Simple Consumer** and **Consumer Group** workflows.
 
 ### Supported Features
-*   **Protocol Versions**: Kafka 0.10.x era (ApiVersions V0, Produce V2, Fetch V2, Metadata V2, JoinGroup V1).
-*   **Message Format**: 
-    *   MessageSet V0/V1 (Legacy).
-    *   RecordBatch V2 (Kafka 0.11+). Record counts are correctly parsed from RecordBatch headers to ensure accurate offset tracking (one per record, rather than one per batch).
+*   **Protocol Versions**: Kafka 0.10.x-era APIs. `ApiVersions` advertises
+    exactly what is implemented, and any other version of a known API, or an
+    unknown API, is answered `UNSUPPORTED_VERSION` rather than dropped.
+
+    | API | Versions |
+    | :--- | :--- |
+    | Produce | 0-3 |
+    | Fetch | 0-5 |
+    | ListOffsets | 0-2 |
+    | Metadata | 0-6 |
+    | OffsetCommit | 0 |
+    | OffsetFetch | 0-1 |
+    | FindCoordinator | 0 |
+    | JoinGroup | 0-1 |
+    | SyncGroup / Heartbeat / LeaveGroup | 0 |
+    | CreateTopics / DeleteTopics | 0 |
+    | ListGroups / DescribeGroups | 0 |
+    | SaslHandshake / SaslAuthenticate | 0-1 / 0 |
+*   **Message Format**:
+    *   MessageSet V0/V1 (legacy), including GZIP, Snappy (with Kafka's length
+        prefix) and LZ4 compression.
+    *   RecordBatch V2 (Kafka 0.11+), in **both** encodings: bare, as
+        `segmentio/kafka-go` sends it, and wrapped in an outer message set
+        entry, as the Java client, librdkafka and sarama send it. The record
+        count is read from the batch header, so the log end offset advances by
+        one per record rather than one per batch.
+*   **Fetched batches are always re-framed bare.** `segmentio/kafka-go`
+    assumes the bare form in *both* of its decoders, so data written by a Java
+    or librdkafka producer would otherwise be unreadable to a client built on
+    it. Both framings are valid Kafka. See `wal.UnwrapBatches`.
 *   **Decompression**: Automatic decompression of GZIP, Snappy, and LZ4 compressed message batches for accurate offset tracking.
 *   **Durability**: Acknowledged writes are fsynced before the producer is
     given its offset. This follows Kafka's `acks` semantics:
@@ -28,9 +54,68 @@ This server implements a subset of the Kafka Protocol (primarily V0-V2). It is d
 *   **Discovery**: `Metadata` and `FindCoordinator` requests allow clients to auto-discover brokers, topics, partitions, and group coordinators.
 *   **Data Persistence**: Low-latency local Write-Ahead Log (WAL) with transparent asynchronous segment offloading to AWS S3 or compatible object stores.
 
+### Version ceilings
+
+Every advertised version is implemented exactly as the schema declares it.
+Kafka serialises message fields in declaration order, so the layouts below were
+taken from Apache Kafka's own `*.json` message definitions rather than from
+any client's decoder.
+
+**Produce stops at v3.** v3 is where magic 2 became legal, and magic 2 is the
+record batch format. Capping Produce lower looks attractive: a v0 response
+has no `ThrottleTimeMs` field, so it cannot be misordered. It is a trap.
+Offer a client only Produce v0-v2 and it falls back to magic 1, which has no
+header field, so every Kafka record header the producer set is silently
+discarded. Grafana Mimir keeps the wire format of each write in a record
+header; measured against a real Mimir 3.2.1, a Produce v0 ceiling makes its
+ingester fail to parse every record it consumes
+(`Remote Write 2.0 field Symbols in non-Remote Write 2.0 message`) because it
+sees version 0 for everything. v3 is also the newest Produce version before the
+flexible (tagged-field) encoding, which is not implemented here.
+
+**Heartbeat and LeaveGroup stop at v0.** The target client decodes those two
+with `ErrorCode` before `ThrottleTimeMs`, the reverse of the schema, so
+offering v1+ would hand it a misaligned response. v0 has no throttle field, so
+the two readings coincide.
+
+**Metadata goes to v6**, the newest non-flexible version. Note that
+`cluster_id` is a **v2** field, not v1: a v1 client reads whatever sits where
+the controller id belongs, so emitting it early desynchronises every field
+after it.
+
+**Fetch goes to v5**, which adds `log_start_offset` so a client can find the
+log start without a separate ListOffsets round trip.
+
+**Fetched RecordBatches are always re-framed bare.** Both Go Kafka clients
+assume the bare form in *both* of their decoders, so data written by a Java or
+librdkafka producer would otherwise be unreadable to the client this agent
+exists to serve. Both framings are valid Kafka: a RecordBatch is
+self-describing either way.
+
+### When a client does not negotiate
+
+A request above an advertised ceiling is answered `UNSUPPORTED_VERSION` in a
+response shaped like a real response of that version, so a well-behaved client
+downgrades and retries instead of dropping the connection. Every such refusal
+increments `kimistore_unsupported_api_versions_total{api, version}`, and the
+startup log prints the advertised version table with the reason for each
+ceiling. A client that reads ApiVersions and adapts should never generate that
+counter; if yours does, the label names the API and version it is insisting
+on.
+
 ### Limitations (What WON'T work)
-1.  **Transactions/Idempotency**: Transactional producing (`InitProducerId`, transaction markers) is not supported.
-2.  **Replication**: Multi-broker data replication (partition leaders and ISRs) is not implemented. The agent operates as a single-node stateless caching proxy/broker.
+1.  **Transactions/Idempotency**: Transactional producing (`InitProducerId`,
+    transaction markers) is not implemented. A client that enables
+    idempotence gets `UNSUPPORTED_VERSION` rather than a dropped connection.
+2.  **Replication**: Multi-broker data replication (partition leaders and ISRs)
+    is not implemented. The agent operates as a single-node broker.
+3.  **Flexible (tagged-field) message versions**: Metadata v9+, Fetch v12+ and
+    every other flexible version are not decodable here, so they are not
+    advertised and are refused on arrival.
+4.  **Offset commits are acknowledged before they are persisted.** A commit is
+    flushed to object storage on a background loop. A crash in between loses
+    the commit and the group replays from its previous position, which is safe
+    but not exactly-once.
 
 ### Client Configuration Examples
 
@@ -71,20 +156,46 @@ kcat -b localhost:19092 -G my-group my-topic
 
 | Feature Category | Feature | Status | Notes |
 | :--- | :--- | :--- | :--- |
-| **Core Protocol** | Produce API (V2) | ✅ Supported | Batch duration/parsing pending |
+| **Core Protocol** | Produce API (V0-V3) | ✅ Supported | See the throttle note above |
 | | Fetch API (V2) | ✅ Supported | |
-| | ListOffsets (V1) | ✅ Supported | |
+| | ListOffsets (V1) | ✅ Supported | earliest offset reflects retention, not a hardcoded 0 |
 | | Metadata (V2) | ✅ Supported | |
-| | ApiVersions (V0) | ✅ Supported | Higher versions return Error |
+| | ApiVersions (V0) | ✅ Supported | Higher versions are refused so the client retries at v0 |
 | **Messaging** | MessageSets (V0, V1) | ✅ Supported | Legacy format |
-| | RecordBatch (V2) | ✅ Supported | record count parsed correctly; offset tracking is accurate |
+| | RecordBatch (V2) | ✅ Supported | bare and message-set-wrapped encodings; record count read from the batch header |
 | | Compression | ✅ Supported | GZIP, Snappy, and LZ4 decompressed for counting |
 | **Consumption** | Simple Consumer | ✅ Supported | `assign()` partitions manually |
+| | Multi-record fetch | ✅ Supported | fills the client's byte budget |
 | | Consumer Groups | ✅ Supported | `subscribe()` is fully operational via Lite Coordinator |
 | | Offset Commit | ✅ Supported | Group progress committed/loaded from S3 |
 | **Durability** | Local Persistence | ✅ Supported | Synchronous WAL |
 | | Acked-write fsync | ✅ Supported | Group-committed; honours `acks` |
 | | S3 Offload | ✅ Supported | Asynchronous upload |
 | | S3 Recovery | ✅ Supported | Transparent fallback to S3 |
+| **Durability** | Log position across restart | ✅ Supported | checkpoint + manifest + segment-tail recovery |
+| | Active segment on shutdown | ✅ Supported | sealed and uploaded before exit |
 | **Reliability** | Replication | ❌ No | Single node only |
 | | ISR/HW | ❌ No | Always ISR=1, HW=Max |
+
+### Operational guarantees that affect the protocol
+
+* **One writer per log.** The agent claims its log in object storage with a
+  compare-and-swap lease before it serves anything, and refuses to start when
+  another live agent holds it. Two agents on one bucket do not interleave: they
+  assign the same offsets and overwrite each other's segments, so the second one
+  must not run rather than run "a bit behind". If the store cannot enforce
+  conditional writes, `KIMISTORE_REQUIRE_LEASE=false` downgrades the fence to a
+  startup warning.
+* **Durable state carries a writer epoch.** The checkpoint and the manifest
+  record the epoch that wrote them. An agent whose epoch is behind the one it
+  finds on startup refuses to serve that log, which closes the window between
+  one agent stopping and its replacement starting.
+* **Every storage call is bounded.** Object-store operations are limited by
+  `KIMISTORE_S3_TIMEOUT_MS`, and a client that disconnects cancels the read it
+  started. A client therefore sees a retriable error rather than a stalled
+  connection, which matters because a stalled connection stops heartbeats and
+  commits and shows up as a rebalance storm.
+
+New metrics for these: `kimistore_lease_owned`, `kimistore_lease_epoch`,
+`kimistore_lease_renewal_failures_total`, `kimistore_lease_refused_writes_total`,
+`kimistore_object_store_timeouts_total`.

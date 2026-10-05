@@ -19,12 +19,13 @@
 package protocol
 
 import (
+	"context"
 	"log"
 
 	"kimistore/internal/storage"
 )
 
-func handleCreateTopics(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
+func handleCreateTopics(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
 	// Request V0
 	// Array of CreateTopicRequests
 
@@ -40,25 +41,51 @@ func handleCreateTopics(dec *Decoder, enc *Encoder, store *storage.StorageEngine
 	results := make([]TopicResult, 0, count)
 
 	for i := int32(0); i < count; i++ {
-		topic, _ := dec.String()
-		numPartitions, _ := dec.Int32()
-		replicationFactor, _ := dec.Int16()
+		topic, err := dec.String()
+		if err != nil {
+			return nil, err
+		}
+		numPartitions, err := dec.Int32()
+		if err != nil {
+			return nil, err
+		}
+		replicationFactor, err := dec.Int16()
+		if err != nil {
+			return nil, err
+		}
 
-		// Replica Assignemnt
-		assignCount, _ := dec.Int32()
+		// Replica Assignment
+		assignCount, err := dec.Int32()
+		if err != nil {
+			return nil, err
+		}
 		for j := int32(0); j < assignCount; j++ {
-			dec.Int32() // PartitionID
-			repCount, _ := dec.Int32()
+			if _, err := dec.Int32(); err != nil { // PartitionID
+				return nil, err
+			}
+			repCount, err := dec.Int32()
+			if err != nil {
+				return nil, err
+			}
 			for k := int32(0); k < repCount; k++ {
-				dec.Int32() // Replica
+				if _, err := dec.Int32(); err != nil { // Replica
+					return nil, err
+				}
 			}
 		}
 
 		// Configs
-		configCount, _ := dec.Int32()
+		configCount, err := dec.Int32()
+		if err != nil {
+			return nil, err
+		}
 		for j := int32(0); j < configCount; j++ {
-			dec.String() // Key
-			dec.String() // Value (nullable)
+			if _, err := dec.String(); err != nil { // Key
+				return nil, err
+			}
+			if _, err := dec.String(); err != nil { // Value (nullable)
+				return nil, err
+			}
 		}
 
 		log.Printf("CreateTopic: Name=%s Partitions=%d RepFactor=%d", topic, numPartitions, replicationFactor)
@@ -66,17 +93,19 @@ func handleCreateTopics(dec *Decoder, enc *Encoder, store *storage.StorageEngine
 		// Impl
 		errCode := int16(ErrNone)
 
-		// Check exists?
-		existingParts, _ := store.GetPartitions(topic)
-		if len(existingParts) > 0 {
-			// Already exists
+		// Existence is decided by the durable topic registry, not by whether
+		// a local directory happens to exist. A topic whose segments have all
+		// been offloaded has no local directory, so a directory-based check
+		// would re-create it and report success on a topic that already
+		// holds data.
+		if store.TopicExists(topic) {
 			errCode = ErrTopicAlreadyExists
 		} else {
 			// Default partitions if -1? Kafka usually requires > 0
 			if numPartitions < 1 {
 				numPartitions = 1
 			}
-			if err := store.CreateTopic(topic, numPartitions); err != nil {
+			if err := store.CreateTopicContext(ctx, topic, numPartitions); err != nil {
 				log.Printf("Failed to create topic %s: %v", topic, err)
 				errCode = ErrUnknown
 			}
@@ -98,7 +127,7 @@ func handleCreateTopics(dec *Decoder, enc *Encoder, store *storage.StorageEngine
 	return enc.Bytes(), nil
 }
 
-func handleDeleteTopics(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
+func handleDeleteTopics(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
 	// Request V0
 	// Array of Topics (String)
 	count, err := dec.Int32()
@@ -131,7 +160,7 @@ func handleDeleteTopics(dec *Decoder, enc *Encoder, store *storage.StorageEngine
 		if len(parts) == 0 {
 			errCode = ErrUnknownTopicOrPartition
 		} else {
-			if err := store.DeleteTopic(topic); err != nil {
+			if err := store.DeleteTopicContext(ctx, topic); err != nil {
 				log.Printf("Failed to delete topic %s: %v", topic, err)
 				errCode = ErrUnknown
 			}

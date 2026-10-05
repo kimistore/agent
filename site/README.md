@@ -7,10 +7,11 @@ Static, dependency-free marketing site. No build step, no bundler, no framework.
 | File | Purpose |
 | :--- | :--- |
 | `index.html` | Single-page site |
+| `logo.svg` | Canonical brand mark (gradient tile, `KS` monogram) |
 | `styles.css` | All styling (design tokens as CSS custom properties at the top) |
 | `script.js` | Progressive enhancement: sticky nav, mobile menu, scroll reveal, code tabs |
-| `favicon.svg` | Browser icon |
-| `og.svg` | Social preview card — **convert to PNG/JPG before publishing**, most platforms won't render SVG |
+| `favicon.svg` | Browser icon, same geometry as `logo.svg` |
+| `og.svg` | Social preview card, embeds the same mark — **convert to PNG/JPG before publishing**, most platforms won't render SVG |
 | `robots.txt` | Crawler policy |
 | `sitemap.xml` | Single-URL sitemap |
 

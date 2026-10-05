@@ -30,6 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"kimistore/internal/protocol"
 	"kimistore/internal/server"
 	"kimistore/internal/storage"
 
@@ -68,30 +69,34 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	mockS3 := &MockObjectStore{}
 	engine, err := storage.NewStorageEngine(tmpDir, mockS3, "bench-bucket", storage.RetentionConfig{})
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer engine.Close()
+	defer func() { _ = engine.Close() }()
 
 	// 3. Setup Server
 	port := "19092"
-	srv := server.NewServer(":"+port, engine, "", "")
+	srv := server.NewServer(":"+port, engine, protocol.ServerConfig{
+		AdvertisedHost: "localhost",
+		AdvertisedPort: 19092,
+	})
 	go func() {
 		if err := srv.Start(); err != nil {
 			log.Printf("Server stopped: %v", err)
 		}
 	}()
-	defer srv.Stop()
+	defer func() { _ = srv.Stop() }()
 
 	// Wait for server to start
 	for i := 0; i < 100; i++ {
-		conn, err := net.Dial("tcp", "localhost:"+port)
+		dialer := net.Dialer{Timeout: 5 * time.Second}
+		conn, err := dialer.DialContext(context.Background(), "tcp", "localhost:"+port)
 		if err == nil {
-			conn.Close()
+			_ = conn.Close()
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -122,7 +127,7 @@ func main() {
 		RequiredAcks: kafka.RequireAll,
 		Compression:  kafka.Gzip,
 	}
-	defer writer.Close()
+	defer func() { _ = writer.Close() }()
 
 	msgs := make([]kafka.Message, batchSize)
 	for i := 0; i < batchSize; i++ {
@@ -167,7 +172,7 @@ func main() {
 				log.Printf("Consumer %d dial failed: %v", partitionID, err)
 				return
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			if _, err := conn.Seek(0, kafka.SeekStart); err != nil {
 				log.Printf("Consumer %d seek failed: %v", partitionID, err)
@@ -176,12 +181,9 @@ func main() {
 
 			// 10s timeout per batch loop? No, refreshing deadline
 
-			for {
-				if atomic.LoadInt64(&totalConsumed) >= int64(totalMsgs) {
-					break
-				}
+			for atomic.LoadInt64(&totalConsumed) < int64(totalMsgs) {
 
-				conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+				_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 				batchReader := conn.ReadBatch(1, 10*1024*1024)
 
 				for {
@@ -196,7 +198,7 @@ func main() {
 						break
 					}
 				}
-				batchReader.Close()
+				_ = batchReader.Close()
 			}
 		}(pID)
 	}

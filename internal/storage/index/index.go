@@ -42,7 +42,7 @@ func GenerateIndex(logPath string, baseOffset int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var buf bytes.Buffer
 	var position int64 = 0
@@ -83,9 +83,10 @@ func GenerateIndex(logPath string, baseOffset int64) ([]byte, error) {
 			relOffset := int32(offset - baseOffset)
 			pos := int32(msgStartPos)
 
-			// Write Index Entry
-			binary.Write(&buf, binary.BigEndian, relOffset)
-			binary.Write(&buf, binary.BigEndian, pos)
+			// Write Index Entry. Both writes are into a bytes.Buffer with a
+			// fixed-width integer, so neither can fail.
+			_ = binary.Write(&buf, binary.BigEndian, relOffset)
+			_ = binary.Write(&buf, binary.BigEndian, pos)
 
 			lastIndexedPos = position
 		}

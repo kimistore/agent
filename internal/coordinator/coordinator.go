@@ -251,6 +251,16 @@ func (c *Coordinator) Close() {
 	c.wg.Wait()
 }
 
+// SelectedProtocol reports the protocol name the group has settled on, so the
+// protocol layer can return the same name, and the matching member metadata,
+// to every participant.
+func (c *Coordinator) SelectedProtocol(groupID string) string {
+	g := c.GetGroup(groupID)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.Protocol
+}
+
 func (c *Coordinator) GetGroup(groupID string) *Group {
 	c.mu.Lock()
 	defer c.mu.Unlock()

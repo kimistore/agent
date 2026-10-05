@@ -98,7 +98,7 @@ func firstEntryPayload(t *testing.T, body []byte) string {
 // wrong record.
 func TestAppend_PositionIndexSurvivesInterleavedRead(t *testing.T) {
 	dir := t.TempDir()
-	pw, err := NewPartitionWAL(dir, "orders", 0, nil)
+	pw, err := NewPartitionWAL(dir, "orders", 0, 0, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestAppend_PositionIndexSurvivesInterleavedRead(t *testing.T) {
 // mixed traffic rather than a single read, which is what a real broker sees.
 func TestAppend_RepeatedInterleavedReadWrite(t *testing.T) {
 	dir := t.TempDir()
-	pw, err := NewPartitionWAL(dir, "mixed", 0, nil)
+	pw, err := NewPartitionWAL(dir, "mixed", 0, 0, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestAppend_RepeatedInterleavedReadWrite(t *testing.T) {
 func TestRecover_TornTailBodyIsTruncated(t *testing.T) {
 	dir := t.TempDir()
 
-	pw, err := NewPartitionWAL(dir, "torn", 0, nil)
+	pw, err := NewPartitionWAL(dir, "torn", 0, 0, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestRecover_TornTailBodyIsTruncated(t *testing.T) {
 	f.Close()
 
 	// Restart: recovery must succeed and keep the valid prefix.
-	pw2, err := NewPartitionWAL(dir, "torn", 0, nil)
+	pw2, err := NewPartitionWAL(dir, "torn", 0, 0, nil)
 	if err != nil {
 		t.Fatalf("RECOVERY FAILED on torn tail (partition is now bricked): %v", err)
 	}
@@ -248,7 +248,7 @@ func TestRecover_TornTailBodyIsTruncated(t *testing.T) {
 func TestRecover_TornTailHeaderIsTruncated(t *testing.T) {
 	dir := t.TempDir()
 
-	pw, err := NewPartitionWAL(dir, "tornhdr", 0, nil)
+	pw, err := NewPartitionWAL(dir, "tornhdr", 0, 0, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -261,7 +261,7 @@ func TestRecover_TornTailHeaderIsTruncated(t *testing.T) {
 	f.Write([]byte{0, 0, 0, 0, 0, 1, 0, 0}) // 8 of 12 header bytes
 	f.Close()
 
-	pw2, err := NewPartitionWAL(dir, "tornhdr", 0, nil)
+	pw2, err := NewPartitionWAL(dir, "tornhdr", 0, 0, nil)
 	if err != nil {
 		t.Fatalf("RECOVERY FAILED on partial header: %v", err)
 	}
@@ -280,7 +280,7 @@ func TestRecover_TornTailHeaderIsTruncated(t *testing.T) {
 func TestRecover_ImplausibleSizeIsTruncated(t *testing.T) {
 	dir := t.TempDir()
 
-	pw, err := NewPartitionWAL(dir, "badsize", 0, nil)
+	pw, err := NewPartitionWAL(dir, "badsize", 0, 0, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestRecover_ImplausibleSizeIsTruncated(t *testing.T) {
 	f.Write(hdr)
 	f.Close()
 
-	pw2, err := NewPartitionWAL(dir, "badsize", 0, nil)
+	pw2, err := NewPartitionWAL(dir, "badsize", 0, 0, nil)
 	if err != nil {
 		t.Fatalf("RECOVERY FAILED on implausible size: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestRoll_SealedSegmentIsFlushedBeforeSeal(t *testing.T) {
 	dir := t.TempDir()
 
 	sealed := make(chan UploadTask, 4)
-	pw, err := NewPartitionWAL(dir, "roll", 0, func(tk UploadTask) { sealed <- tk })
+	pw, err := NewPartitionWAL(dir, "roll", 0, 0, func(tk UploadTask) { sealed <- tk })
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestRoll_SealedSegmentIsFlushedBeforeSeal(t *testing.T) {
 func TestRoll_RemainsWritableAfterRenameFailure(t *testing.T) {
 	dir := t.TempDir()
 
-	pw, err := NewPartitionWAL(dir, "rollfail", 0, nil)
+	pw, err := NewPartitionWAL(dir, "rollfail", 0, 0, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -401,7 +401,7 @@ func TestRoll_RemainsWritableAfterRenameFailure(t *testing.T) {
 func TestReadFromSealed_ServesOffsetInsideBatch(t *testing.T) {
 	dir := t.TempDir()
 
-	pw, err := NewPartitionWAL(dir, "sealed", 0, nil)
+	pw, err := NewPartitionWAL(dir, "sealed", 0, 0, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -417,7 +417,7 @@ func TestReadFromSealed_ServesOffsetInsideBatch(t *testing.T) {
 	}
 	pw.Close()
 
-	pw2, err := NewPartitionWAL(dir, "sealed", 0, nil)
+	pw2, err := NewPartitionWAL(dir, "sealed", 0, 0, nil)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

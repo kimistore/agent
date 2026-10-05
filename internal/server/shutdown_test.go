@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"kimistore/internal/protocol"
 	"kimistore/internal/storage"
 )
 
@@ -61,7 +62,7 @@ func startTestServer(t *testing.T) (*Server, string) {
 	addr := ln.Addr().String()
 	ln.Close()
 
-	srv := NewServer(addr, engine, "", "")
+	srv := NewServer(addr, engine, protocol.DefaultServerConfig())
 	go srv.Start()
 
 	// Wait for the listener to come up.

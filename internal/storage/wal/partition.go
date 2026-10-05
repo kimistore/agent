@@ -87,9 +87,22 @@ type PartitionWAL struct {
 	// known to be on stable storage. Both guarded by mu.
 	writeSeq  uint64
 	syncedSeq uint64
+
+	// seed is the log end offset supplied at construction from durable
+	// metadata. loadState prefers it over anything it can infer from local
+	// files, because local files understate the log once segments have been
+	// offloaded.
+	seed int64
 }
 
-func NewPartitionWAL(dir string, topic string, partition int32, onRoll func(UploadTask)) (*PartitionWAL, error) {
+// NewPartitionWAL opens (or creates) the WAL for a partition.
+//
+// seed is the log end offset recovered from durable metadata: the checkpoint,
+// or the segment inventory in object storage. It is the authority for where
+// the log stands, because the local directory cannot answer that question
+// once sealed segments have been offloaded and deleted. Pass 0 when there is
+// nothing durable to restore, in which case the local files are used.
+func NewPartitionWAL(dir string, topic string, partition int32, seed int64, onRoll func(UploadTask)) (*PartitionWAL, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
@@ -100,6 +113,7 @@ func NewPartitionWAL(dir string, topic string, partition int32, onRoll func(Uplo
 		partition: partition,
 		index:     make(map[int64]int64),
 		onRoll:    onRoll,
+		seed:      seed,
 	}
 
 	if err := pw.loadState(); err != nil {
@@ -107,6 +121,25 @@ func NewPartitionWAL(dir string, topic string, partition int32, onRoll func(Uplo
 	}
 
 	return pw, nil
+}
+
+// SeedPartition tells an already-open partition where the log actually ends.
+// It is applied on startup, after the durable offset is known, and only ever
+// moves the partition forward: rewinding here would let new writes collide
+// with records already in object storage.
+func (p *PartitionWAL) SeedPartition(logEndOffset int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if logEndOffset > p.nextOffset {
+		p.nextOffset = logEndOffset
+	}
+	if p.currentSize == 0 {
+		p.activeBaseOffset = logEndOffset
+	} else if p.activeBaseOffset < logEndOffset {
+		// The active file was written before the restore point; keep it
+		// addressable but do not let the base offset run ahead of the data.
+		p.activeBaseOffset = logEndOffset
+	}
 }
 
 func (p *PartitionWAL) loadState() error {
@@ -130,12 +163,33 @@ func (p *PartitionWAL) loadState() error {
 		return err
 	}
 
-	// 3. Determine activeBaseOffset
-	// If active file was empty, we need to infer next offset from sealed files.
-	// However, if we preserve activeBaseOffset in a metadata file it would be safer.
-	// For now, let's scan sealed files to find the max offset if active is empty.
-	if p.nextOffset == 0 {
-		// Find max encoded offset in dir
+	// 3. Determine activeBaseOffset.
+	//
+	// Durable metadata wins. Falling back to local files alone is what used
+	// to make a restart rewind the log to zero: sealed segments are deleted
+	// after they are uploaded, so after a restart the directory is empty and
+	// the recovered nextOffset is 0, which is then handed to the next
+	// producer as if it were free.
+	if p.seed > p.nextOffset {
+		p.nextOffset = p.seed
+	}
+
+	if p.seed > 0 {
+		// The log position is known durably. Sealed segments on local disk
+		// are a subset of it, so there is nothing left to infer -- and
+		// inferring from an empty directory would undo the restore.
+		if p.currentSize > 0 {
+			if min, ok := minOffset(p.index); ok && min < p.nextOffset {
+				p.activeBaseOffset = min
+			} else {
+				p.activeBaseOffset = p.nextOffset
+			}
+		} else {
+			p.activeBaseOffset = p.nextOffset
+		}
+	} else if p.nextOffset == 0 {
+		// Nothing durable and nothing in the active file: infer from sealed
+		// local segments, if any survived.
 		maxEndOffset, err := p.findMaxSealedOffset()
 		if err != nil {
 			return err
@@ -153,20 +207,28 @@ func (p *PartitionWAL) loadState() error {
 		}
 		if minOff != -1 {
 			p.activeBaseOffset = minOff
-		} else {
-			// Should happen only if file has data but recover failed?
-			// Or maybe we treat empty active file as extension of last sealed.
-			// Assume initialized.
 		}
+		// Otherwise the active file contributed nothing readable and its base
+		// offset stays where it was: the segment continues the log rather than
+		// rewinding it, which is the only safe answer.
 	} else {
-		// Active file empty, but p.nextOffset might be 0.
-		// Need to check sealed files again
-		maxEnd, _ := p.findMaxSealedOffset()
-		p.nextOffset = maxEnd
-		p.activeBaseOffset = maxEnd
+		// Active file is empty but it holds records' offsets, so the base
+		// offset is simply where the next write will land.
+		p.activeBaseOffset = p.nextOffset
 	}
 
 	return nil
+}
+
+// minOffset returns the lowest offset present in an index.
+func minOffset(idx map[int64]int64) (int64, bool) {
+	best := int64(-1)
+	for off := range idx {
+		if best == -1 || off < best {
+			best = off
+		}
+	}
+	return best, best >= 0
 }
 
 func (p *PartitionWAL) findMaxSealedOffset() (int64, error) {
@@ -207,7 +269,7 @@ func (p *PartitionWAL) findMaxSealedOffset() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Scan to end
 	// Use a lighter scanner if possible, or just reuse recovering logic?
@@ -220,7 +282,9 @@ func (p *PartitionWAL) findMaxSealedOffset() (int64, error) {
 	// ... Scanning implementation ...
 	// For MVP, if we restart, scanning all might be slow but safe.
 
-	f.Seek(0, 0)
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
 	for {
 		header := make([]byte, 12)
 		if _, err := io.ReadFull(f, header); err != nil {
@@ -261,7 +325,9 @@ func (p *PartitionWAL) findMaxSealedOffset() (int64, error) {
 // rather than fatal. The damage is confined to the tail, so we truncate back
 // to the last known-good record boundary and carry on serving the rest.
 func (p *PartitionWAL) recoverActive() error {
-	p.activeFile.Seek(0, 0)
+	if _, err := p.activeFile.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 	pos := int64(0)
 	p.offsets = nil
 
@@ -350,7 +416,7 @@ func syncDir(dir string) {
 		log.Printf("WAL: cannot open dir %s for sync: %v", dir, err)
 		return
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 	if err := d.Sync(); err != nil {
 		// Not fatal on platforms that do not support directory fsync.
 		log.Printf("WAL: dir sync failed for %s: %v", dir, err)
@@ -367,7 +433,7 @@ func (p *PartitionWAL) openActive() error {
 	}
 	info, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	p.activeFile = f
@@ -495,10 +561,9 @@ func (p *PartitionWAL) commit(seq uint64) error {
 	p.mu.Unlock()
 
 	var err error
-	switch {
-	case f == nil:
+	if f == nil {
 		err = fmt.Errorf("no active log open")
-	default:
+	} else {
 		err = f.Sync()
 	}
 	p.fileMu.RUnlock()
@@ -585,145 +650,237 @@ func (p *PartitionWAL) roll() error {
 	p.index = make(map[int64]int64)
 	p.offsets = nil
 
-	// Trigger async upload
+	// Hand the sealed segment to the uploader. The callback only enqueues, so
+	// calling it inline keeps the handoff synchronous: a caller that seals on
+	// shutdown must be able to wait for the queue afterwards and be sure the
+	// task is already in it.
 	if p.onRoll != nil {
-		task := UploadTask{
+		p.onRoll(UploadTask{
 			Topic:      p.topic,
 			Partition:  p.partition,
 			Path:       newPath,
 			BaseOffset: baseOffset,
-		}
-		go p.onRoll(task)
+		})
 	}
 
 	return nil
 }
 
+// Read returns the stored record blob covering offset, re-addressed so the
+// offsets it carries agree with the log's own offset space.
 func (p *PartitionWAL) Read(offset int64) ([]byte, error) {
+	data, _, err := p.read(offset, 0, true)
+	return data, err
+}
+
+// ReadBatch returns consecutive record blobs starting at offset, stopping
+// once maxBytes of payload would be exceeded. It also returns the offset the
+// caller should request next.
+//
+// Returning a single blob per Fetch is a throughput trap: a consumer would
+// need one round trip per producer batch, and against object storage that is
+// one GET per batch. Filling the caller's byte budget is what makes the fetch
+// loop behave like a broker's.
+func (p *PartitionWAL) ReadBatch(offset int64, maxBytes int64) ([]byte, int64, error) {
+	if maxBytes <= 0 {
+		maxBytes = maxInt64
+	}
+	return p.read(offset, maxBytes, false)
+}
+
+func (p *PartitionWAL) read(offset int64, maxBytes int64, single bool) ([]byte, int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Check active using binary search on offsets
-	// Find largest startOffset <= offset
-	idx := sort.Search(len(p.offsets), func(i int) bool {
-		return p.offsets[i] > offset
-	})
-	// idx is where p.offsets[i] > offset.
-	// So p.offsets[idx-1] <= offset.
-	// However, if idx == 0, it means p.offsets[0] > offset, so no element <= offset.
-	// If idx == len, it means all elements <= offset.
-
+	idx := sort.Search(len(p.offsets), func(i int) bool { return p.offsets[i] > offset })
 	searchIdx := idx - 1
+
 	if searchIdx >= 0 && searchIdx < len(p.offsets) {
 		startOffset := p.offsets[searchIdx]
-		pos := p.index[startOffset]
+		pos, ok := p.index[startOffset]
+		if ok {
+			if body, count, err := p.readEntryAt(p.activeFile, pos); err == nil {
+				if startOffset+int64(count) > offset {
+					out, next := accumulate(body, startOffset, int64(count), maxBytes, nil)
+					if single {
+						return out, next, nil
+					}
 
-		// If found, verify it covers the offset
-		data, err := p.readFromFile(p.activeFile, pos)
-		if err == nil {
-			// Check coverage requires count.
-			count := CountMessageSet(data)
-			if count == 0 {
-				count = 1
-			}
-			if startOffset+int64(count) > offset {
-				return data, nil
+					// Keep consuming the rest of the active segment while the
+					// budget allows. One record per fetch turns a consumer
+					// into a request loop.
+					for i := searchIdx + 1; i < len(p.offsets) && int64(len(out)) < maxBytes; i++ {
+						nextPos, ok := p.index[p.offsets[i]]
+						if !ok {
+							break
+						}
+						more, moreCount, err := p.readEntryAt(p.activeFile, nextPos)
+						if err != nil {
+							break
+						}
+						if int64(len(out))+int64(len(more)) > maxBytes {
+							break
+						}
+						out = append(out, more...)
+						next += int64(moreCount)
+					}
+					return out, next, nil
+				}
 			}
 		}
 	}
 
-	// Not in active. Check sealed files?
-	// For MVP, we only serve from Active WAL explicitly here?
-	// Plan says: "Locate: Determine if the offset is in the WAL (Hot) or S3 (Cold)."
-	// But we might also have sealed WAL files that are not yet in S3 or are still local.
-	// Let's strictly say: WAL read = Active WAL or local sealed WALs.
-	// Implementing read from sealed WALs is needed.
-
-	// Find file covering offset.
-	// scan dir?
-	// cache?
-	// For now, let's scan dir.
-
-	return p.readFromSealed(offset)
+	return p.readFromSealedBatch(offset, maxBytes, single)
 }
 
-func (p *PartitionWAL) readFromFile(f *os.File, pos int64) ([]byte, error) {
-	if _, err := f.Seek(pos, 0); err != nil {
-		return nil, err
-	}
+const maxInt64 = int64(^uint64(0) >> 1)
 
-	header := make([]byte, 12)
+// accumulate appends one stored blob to out if it fits the budget, then keeps
+// consuming consecutive blobs from the active segment while they do.
+func accumulate(body []byte, startOffset, count, maxBytes int64, out []byte) ([]byte, int64) {
+	if out == nil {
+		out = make([]byte, 0, len(body))
+	}
+	if int64(len(out))+int64(len(body)) > maxBytes && len(out) > 0 {
+		return out, startOffset
+	}
+	out = append(out, body...)
+	next := startOffset + count
+	return out, next
+}
+
+// readEntryAt reads a single stored entry (header + body) from f at pos and
+// returns the raw body alongside the record count it holds.
+func (p *PartitionWAL) readEntryAt(f *os.File, pos int64) ([]byte, int, error) {
+	if _, err := f.Seek(pos, io.SeekStart); err != nil {
+		return nil, 0, err
+	}
+	header := make([]byte, msgSetEntryHeaderLen)
 	if _, err := io.ReadFull(f, header); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-
-	size := binary.BigEndian.Uint32(header[8:12])
-
+	size := int32(binary.BigEndian.Uint32(header[8:12]))
+	if size < 0 || size > maxEntrySize {
+		return nil, 0, fmt.Errorf("implausible entry size %d at %d", size, pos)
+	}
 	body := make([]byte, size)
 	if _, err := io.ReadFull(f, body); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-
 	msgOffset := int64(binary.BigEndian.Uint64(header[0:8]))
-
-	// Determine total count (recursive)
-	totalCount := CountMessageSet(body)
-	if totalCount == 0 {
-		totalCount = 1
+	count := CountMessageSet(body)
+	if count == 0 {
+		count = 1
 	}
-
-	return patchOffsets(body, msgOffset, totalCount), nil
+	return patchOffsets(body, msgOffset, count), count, nil
 }
 
-// patchOffsets rewrites the offsets inside a MessageSet so they run
-// sequentially from baseOffset. For a compressed wrapper holding many
-// records, every outer entry takes the batch's last offset, matching how
-// librdkafka expects a compressed batch to be addressed.
+// patchOffsets re-addresses a stored record blob into the log's offset space.
+//
+// A blob is either a bare RecordBatch or a message set whose entries wrap one.
+// The two are handled separately because they carry the offset in different
+// places: a bare batch's first 8 bytes *are* its base offset, whereas in a
+// message set the offset lives in the outer entry header and a wrapped
+// RecordBatch additionally has its own base offset inside. Rewriting only the
+// outer one leaves the inner base offset stale, which every modern client
+// reads in preference to it.
+// PatchStoredBlob re-addresses a stored record blob into a log's offset space
+// and returns the blob, so the cold and hot read paths agree on what the
+// offsets mean.
+func PatchStoredBlob(body []byte, msgOffset int64, totalCount int) []byte {
+	return patchOffsets(body, msgOffset, totalCount)
+}
+
+// patchOffsets re-addresses a stored record blob so the offsets it carries
+// agree with the log's own offset space.
+//
+// A blob is either a bare RecordBatch or a message set. The two are handled
+// separately because the offset lives in a different place in each: a bare
+// batch's first 8 bytes *are* its base offset, while a message set carries the
+// offset in the entry header and a wrapped RecordBatch additionally has its own
+// base offset inside. Rewriting only the outer one leaves the inner base offset
+// stale, and every modern client reads the inner one in preference.
 func patchOffsets(body []byte, msgOffset int64, totalCount int) []byte {
-	// Check if we have a single compressed wrapper
-	// A wrapper implies shallowCount == 1 and totalCount > 1
-	// Or simply if Attributes says compressed.
-	// But simply: if shallow entries loop only finds 1 entry, and totalCount > 1.
-
-	shallowCount := 0
-	checkPos := 0
-	for checkPos <= len(body)-12 {
-		entrySize := binary.BigEndian.Uint32(body[checkPos+8 : checkPos+12])
-		checkPos += 12 + int(entrySize)
-		shallowCount++
-	}
-
-	isCompressedWrapper := (shallowCount == 1 && totalCount > 1)
-
-	offsetPos := 0
-	currentOff := msgOffset
-
-	for offsetPos <= len(body)-12 {
-		entrySize := binary.BigEndian.Uint32(body[offsetPos+8 : offsetPos+12])
-		totalLen := 12 + int(entrySize)
-		if offsetPos+totalLen > len(body) {
-			break
+	if isRecordBatch(body) {
+		if err := setRecordBatchBaseOffset(body, msgOffset); err == nil {
+			return body
 		}
-
-		writeOff := currentOff
-		if isCompressedWrapper {
-			// Use Last Offset
-			writeOff = msgOffset + int64(totalCount) - 1
-		}
-
-		binary.BigEndian.PutUint64(body[offsetPos:offsetPos+8], uint64(writeOff))
-		offsetPos += totalLen
-		currentOff++
+		// Not a batch after all; fall through to message set handling.
 	}
-
+	assignMessageSetOffsets(body, msgOffset)
 	return body
 }
 
+// assignMessageSetOffsets rewrites the offset of every message set entry,
+// starting at base, and returns the offset the next entry will take.
+//
+// The per-entry advance is the part that has to be right. A legacy message set
+// is a flat list of single messages, so each entry takes exactly one offset. A
+// compressed wrapper is a single entry standing in for many, and carries the
+// *last* offset of the batch: readers recover the first by subtracting, which
+// is why setting it to the base instead would shift the whole batch.
+func assignMessageSetOffsets(body []byte, base int64) int64 {
+	off := base
+	pos := 0
+	for pos+msgSetEntryHeaderLen <= len(body) {
+		size := int32(binary.BigEndian.Uint32(body[pos+8 : pos+12]))
+		if size < 0 {
+			break
+		}
+		total := msgSetEntryHeaderLen + int(size)
+		if pos+total > len(body) {
+			break
+		}
+		entry := body[pos+msgSetEntryHeaderLen : pos+total]
+
+		if isRecordBatch(entry) {
+			// Both offsets have to move: the entry header carries the
+			// batch's base offset, and the batch carries its own copy of the
+			// same thing, which is what clients actually read.
+			binary.BigEndian.PutUint64(body[pos:pos+8], uint64(off))
+			_ = setRecordBatchBaseOffset(entry, off)
+			if info, err := parseRecordBatch(entry); err == nil {
+				off += int64(info.RecordsCount)
+			} else {
+				off++
+			}
+		} else if count, wrapped := compressedEntryCount(entry); wrapped {
+			binary.BigEndian.PutUint64(body[pos:pos+8], uint64(off+count-1))
+			off += count
+		} else {
+			binary.BigEndian.PutUint64(body[pos:pos+8], uint64(off))
+			off++
+		}
+		pos += total
+	}
+	return off
+}
+
+// compressedEntryCount reports how many records a legacy compressed wrapper
+// stands for, and whether the entry is one at all.
+func compressedEntryCount(entry []byte) (int64, bool) {
+	l, ok := parseLegacyMessage(entry)
+	if !ok || !l.compressed || l.valueLen <= 0 {
+		return 0, false
+	}
+	raw, err := decompress(l.codec, entry[l.valueOff:l.valueOff+l.valueLen])
+	if err != nil {
+		return 0, false
+	}
+	return int64(CountMessageSet(raw)), true
+}
+
+// readFromSealed is the single-blob form of readFromSealedBatch.
 func (p *PartitionWAL) readFromSealed(offset int64) ([]byte, error) {
+	data, _, err := p.readFromSealedBatch(offset, 0, true)
+	return data, err
+}
+
+func (p *PartitionWAL) readFromSealedBatch(offset int64, maxBytes int64, single bool) ([]byte, int64, error) {
 	// 1. List all .log files
 	files, err := os.ReadDir(p.dir)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	var candidates []int64
@@ -739,39 +896,32 @@ func (p *PartitionWAL) readFromSealed(offset int64) ([]byte, error) {
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i] > candidates[j] })
 
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("offset %d not found in any local segment", offset)
+		return nil, 0, fmt.Errorf("offset %d not found in any local segment", offset)
 	}
 
-	// Try the closest start offset <= requested offset
 	targetStart := candidates[0]
 	path := filepath.Join(p.dir, fmt.Sprintf("%020d.log", targetStart))
 
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
-	// Scan to the record whose offset range covers the target. Matching on
-	// recOff == offset alone is not enough: a single entry can hold many
-	// records (compressed batches, or a multi-record MessageSet), and readers
-	// legitimately ask for an offset in the middle of one.
 	pos := int64(0)
 	for {
-		header := make([]byte, 12)
+		header := make([]byte, msgSetEntryHeaderLen)
 		if _, err := io.ReadFull(f, header); err != nil {
 			break
 		}
 
 		recOff := int64(binary.BigEndian.Uint64(header[0:8]))
-		recSize := binary.BigEndian.Uint32(header[8:12])
-
-		if recSize > maxEntrySize {
-			break // Corrupt
+		recSize := int32(binary.BigEndian.Uint32(header[8:12]))
+		if recSize < 0 || recSize > maxEntrySize {
+			break
 		}
 		if recOff > offset {
-			// Overshot: this segment cannot contain the target.
-			break
+			break // this segment cannot contain the target
 		}
 
 		body := make([]byte, recSize)
@@ -783,19 +933,101 @@ func (p *PartitionWAL) readFromSealed(offset int64) ([]byte, error) {
 		if count == 0 {
 			count = 1
 		}
-
 		if recOff+int64(count) > offset {
-			// Target falls inside [recOff, recOff+count)
-			return patchOffsets(body, recOff, count), nil
+			patched := patchOffsets(body, recOff, count)
+			// Fill the remaining budget from the rest of this segment so one
+			// read can serve several batches.
+			out, next := accumulate(patched, recOff, int64(count), maxBytes, nil)
+			if !single && maxBytes > int64(len(patched)) {
+				more, moreNext, err := p.drainSealed(f, out, next, maxBytes)
+				if err == nil && len(more) > len(out) {
+					return more, moreNext, nil
+				}
+			}
+			return out, next, nil
 		}
-
-		pos += 12 + int64(recSize)
+		pos += msgSetEntryHeaderLen + int64(recSize)
 	}
 
-	return nil, fmt.Errorf("offset %d not found in segment %s", offset, path)
+	return nil, 0, fmt.Errorf("offset %d not found in segment %s", offset, path)
 }
 
+// drainSealed keeps reading entries from an open sealed segment until the
+// budget is spent. onErr is deliberately non-fatal: a partial answer that
+// already covers the requested offset beats failing the whole fetch.
+func (p *PartitionWAL) drainSealed(f *os.File, out []byte, offset, maxBytes int64) ([]byte, int64, error) {
+	next := offset
+	for int64(len(out)) < maxBytes {
+		header := make([]byte, msgSetEntryHeaderLen)
+		if _, err := io.ReadFull(f, header); err != nil {
+			return out, next, nil
+		}
+		recOff := int64(binary.BigEndian.Uint64(header[0:8]))
+		recSize := int32(binary.BigEndian.Uint32(header[8:12]))
+		if recSize < 0 || recSize > maxEntrySize {
+			return out, next, nil
+		}
+		body := make([]byte, recSize)
+		if _, err := io.ReadFull(f, body); err != nil {
+			return out, next, nil
+		}
+		count := CountMessageSet(body)
+		if count == 0 {
+			count = 1
+		}
+		if int64(len(out))+int64(len(body)) > maxBytes {
+			break
+		}
+		out = append(out, patchOffsets(body, recOff, count)...)
+		next = recOff + int64(count)
+	}
+	return out, next, nil
+}
+
+// Discard closes the active file without sealing or uploading it.
+//
+// Used when a topic is being deleted: sealing there would publish the
+// segment to object storage, and the upload could land after the delete and
+// put the objects back.
+func (p *PartitionWAL) Discard() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.activeFile == nil {
+		return nil
+	}
+	err := p.activeFile.Close()
+	p.activeFile = nil
+	return err
+}
+
+// Close seals the active segment before closing the file.
+//
+// Sealing matters because this agent is expected to run with an ephemeral
+// local disk: durable data lives in object storage, and the active segment is
+// the only copy of whatever has not rolled yet. Closing without sealing
+// discards it on a graceful restart, which is the exact failure the
+// object-store-backed design exists to avoid.
+//
+// A segment with no records is left alone; an empty segment would only cost
+// an object.
 func (p *PartitionWAL) Close() error {
+	p.mu.Lock()
+	size := p.currentSize
+	p.mu.Unlock()
+
+	if size > 0 {
+		if err := p.roll(); err != nil {
+			// Report the sealing failure but still close the file, so the
+			// caller is not left with a leaked descriptor.
+			p.mu.Lock()
+			if p.activeFile != nil {
+				_ = p.activeFile.Close()
+			}
+			p.mu.Unlock()
+			return err
+		}
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.activeFile != nil {

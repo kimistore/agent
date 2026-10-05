@@ -19,7 +19,9 @@
 package server
 
 import (
+	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -32,13 +34,23 @@ import (
 	"kimistore/internal/storage"
 )
 
+// maxFrameSize bounds a single inbound request. A client announcing more than
+// this is either broken or hostile, and allocating whatever it asked for
+// would be an easy way to lose the process.
+const maxFrameSize = 100 * 1024 * 1024
+
+// maxInFlightRequests bounds how many requests one connection may have
+// outstanding. Kafka clients pipeline aggressively; without a ceiling a slow
+// handler (a long-polling Fetch) would let a client queue unbounded work.
+const maxInFlightRequests = 256
+
 type Server struct {
-	addr       string
-	listener   net.Listener
-	quit       chan struct{}
-	wg         sync.WaitGroup
-	storage    *storage.StorageEngine
-	authConfig protocol.AuthConfig
+	addr     string
+	listener net.Listener
+	quit     chan struct{}
+	wg       sync.WaitGroup
+	storage  *storage.StorageEngine
+	config   protocol.ServerConfig
 
 	// stateMu guards the server lifecycle: the listener, the set of live
 	// connections, and the closing flag. Connections are tracked so Stop can
@@ -50,21 +62,28 @@ type Server struct {
 	closing bool
 }
 
-func NewServer(addr string, storage *storage.StorageEngine, saslUser, saslPassword string) *Server {
+func NewServer(addr string, storage *storage.StorageEngine, config protocol.ServerConfig) *Server {
+	if config.AdvertisedHost == "" {
+		config.AdvertisedHost = "localhost"
+	}
+	if config.AdvertisedPort == 0 {
+		config.AdvertisedPort = 19092
+	}
 	return &Server{
 		addr:    addr,
 		quit:    make(chan struct{}),
 		conns:   make(map[net.Conn]struct{}),
 		storage: storage,
-		authConfig: protocol.AuthConfig{
-			Username: saslUser,
-			Password: saslPassword,
-		},
+		config:  config,
 	}
 }
 
 func (s *Server) Start() error {
-	ln, err := net.Listen("tcp", s.addr)
+	// ListenConfig rather than net.Listen: a listener that cannot be closed
+	// promptly is a listener that cannot be shut down promptly, and shutdown
+	// depends on closing this one.
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "tcp", s.addr)
 	if err != nil {
 		return err
 	}
@@ -75,6 +94,8 @@ func (s *Server) Start() error {
 	s.listener = ln
 	s.stateMu.Unlock()
 
+	log.Printf("Broker advertised as %s:%d", s.config.AdvertisedHost, s.config.AdvertisedPort)
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -83,6 +104,8 @@ func (s *Server) Start() error {
 				return nil
 			default:
 				log.Printf("Accept error: %v", err)
+				// A transient accept error must not spin the CPU.
+				time.Sleep(5 * time.Millisecond)
 				continue
 			}
 		}
@@ -107,7 +130,7 @@ func (s *Server) Stop() error {
 	s.stateMu.Unlock()
 
 	if ln != nil {
-		ln.Close()
+		_ = ln.Close()
 	}
 
 	// Tear down every live connection, unblocking handlers parked in a read.
@@ -115,7 +138,7 @@ func (s *Server) Stop() error {
 	s.stateMu.Lock()
 	live := len(s.conns)
 	for c := range s.conns {
-		c.Close()
+		_ = c.Close()
 	}
 	s.stateMu.Unlock()
 
@@ -135,9 +158,15 @@ func (s *Server) Stop() error {
 	return nil
 }
 
+// result carries one handled request back to the writer.
+type result struct {
+	body []byte
+	err  error
+}
+
 func (s *Server) handleConnection(conn net.Conn) {
 	defer s.wg.Done()
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -168,60 +197,112 @@ func (s *Server) handleConnection(conn net.Conn) {
 	log.Printf("New connection from %s", remoteAddr)
 	defer log.Printf("Connection closed from %s", remoteAddr)
 
-	session := &protocol.Session{
-		Authenticated: false,
-	}
+	session := &protocol.Session{Authenticated: false}
 
+	// The connection's context, cancelled the moment the socket goes away.
+	// Everything below inherits it, so a long-poll or a cold read started for
+	// a client that has disconnected stops immediately instead of holding a
+	// handler goroutine and an in-flight slot until it finishes on its own.
+	connCtx, cancelConn := context.WithCancel(context.Background())
+	defer cancelConn()
+
+	// Kafka clients pipeline: several requests may be in flight on one socket
+	// at a time, and responses may come back out of order by correlation ID.
+	// Handling each request on its own goroutine while a dedicated writer
+	// emits responses in arrival order keeps that pattern working.
+	//
+	// The previous serial loop meant a single long-polling Fetch parked the
+	// whole connection, so heartbeats and offset commits queued behind it --
+	// which shows up as spurious session timeouts and rebalance storms for
+	// exactly the multiplexed clients that need a broker most.
+	pending := make(chan chan result, maxInFlightRequests)
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for ch := range pending {
+			res := <-ch
+			if res.err != nil {
+				log.Printf("Protocol error: %v", res.err)
+				return
+			}
+			if res.body == nil {
+				// No response expected (e.g. acks=0).
+				continue
+			}
+			if err := writeFrame(conn, res.body); err != nil {
+				log.Printf("Write error: %v", err)
+				return
+			}
+		}
+	}()
+
+	var handlers sync.WaitGroup
 	for {
-		// 1. Read Message Size (int32)
-		headerBuf := make([]byte, 4)
-		if _, err := io.ReadFull(conn, headerBuf); err != nil {
+		body, err := readFrame(conn)
+		if err != nil {
 			if err != io.EOF {
 				log.Printf("Read error: %v", err)
 			}
-			return
-		}
-		metrics.AddIOBytes("inbound", 4)
-
-		size := binary.BigEndian.Uint32(headerBuf)
-
-		// 2. Read Message Body
-		bodyBuf := make([]byte, size)
-		if _, err := io.ReadFull(conn, bodyBuf); err != nil {
-			log.Printf("Read body error: %v", err)
-			return
-		}
-		metrics.AddIOBytes("inbound", int(size))
-
-		// 3. Process Request
-		resp, err := protocol.HandleRequest(bodyBuf, s.storage, session, s.authConfig)
-		if err != nil {
-			log.Printf("Protocol error: %v", err)
-			return // Or close connection on protocol error
+			break
 		}
 
-		if resp == nil {
-			// No response needed (e.g. Acks=0)
-			continue
-		}
+		ch := make(chan result, 1)
+		pending <- ch
 
-		// log.Printf("Sending Response: Size=%d", len(resp))
-		// log.Printf("Response Hex: %x", resp)
-
-		// 4. Send Response
-		// Response format: Size (int32) | Body
-		respSize := make([]byte, 4)
-		binary.BigEndian.PutUint32(respSize, uint32(len(resp)))
-
-		if _, err := conn.Write(respSize); err != nil {
-			log.Printf("Write error: %v", err)
-			return
-		}
-		metrics.AddIOBytes("outbound", 4)
-		if _, err := conn.Write(resp); err != nil {
-			log.Printf("Write body error: %v", err)
-			return
-		}
-		metrics.AddIOBytes("outbound", len(resp))
+		handlers.Add(1)
+		go func(body []byte, ch chan<- result) {
+			defer handlers.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Panic handling request: %v\n%s", r, debug.Stack())
+					ch <- result{err: fmt.Errorf("handler panic: %v", r)}
+				}
+			}()
+			resp, herr := protocol.HandleRequest(connCtx, body, s.storage, session, s.config)
+			ch <- result{body: resp, err: herr}
+		}(body, ch)
 	}
+
+	// Let outstanding handlers finish so their responses are not dropped
+	// mid-flight, then close the writer.
+	handlers.Wait()
+	close(pending)
+	<-writerDone
+}
+
+func readFrame(conn net.Conn) ([]byte, error) {
+	headerBuf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, headerBuf); err != nil {
+		return nil, err
+	}
+	metrics.AddIOBytes("inbound", 4)
+
+	size := binary.BigEndian.Uint32(headerBuf)
+	if size == 0 {
+		return nil, io.EOF
+	}
+	if size > maxFrameSize {
+		return nil, fmt.Errorf("request frame of %d bytes exceeds the %d byte limit", size, maxFrameSize)
+	}
+
+	body := make([]byte, size)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		return nil, err
+	}
+	metrics.AddIOBytes("inbound", int(size))
+	return body, nil
+}
+
+func writeFrame(conn net.Conn, body []byte) error {
+	size := make([]byte, 4)
+	binary.BigEndian.PutUint32(size, uint32(len(body)))
+	if _, err := conn.Write(size); err != nil {
+		return err
+	}
+	metrics.AddIOBytes("outbound", 4)
+	if _, err := conn.Write(body); err != nil {
+		return err
+	}
+	metrics.AddIOBytes("outbound", len(body))
+	return nil
 }

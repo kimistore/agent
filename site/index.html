@@ -26,13 +26,14 @@
   <div class="wrap nav__inner">
     <a class="brand" href="#top" aria-label="Kimistore home">
       <span class="brand__mark" aria-hidden="true">
-        <svg viewBox="0 0 32 32" width="30" height="30"><use href="#logo-mark"></use></svg>
+        <svg viewBox="0 0 64 64" width="30" height="30" role="img" aria-label="Kimistore"><use href="#logo-mark"></use></svg>
       </span>
       <span class="brand__text">kimistore</span>
     </a>
     <nav class="nav__links" aria-label="Main">
       <a href="#why">Why</a>
       <a href="#architecture">Architecture</a>
+      <a href="#grafana">Mimir &amp; Tempo</a>
       <a href="#compatibility">Compatibility</a>
       <a href="#quickstart">Quickstart</a>
       <a href="#status">Capabilities</a>
@@ -49,6 +50,7 @@
   <div class="nav__mobile" id="mobileMenu" hidden>
     <a href="#why">Why</a>
     <a href="#architecture">Architecture</a>
+    <a href="#grafana">Mimir &amp; Tempo</a>
     <a href="#compatibility">Compatibility</a>
     <a href="#quickstart">Quickstart</a>
     <a href="#status">Capabilities</a>
@@ -283,11 +285,11 @@
           <text x="447" y="374" class="d-label d-label--hot">HOT — local WAL (write buffer)</text>
 
           <!-- connectors -->
-          <line x1="178" y1="235" x2="226" y2="235" class="d-line" marker-end="url(#arrow)"/>
+          <line x1="174" y1="235" x2="232" y2="235" class="d-line" marker-end="url(#arrow)"/>
           <text x="202" y="222" class="d-tag" text-anchor="middle">produce / fetch</text>
 
-          <line x1="447" y1="346" x2="447" y2="328" class="d-line" marker-end="url(#arrow)"/>
-          <line x1="447" y1="336" x2="447" y2="318" class="d-line" marker-end="url(#arrow)"/>
+          <line x1="447" y1="332" x2="447" y2="344" class="d-line" marker-end="url(#arrow)"/>
+          <line x1="543" y1="272" x2="543" y2="260" class="d-line" marker-end="url(#arrow)"/>
 
           <!-- s3 -->
           <g>
@@ -302,13 +304,13 @@
             <text x="849" y="304" class="d-label">metadata checkpoint</text>
           </g>
 
-          <path d="M664 368 C 720 368, 720 235, 738 235" class="d-line" marker-end="url(#arrow)"/>
+          <path d="M662 368 C 706 368, 706 235, 742 235" class="d-line" marker-end="url(#arrow)"/>
           <text x="726" y="330" class="d-tag" text-anchor="end">async upload</text>
 
-          <path d="M738 300 C 700 300, 700 230, 646 230" class="d-line d-line--dash" marker-end="url(#arrow)"/>
+          <path d="M742 300 C 702 300, 694 230, 632 230" class="d-line d-line--dash" marker-end="url(#arrow)"/>
           <text x="712" y="288" class="d-tag" text-anchor="end">checkpoint</text>
 
-          <path d="M742 168 C 700 168, 690 120, 636 120" class="d-line d-line--dash" marker-end="url(#arrow)"/>
+          <path d="M742 168 C 700 168, 690 158, 632 158" class="d-line d-line--dash" marker-end="url(#arrow)"/>
           <text x="700" y="140" class="d-tag" text-anchor="end">ranged reads</text>
         </svg>
       </div>
@@ -332,6 +334,212 @@
       </div>
     </div>
   </section>
+
+<!-- ============ GRAFANA ============ -->
+<section class="section" id="grafana">
+  <div class="wrap">
+    <header class="section__head reveal">
+      <span class="eyebrow">Real deployments</span>
+      <h2>Kafka is now the centre of the Grafana write path.</h2>
+      <p class="lede">
+        Grafana Mimir&nbsp;3.0 made <strong>ingest storage architecture</strong> stable and the
+        recommended way to run: Kafka sits between distributors and ingesters, and
+        <em>the write path ends at Kafka</em>. Grafana Tempo's microservices mode uses a
+        Kafka-compatible queue as the durable write-ahead log behind every write. Both
+        documents point at the same door — the Mimir docs say its use of the Kafka protocol
+        is <strong>deliberately limited</strong> precisely so you can bring a compatible
+        system instead of Apache Kafka.
+      </p>
+      <p class="lede lede--sm">
+        That is the workload Kimistore was built for: a write path that must be durably
+        acknowledged, replayed by several independent consumers, and retained for a window
+        measured in hours or days — on storage that costs pennies per gigabyte.
+      </p>
+    </header>
+
+    <!-- what a buyer needs to decide -->
+    <div class="grid grid--4 proof">
+      <div class="stat reveal">
+        <span class="stat__num">0</span>
+        <span class="stat__label">coordination services — no ZooKeeper, no KRaft quorum</span>
+      </div>
+      <div class="stat reveal">
+        <span class="stat__num">1×</span>
+        <span class="stat__label">durable copy on object storage, not three broker replicas</span>
+      </div>
+      <div class="stat reveal">
+        <span class="stat__num">acks=all</span>
+        <span class="stat__label">the durability contract both Grafana services expect</span>
+      </div>
+      <div class="stat reveal">
+        <span class="stat__num">3</span>
+        <span class="stat__label">consumer groups in a Tempo deployment, each with its own offsets</span>
+      </div>
+    </div>
+
+    <!-- how the traffic flows -->
+    <div class="grid grid--3 flow-cards grafana-flow">
+      <div class="flow reveal">
+        <span class="flow__step">Write</span>
+        <h4>Distributor → Kimistore</h4>
+        <p>
+          The distributor hashes each series into a topic partition, produces with
+          <code>acks=all</code>, and does not reply to the client — be that an OTel collector
+          or a Prometheus remote-write sender — until the broker confirms. Tempo does the
+          same and documents it as "the Kafka protocol's strongest acknowledgment mode".
+        </p>
+      </div>
+      <div class="flow reveal">
+        <span class="flow__step">Persist</span>
+        <h4>Group-committed fsync</h4>
+        <p>
+          The ack is a real durability promise: the batch is fsynced to the local WAL before
+          the offset is returned, with concurrent producers sharing a single flush. Sealed
+          segments are offloaded to object storage in the background, and flushed on
+          shutdown, so an ephemeral local disk loses nothing.
+        </p>
+      </div>
+      <div class="flow reveal">
+        <span class="flow__step">Read</span>
+        <h4>Ingesters consume, independently</h4>
+        <p>
+          Every Mimir ingester runs its <em>own</em> consumer group, so a zone can be
+          restarted or rolled back independently. Tempo runs three — <code>block-builder</code>,
+          <code>live-store</code> and <code>metrics-generator</code> — each tracking its own
+          offsets at its own pace. One lagging group never blocks another.
+        </p>
+      </div>
+    </div>
+
+    <!-- the two products -->
+    <div class="grid grid--2 grafana-cards">
+      <article class="gcard reveal">
+        <div class="gcard__head">
+          <span class="gcard__badge">Grafana Mimir</span>
+          <span class="gcard__ver">3.0+</span>
+        </div>
+        <h3>Ingest storage architecture</h3>
+        <p>
+          Mimir's classic architecture keeps ingesters heavily stateful: they combine
+          in-memory data with local write-ahead logs and sit on both the write and the read
+          path, so heavy queries disrupt live writes. Ingest storage architecture decouples
+          the two, and <strong>the write path ends at Kafka</strong> — a push succeeds once
+          the broker confirms, without an ingester quorum.
+        </p>
+        <ul class="check-list">
+          <li>One consumer group <em>per ingester zone</em>, so HA on the read path and independent rollback</li>
+          <li>Partition assignment derived from the instance ID — the agent serves plain <code>Metadata</code> for it</li>
+          <li>Strong read consistency makes the query-frontend read partition offsets from Kafka and gate ingesters on them: a hard <code>ListOffsets</code> requirement, answered from durable state</li>
+          <li><code>consume-from-position-at-startup</code> resolves to earliest/latest/a timestamp through the same API</li>
+          <li>No transactions and no idempotency required — the agent implements neither, and is not asked to</li>
+        </ul>
+        <p class="gcard__foot">
+          In this architecture the broker is a durable hand-off point, not a queryable
+          store — the samples are written again downstream into per-tenant TSDB blocks. A
+          node that can be torn down and recreated is therefore no longer a liability.
+        </p>
+      </article>
+
+      <article class="gcard reveal">
+        <div class="gcard__head">
+          <span class="gcard__badge">Grafana Tempo</span>
+          <span class="gcard__ver">microservices mode</span>
+        </div>
+        <h3>Kafka as the durable write-ahead log</h3>
+        <p>
+          In microservices mode Tempo uses a Kafka-compatible queue as the WAL between
+          distributors and every downstream consumer: block-builders, live-stores and
+          metrics-generators. Because durability is centralised, Tempo does not have to
+          replicate data across instances on the write path — it runs with a
+          <strong>replication factor of 1</strong>. Monolithic mode
+          (<code>target: all</code>) pushes in-process and never touches Kafka.
+        </p>
+        <ul class="check-list">
+          <li>Distributors write with <code>acks=all</code> and wait for backend confirmation before answering the client</li>
+          <li>One topic for all tenants, hashed by trace ID to an active partition</li>
+          <li>Three independent consumer groups, each with its own offsets and its own pace</li>
+          <li>The partition ring maps Tempo partitions to Kafka partitions, typically 1:1</li>
+          <li>Kafka retention defines the replay budget — and lag is tracked per group via <code>tempo_ingest_group_partition_lag</code></li>
+        </ul>
+        <p class="gcard__foot">
+          Tempo's design already runs the write path at replication factor 1. Here that
+          single copy costs object storage rather than three provisioned broker disks.
+        </p>
+      </article>
+    </div>
+
+    <!-- requirement mapping -->
+    <div class="table-wrap reveal">
+      <table class="table">
+        <thead>
+          <tr><th>What Grafana requires of a Kafka-compatible backend</th><th>Who needs it</th><th>Kimistore</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th scope="row">Durable acknowledgement before the client is answered</th>
+            <td>Mimir distributor, Tempo distributor</td>
+            <td><span class="tag tag--yes">Yes</span> group-committed fsync for <code>acks&gt;=1</code></td>
+          </tr>
+          <tr>
+            <th scope="row">Metadata for topic and leader discovery</th>
+            <td>Both distributors and ingesters</td>
+            <td><span class="tag tag--yes">Yes</span> Metadata v0–v6, configurable advertised listener</td>
+          </tr>
+          <tr>
+            <th scope="row">Several independent consumer groups</th>
+            <td>Mimir per ingester zone; Tempo <code>block-builder</code>, <code>live-store</code>, <code>metrics-generator</code></td>
+            <td><span class="tag tag--yes">Yes</span> per-group offsets, persisted to object storage and rehydrated</td>
+          </tr>
+          <tr>
+            <th scope="row">Accurate partition offsets for read consistency and startup positioning</th>
+            <td>Strong read consistency, <code>consume-from-position-at-startup</code></td>
+            <td><span class="tag tag--yes">Yes</span> real log start and log end, correct across restarts</td>
+          </tr>
+          <tr>
+            <th scope="row">Replay window measured in hours or days</th>
+            <td>Block-builder cycle, live-store startup replay</td>
+            <td><span class="tag tag--yes">Yes</span> time and size retention on the object-store tier</td>
+          </tr>
+          <tr>
+            <th scope="row">No transactions, no idempotent writes</th>
+            <td>Both, by design</td>
+            <td><span class="tag tag--yes">Neither</span> implemented or required</td>
+          </tr>
+          <tr>
+            <th scope="row">Multi-broker replication across failure domains</th>
+            <td>Optional for them, <em>never required</em></td>
+            <td class="muted">Not implemented — by design</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="sources reveal">
+      Sources:
+      <a href="https://grafana.com/docs/mimir/latest/get-started/about-grafana-mimir-architecture/about-ingest-storage-architecture/" target="_blank" rel="noopener">Mimir ingest storage architecture</a>
+      &middot;
+      <a href="https://grafana.com/docs/tempo/latest/reference-tempo-architecture/components/kafka/" target="_blank" rel="noopener">Tempo&rsquo;s Kafka component</a>
+      &middot;
+      <a href="https://grafana.com/docs/tempo/latest/set-up-for-tracing/setup-tempo/configure-kafka/" target="_blank" rel="noopener">Tempo: configure a Kafka-compatible backend</a>
+    </p>
+
+    <div class="callout reveal">
+      <div class="callout__mark" aria-hidden="true">i</div>
+      <div>
+        <h3>Why the economics work out</h3>
+        <p>
+          A replicated Kafka ingest path pays for every write three times, plus the broker
+          disks, the controller quorum and the capacity plan. In both Grafana architectures
+          Kafka is a durable hand-off point rather than a queryable store: the data is
+          written again into per-tenant TSDB blocks by the ingesters or block-builders, and
+          read from there. Kimistore keeps exactly one durable copy, in object storage,
+          and exists only to get samples durably acknowledged and replayable. That is the
+          layer where a single-node design is not a compromise but the whole point.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
 
   <!-- ============ COMPARISON ============ -->
   <section class="section section--alt" id="compare">
@@ -377,7 +585,7 @@
       <header class="section__head reveal">
         <span class="eyebrow">Compatibility</span>
         <h2>What the agent actually implements</h2>
-        <p class="lede lede--sm">Negotiated through <code>ApiVersions</code> across the Kafka 0.10-era protocol range, with V3 support added for Produce, Fetch, and Metadata.</p>
+        <p class="lede lede--sm">Negotiated through <code>ApiVersions</code> one ApiVersions table, generated from the same map the request dispatcher refuses from — so the broker can never advertise a version it then mis-parses.</p>
       </header>
 
       <div class="compat reveal">
@@ -385,9 +593,9 @@
           <h3 class="compat__title">Data plane</h3>
           <ul class="api-list">
             <li><span class="api">Produce</span><span class="api__k">0</span><span class="api__v">v0–v3</span><span class="tick">✓</span></li>
-            <li><span class="api">Fetch</span><span class="api__k">1</span><span class="api__v">v0–v3</span><span class="tick">✓</span></li>
-            <li><span class="api">ListOffsets</span><span class="api__k">2</span><span class="api__v">v0–v1</span><span class="tick">✓</span></li>
-            <li><span class="api">Metadata</span><span class="api__k">3</span><span class="api__v">v0–v3</span><span class="tick">✓</span></li>
+            <li><span class="api">Fetch</span><span class="api__k">1</span><span class="api__v">v0–v5</span><span class="tick">✓</span></li>
+            <li><span class="api">ListOffsets</span><span class="api__k">2</span><span class="api__v">v0–v2</span><span class="tick">✓</span></li>
+            <li><span class="api">Metadata</span><span class="api__k">3</span><span class="api__v">v0–v6</span><span class="tick">✓</span></li>
             <li><span class="api">ApiVersions</span><span class="api__k">18</span><span class="api__v">v0</span><span class="tick">✓</span></li>
           </ul>
         </div>
@@ -419,7 +627,9 @@
             <li><span class="tick">✓</span> MessageSet v0 / v1 (legacy)</li>
             <li><span class="tick">✓</span> RecordBatch v2 (Kafka 0.11+)</li>
             <li><span class="tick">✓</span> GZIP, Snappy, LZ4 decompression</li>
-            <li><span class="tick">✓</span> Recursive batch offset rewriting on fetch</li>
+            <li><span class="tick">✓</span> Record-level offset rewriting on fetch, with CRC repair</li>
+            <li><span class="tick">✓</span> Kafka record headers preserved end to end, which Mimir&rsquo;s ingest path depends on</li>
+            <li><span class="tick">✓</span> Log position restored from object storage, so a restart with a wiped local disk continues the log</li>
             <li><span class="api__k--off">✕</span> Transactions / idempotent producer</li>
             <li><span class="api__k--off">✕</span> Replication, partition leaders, ISR</li>
           </ul>
@@ -535,8 +745,8 @@ p.<span class="c-fn">put</span>(<span class="c-str">"value.deserializer"</span>,
   <section class="section" id="usecases">
     <div class="wrap">
       <header class="section__head reveal">
-        <span class="eyebrow">Where it earns its keep</span>
-        <h2>Good fit</h2>
+        <span class="eyebrow">Also a good fit</span>
+        <h2>Beyond the Grafana stack</h2>
       </header>
       <div class="grid grid--4">
         <article class="mini reveal">
@@ -570,16 +780,16 @@ p.<span class="c-fn">put</span>(<span class="c-str">"value.deserializer"</span>,
 
       <div class="grid grid--3">
         <div class="stat reveal">
-          <span class="stat__num">10.5k</span>
-          <span class="stat__label">lines of Go</span>
+          <span class="stat__num">9.1k</span>
+          <span class="stat__label">lines of Go, plus 6.7k of tests</span>
         </div>
         <div class="stat reveal">
-          <span class="stat__num">68</span>
+          <span class="stat__num">112</span>
           <span class="stat__label">unit &amp; integration tests, passing</span>
         </div>
         <div class="stat reveal">
           <span class="stat__num">27 MB</span>
-          <span class="stat__label">single static binary</span>
+          <span class="stat__label">single static binary, zero dependencies</span>
         </div>
       </div>
 
@@ -598,13 +808,13 @@ p.<span class="c-fn">put</span>(<span class="c-str">"value.deserializer"</span>,
             <li>Transparent tiered storage: hot local WAL with 64 MB rolling segments and parallel S3 uploader pool</li>
             <li>MessageSet v0/v1 and RecordBatch v2 with exact record-level offset accounting across GZIP, Snappy, and LZ4</li>
             <li>CreateTopics, DeleteTopics, ListGroups, DescribeGroups, and SASL PLAIN authentication</li>
-            <li>Comprehensive Prometheus metrics on port 9091 covering request latencies, WAL recoveries, and retention</li>
+            <li>Comprehensive Prometheus metrics on port 9091 covering request latencies, WAL recoveries, retention, and the writer lease</li>
           </ul>
         </div>
         <div class="reveal">
           <h3 class="status-h status-h--todo">Architectural scope &amp; non-goals</h3>
           <ul class="todo-list">
-            <li>Single-node architecture by design: no multi-broker replication, ISR quorums, or partition leader elections</li>
+            <li>Single-node architecture by design: no multi-broker replication, ISR quorums, or partition leader elections. One agent owns one log: a writer lease in object storage stops a second agent from silently corrupting it</li>
             <li>Standard Kafka at-least-once streaming: no 2PC distributed transactions or transactional producer IDs</li>
             <li>Built-in SASL PLAIN authentication: topic-level ACL authorization is not enforced</li>
             <li>Dynamic consumer rebalance assignment: delegates partition assignment to group leader without cooperative sticky protocols</li>
@@ -680,7 +890,7 @@ p.<span class="c-fn">put</span>(<span class="c-str">"value.deserializer"</span>,
   <div class="wrap footer__inner">
     <div class="footer__brand">
       <span class="brand__mark" aria-hidden="true">
-        <svg viewBox="0 0 32 32" width="26" height="26"><use href="#logo-mark"></use></svg>
+        <svg viewBox="0 0 64 64" width="26" height="26" role="img" aria-label="Kimistore"><use href="#logo-mark"></use></svg>
       </span>
       <div>
         <strong>kimistore</strong>
@@ -713,16 +923,24 @@ p.<span class="c-fn">put</span>(<span class="c-str">"value.deserializer"</span>,
 </footer>
 
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
-  <symbol id="logo-mark" viewBox="0 0 32 32">
+  <symbol id="logo-mark" viewBox="0 0 64 64">
     <defs>
       <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
         <stop offset="0%" stop-color="#6ea8ff"/><stop offset="55%" stop-color="#8b5cf6"/><stop offset="100%" stop-color="#22d3ee"/>
       </linearGradient>
+      <linearGradient id="lgsheen" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#ffffff" stop-opacity=".26"/><stop offset="60%" stop-color="#ffffff" stop-opacity="0"/>
+      </linearGradient>
     </defs>
-    <rect x="1.5" y="1.5" width="29" height="29" rx="8" fill="none" stroke="url(#lg)" stroke-width="2.2"/>
-    <path d="M9 8v16" stroke="url(#lg)" stroke-width="2.6" stroke-linecap="round"/>
-    <path d="M15 8v16" stroke="url(#lg)" stroke-width="2.6" stroke-linecap="round" opacity=".62"/>
-    <path d="M21 8v16" stroke="url(#lg)" stroke-width="2.6" stroke-linecap="round" opacity=".34"/>
+    <rect x="1" y="1" width="62" height="62" rx="16" fill="url(#lg)"/>
+    <rect x="1" y="1" width="62" height="62" rx="16" fill="url(#lgsheen)"/>
+    <g fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"
+       transform="translate(32 32) scale(1.16) translate(-32 -32)">
+      <path d="M16 19V45"/>
+      <path d="M16 32 28 19"/>
+      <path d="M16 32 28 45"/>
+      <path d="M48 25.2C48 21.8 44.6 19 41 19S34 21.8 34 25.2s3.4 5.8 7 6.8 7 3.4 7 6.8-3.4 6.2-7 6.2-7-2.8-7-6.2"/>
+    </g>
   </symbol>
 </svg>
 

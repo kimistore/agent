@@ -232,9 +232,34 @@ func (s *StorageEngine) processPartitionRetention(ctx context.Context, topic str
 		s.cacheMu.Lock()
 		delete(s.segmentCache, cacheKey)
 		s.cacheMu.Unlock()
-		log.Printf("Retention: deleted %d segment(s) from %s", deleted, cacheKey)
+
+		// The log start has moved. ListOffsets has to report it, otherwise a
+		// consumer that resets to "earliest" is sent to an offset that no
+		// longer exists and loops on OffsetOutOfRange forever.
+		remaining := s.oldestRetainedOffset(ctx, topic, partition)
+		s.metadataCache.SetPartitionState(topic, partition,
+			s.metadataCache.LogEndOffset(topic, partition), remaining, s.currentSegments(ctx, topic, partition))
+		log.Printf("Retention: deleted %d segment(s) from %s; log start now %d", deleted, cacheKey, remaining)
 	}
 	return deleted
+}
+
+// oldestRetainedOffset reports the start offset of the oldest segment still
+// present, or the log end offset if the partition has been fully reclaimed.
+func (s *StorageEngine) oldestRetainedOffset(ctx context.Context, topic string, partition int32) int64 {
+	segments := s.currentSegments(ctx, topic, partition)
+	if len(segments) == 0 {
+		return s.metadataCache.LogEndOffset(topic, partition)
+	}
+	return segments[0].StartOffset
+}
+
+func (s *StorageEngine) currentSegments(ctx context.Context, topic string, partition int32) []*SegmentMetadata {
+	segs, err := s.objectSegments(ctx, topic, partition)
+	if err != nil {
+		return nil
+	}
+	return segs
 }
 
 // FirstAllowedOffset is the lowest offset still needed by any consumer group,

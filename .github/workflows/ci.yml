@@ -1,0 +1,113 @@
+# Kimistore CI.
+#
+# Two jobs, because they have different shapes:
+#   * checks  -- fast, no Docker, runs on every push. This is what has to be
+#                green before a change is considered done.
+#   * e2e     -- starts a real Grafana Mimir and a real S3 shim, runs this
+#                agent as its Kafka landing zone, restarts it with an empty
+#                WAL and queries the data back. Mimir uses twmb/franz-go, the
+#                one client the unit suite cannot stand in for, and it is the
+#                check that has caught real protocol bugs. It needs Docker and
+#                several minutes, so it runs on a schedule and on demand
+#                rather than on every push.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # 04:17 UTC daily. Off the hour so this does not join the thundering herd
+    # of scheduled jobs that run at :00.
+    - cron: "17 4 * * *"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  checks:
+    name: build, vet, race
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: make build
+
+      - name: Check formatting
+        run: make fmt-check
+
+      - name: Vet
+        run: make vet
+
+      - name: go.mod tidy
+        run: make tidy-check
+
+      - name: Unit tests (race)
+        run: make race
+
+      - name: Coverage
+        run: make cover
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+      - name: Benchmark smoke test
+        # Catches a change that makes the append path pathologically slow or
+        # that stops compiling under the benchmark build tag.
+        run: go test -run '^$' -bench . -benchtime=1x ./internal/storage/wal/
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: ignore
+
+  e2e:
+    name: mimir end-to-end
+    # The heavy check: a scheduled and on-demand gate rather than a per-push
+    # one, because it pulls container images and runs a real database tier.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build the agent
+        run: make build
+
+      - name: Run Mimir end-to-end
+        run: ./test/mimir-e2e.sh
+
+      - name: Upload agent log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-log
+          path: agent.log
+          if-no-files-found: ignore

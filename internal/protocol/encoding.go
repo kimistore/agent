@@ -32,6 +32,15 @@ func NewDecoder(data []byte) *Decoder {
 	return &Decoder{data: data, off: 0}
 }
 
+func (d *Decoder) Int8() (int8, error) {
+	if d.remaining() < 1 {
+		return 0, errors.New("insufficient data for int8")
+	}
+	val := int8(d.data[d.off])
+	d.off++
+	return val, nil
+}
+
 func (d *Decoder) Int16() (int16, error) {
 	if d.remaining() < 2 {
 		return 0, errors.New("insufficient data for int16")

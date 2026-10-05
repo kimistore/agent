@@ -19,9 +19,14 @@
 package protocol
 
 import (
+	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"kimistore/internal/coordinator"
@@ -62,6 +67,8 @@ const (
 	ErrSaslAuthenticationFailed   = 58
 	ErrUnsupportedSaslMechanism   = 33
 	ErrIllegalSaslState           = 34
+	ErrOffsetOutOfRange           = 1
+	ErrUnknownTopicOrPartitionV0  = 3
 )
 
 type Session struct {
@@ -69,12 +76,210 @@ type Session struct {
 	User          string
 }
 
+// ServerConfig is the per-broker configuration the protocol layer needs.
+// The advertised address in particular has to be configurable: it is what
+// clients dial, and a hardcoded loopback address makes the broker unreachable
+// from anywhere else.
+type ServerConfig struct {
+	// Auth, when Username is non-empty, requires SASL/PLAIN.
+	Auth AuthConfig
+
+	// AdvertisedHost and AdvertisedPort are reported in Metadata and
+	// FindCoordinator.
+	AdvertisedHost string
+	AdvertisedPort int32
+
+	// AutoCreateTopics mirrors Kafka's auto.create.topics.enable: a Metadata
+	// request naming an unknown topic creates it.
+	AutoCreateTopics     bool
+	AutoCreatePartitions int32
+}
+
 type AuthConfig struct {
 	Username string
 	Password string
 }
 
-func HandleRequest(data []byte, store *storage.StorageEngine, session *Session, authConfig AuthConfig) ([]byte, error) {
+// AdvertisedVersions renders the version table for the startup log, one line
+// per API, so the ceilings are visible in the agent log and not only in the
+// documentation.
+func AdvertisedVersions(saslConfigured bool) string {
+	keys := make([]int, 0, len(supportedAPIVersions))
+	for k := range supportedAPIVersions {
+		if !saslConfigured && (k == ApiKeySaslHandshake || k == ApiKeySaslAuthenticate) {
+			continue
+		}
+		keys = append(keys, int(k))
+	}
+	sort.Ints(keys)
+
+	var b strings.Builder
+	for _, k := range keys {
+		if b.Len() > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%s=0-%d", apiName(int16(k)), supportedAPIVersions[int16(k)])
+	}
+	return b.String()
+}
+
+// VersionCeilingReason explains, for the APIs whose ceiling is lower than a
+// client might expect, why it is there. Clients that hard-code a version list
+// fail with a message naming only the API key, so the reason belongs somewhere
+// the operator will actually see it.
+func VersionCeilingReason(apiKey int16) string {
+	switch apiKey {
+	case ApiKeyProduce:
+		return "v3, the newest non-flexible version. Below v3 clients fall back to magic-1 " +
+			"records, which have no header field, so every Kafka record header a producer sets " +
+			"is dropped. Grafana Mimir keeps each write's wire format in a record header and " +
+			"ingests every record as the wrong version without it."
+	case ApiKeyMetadata:
+		return "v6, the newest version that is not flexible."
+	case ApiKeyFetch:
+		return "v5, which adds log_start_offset so a client can find the log start without a " +
+			"separate ListOffsets round trip."
+	}
+	return ""
+}
+
+// DefaultServerConfig is used by tests and by any caller that does not supply
+// one.
+func DefaultServerConfig() ServerConfig {
+	return ServerConfig{
+		AdvertisedHost:       "localhost",
+		AdvertisedPort:       19092,
+		AutoCreateTopics:     true,
+		AutoCreatePartitions: 1,
+	}
+}
+
+// supportedAPIVersions is the single source of truth for what this broker
+// implements. ApiVersions advertises from it and the dispatcher refuses from
+// it, so the two can no longer disagree -- a broker that advertises a version
+// it then mis-parses is worse than one that never offers it.
+// supportedAPIVersions is the single source of truth for what this broker
+// implements. ApiVersions advertises from it and the dispatcher refuses from
+// it, so the two cannot disagree -- a broker that advertises a version it then
+// mis-parses is worse than one that never offers it.
+//
+// Produce is offered up to v3 and no further, for a reason that has nothing to
+// do with response layout. Produce v3 is where magic 2 became legal, and magic
+// 2 is the record batch format. Offer a client only v0-v2 and it falls back
+// to magic 1, which has no header field, so every Kafka record header the
+// producer set is silently discarded. Grafana Mimir carries the wire format of
+// each write in a record header; capping Produce at v0 makes it ingest every
+// record as the wrong version and fail to parse it. v3 is the newest Produce
+// version before the flexible (tagged-field) encoding, which is not
+// implemented here.
+//
+// Heartbeat and LeaveGroup stop at v0 because the target client decodes those
+// two with ErrorCode before ThrottleTimeMs, the reverse of the schema.
+var supportedAPIVersions = map[int16]int16{
+	ApiKeyProduce:          3,
+	ApiKeyFetch:            5,
+	ApiKeyListOffsets:      2,
+	ApiKeyMetadata:         6,
+	ApiKeyApiVersions:      0,
+	ApiKeyOffsetCommit:     0,
+	ApiKeyOffsetFetch:      1,
+	ApiKeyFindCoordinator:  0,
+	ApiKeyJoinGroup:        1,
+	ApiKeySyncGroup:        0,
+	ApiKeyHeartbeat:        0,
+	ApiKeyLeaveGroup:       0,
+	ApiKeyCreateTopics:     0,
+	ApiKeyDeleteTopics:     0,
+	ApiKeyListGroups:       0,
+	ApiKeyDescribeGroups:   0,
+	ApiKeySaslHandshake:    1,
+	ApiKeySaslAuthenticate: 0,
+}
+
+var apiNames = map[int16]string{
+	ApiKeyProduce: "Produce", ApiKeyFetch: "Fetch", ApiKeyListOffsets: "ListOffsets",
+	ApiKeyMetadata: "Metadata", ApiKeyApiVersions: "ApiVersions", ApiKeyOffsetCommit: "OffsetCommit",
+	ApiKeyOffsetFetch: "OffsetFetch", ApiKeyFindCoordinator: "FindCoordinator", ApiKeyJoinGroup: "JoinGroup",
+	ApiKeySyncGroup: "SyncGroup", ApiKeyHeartbeat: "Heartbeat", ApiKeyLeaveGroup: "LeaveGroup",
+	ApiKeyCreateTopics: "CreateTopics", ApiKeyDeleteTopics: "DeleteTopics", ApiKeyListGroups: "ListGroups",
+	ApiKeyDescribeGroups: "DescribeGroups", ApiKeySaslHandshake: "SaslHandshake", ApiKeySaslAuthenticate: "SaslAuthenticate",
+}
+
+// ApiName is the human-readable name of an API key.
+func ApiName(k int16) string { return apiName(k) }
+
+func apiName(k int16) string {
+	if n, ok := apiNames[k]; ok {
+		return n
+	}
+	return fmt.Sprintf("api-%d", k)
+}
+
+// arrayFirstResponses are the APIs whose v0 response begins with an array
+// rather than an error code. Getting this wrong turns an UNSUPPORTED_VERSION
+// into a decode failure on the client, so the shape has to be picked per API.
+// clusterID is the identifier this broker reports. It has no meaning of its
+// own; it only has to be stable.
+const clusterID = "kimistore-cluster"
+
+var arrayFirstResponses = map[int16]bool{
+	ApiKeyProduce:      true,
+	ApiKeyMetadata:     true,
+	ApiKeyCreateTopics: true,
+	ApiKeyDeleteTopics: true,
+}
+
+// throttleFirstVersions lists, per API, the first response version that gained
+// a leading ThrottleTimeMs. A refusal has to be shaped like a real response of
+// the version that was asked for, or the client cannot parse it.
+var throttleFirstVersions = map[int16]int16{
+	ApiKeyProduce:      1,
+	ApiKeyMetadata:     3,
+	ApiKeyCreateTopics: 2,
+	ApiKeyDeleteTopics: 1,
+}
+
+// unsupportedVersionResponse builds an UNSUPPORTED_VERSION reply shaped like a
+// real response of the requested version, so the client can parse the refusal
+// instead of discarding the connection.
+//
+// The correlation ID has already been written by HandleRequest, so this appends
+// only the body.
+func unsupportedVersionResponse(enc *Encoder, apiKey int16, version int16) []byte {
+	if first, hasThrottle := throttleFirstVersions[apiKey]; hasThrottle && version >= first {
+		enc.Int32(0) // ThrottleTimeMs
+	}
+	if arrayFirstResponses[apiKey] {
+		// The v0 layout of these responses is an array with no error code, so
+		// an empty array is the only way to say "nothing here".
+		enc.Int32(0)
+		return enc.Bytes()
+	}
+	enc.Int16(ErrUnsupportedVersion)
+	// Most responses carry an array or partition list after the code. An empty
+	// one keeps the framing valid without claiming any data.
+	enc.Int32(0)
+	return enc.Bytes()
+}
+
+// orBackground substitutes a root context for a nil one.
+func orBackground(ctx context.Context) context.Context {
+	if ctx != nil {
+		return ctx
+	}
+	return context.Background()
+}
+
+// HandleRequest decodes, dispatches and encodes one request.
+//
+// ctx belongs to the connection, not the individual request: it is cancelled
+// when the client goes away, so a long-poll or an object-store read stops
+// costing resources the moment nobody is left to receive the answer.
+func HandleRequest(ctx context.Context, data []byte, store *storage.StorageEngine, session *Session, cfg ServerConfig) ([]byte, error) {
+	// A nil context is a caller bug, but recovering from it turns a panic
+	// into a working request. contextcheck reads this as a discarded
+	// context; there is no parent to inherit when the input is nil.
+	ctx = orBackground(ctx)
 	dec := NewDecoder(data)
 
 	// Parse Header
@@ -112,7 +317,7 @@ func HandleRequest(data []byte, store *storage.StorageEngine, session *Session, 
 	// Check Authentication
 	// If auth is configured, we only allow ApiVersions, SaslHandshake, SaslAuthenticate
 	// OR if session is authenticated.
-	authRequired := authConfig.Username != ""
+	authRequired := cfg.Auth.Username != ""
 	isAuthRelated := apiKey == ApiKeySaslHandshake || apiKey == ApiKeySaslAuthenticate || apiKey == ApiKeyApiVersions
 
 	if authRequired && !session.Authenticated && !isAuthRelated {
@@ -147,23 +352,48 @@ func HandleRequest(data []byte, store *storage.StorageEngine, session *Session, 
 	var resp []byte
 	var errProc error
 
+	// An API this broker does not implement, or a version of one it does not
+	// implement, gets UNSUPPORTED_VERSION -- not a dropped connection. The
+	// old behaviour closed the socket, which turned a single unexpected
+	// request into a reconnect loop with the client retrying the same request.
+	if maxV, known := supportedAPIVersions[apiKey]; !known {
+		log.Printf("Unsupported API Key: %d (version %d) from %s", apiKey, apiVersion, clientID)
+		metrics.UnsupportedAPIVersions.WithLabelValues(apiName(apiKey), strconv.Itoa(int(apiVersion))).Inc()
+		resp = unsupportedVersionResponse(enc, apiKey, apiVersion)
+		errorCode = ErrUnsupportedVersion
+		metrics.ObserveRequest(apiKey, apiVersion, errorCode, startTime, len(resp))
+		return resp, nil
+	} else if apiVersion > maxV {
+		// A client that read ApiVersions would not get here, so this is worth
+		// naming out loud: some client libraries hard-code the versions they
+		// will use rather than negotiating, and when one of them meets a
+		// ceiling it fails with a version-negotiation error naming the API
+		// key rather than anything the broker can see.
+		log.Printf("Refused %s v%d from %s: this broker implements up to v%d", apiName(apiKey), apiVersion, clientID, maxV)
+		metrics.UnsupportedAPIVersions.WithLabelValues(apiName(apiKey), strconv.Itoa(int(apiVersion))).Inc()
+		resp = unsupportedVersionResponse(enc, apiKey, apiVersion)
+		errorCode = ErrUnsupportedVersion
+		metrics.ObserveRequest(apiKey, apiVersion, errorCode, startTime, len(resp))
+		return resp, nil
+	}
+
 	switch apiKey {
 	case ApiKeySaslHandshake:
 		resp, errProc = handleSaslHandshake(dec, enc, apiVersion)
 	case ApiKeySaslAuthenticate:
-		resp, errProc = handleSaslAuthenticate(dec, enc, apiVersion, session, authConfig)
+		resp, errProc = handleSaslAuthenticate(dec, enc, apiVersion, session, cfg)
 	case ApiKeyProduce:
-		resp, errProc = handleProduce(dec, enc, store, apiVersion)
+		resp, errProc = handleProduce(ctx, dec, enc, store, apiVersion, cfg)
 	case ApiKeyFetch:
-		resp, errProc = handleFetch(dec, enc, store, apiVersion)
+		resp, errProc = handleFetch(ctx, dec, enc, store, apiVersion)
 	case ApiKeyListOffsets:
 		resp, errProc = handleListOffsets(dec, enc, store, apiVersion)
 	case ApiKeyApiVersions:
-		resp, errProc = handleApiVersions(dec, enc, apiVersion)
+		resp, errProc = handleApiVersions(dec, enc, apiVersion, cfg)
 	case ApiKeyMetadata:
-		resp, errProc = handleMetadata(dec, enc, store, apiVersion)
+		resp, errProc = handleMetadata(ctx, dec, enc, store, apiVersion, cfg)
 	case ApiKeyFindCoordinator:
-		resp, errProc = handleFindCoordinator(dec, enc, apiVersion)
+		resp, errProc = handleFindCoordinator(dec, enc, apiVersion, cfg)
 	case ApiKeyJoinGroup:
 		resp, errProc = handleJoinGroup(dec, enc, apiVersion)
 	case ApiKeySyncGroup:
@@ -177,15 +407,14 @@ func HandleRequest(data []byte, store *storage.StorageEngine, session *Session, 
 	case ApiKeyOffsetFetch:
 		resp, errProc = handleOffsetFetch(dec, enc, store, apiVersion)
 	case ApiKeyCreateTopics:
-		resp, errProc = handleCreateTopics(dec, enc, store, apiVersion)
+		resp, errProc = handleCreateTopics(ctx, dec, enc, store, apiVersion)
 	case ApiKeyDeleteTopics:
-		resp, errProc = handleDeleteTopics(dec, enc, store, apiVersion)
+		resp, errProc = handleDeleteTopics(ctx, dec, enc, store, apiVersion)
 	case ApiKeyListGroups:
 		resp, errProc = handleListGroups(dec, enc, store, apiVersion)
 	case ApiKeyDescribeGroups:
 		resp, errProc = handleDescribeGroups(dec, enc, store, apiVersion)
 	default:
-		log.Printf("Unsupported API Key: %d", apiKey)
 		errProc = fmt.Errorf("unsupported api key: %d", apiKey)
 	}
 
@@ -205,7 +434,7 @@ func HandleRequest(data []byte, store *storage.StorageEngine, session *Session, 
 
 var GlobalCoordinator = coordinator.NewCoordinator()
 
-func handleFindCoordinator(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
+func handleFindCoordinator(dec *Decoder, enc *Encoder, version int16, cfg ServerConfig) ([]byte, error) {
 	// FindCoordinator Request V0:
 	// GroupID (string)
 
@@ -215,16 +444,26 @@ func handleFindCoordinator(dec *Decoder, enc *Encoder, version int16) ([]byte, e
 	}
 	log.Printf("FindCoordinator: GroupID=%s", groupID)
 
-	// FindCoordinator Response V0:
-	// ErrorCode (int16)
-	// NodeID (int32)
-	// Host (string)
-	// Port (int32)
+	// V1 adds KeyType (int8) and V2 adds an error message.
+	if version >= 1 {
+		if _, err := dec.Int8(); err != nil {
+			return nil, err
+		}
+	}
 
-	enc.Int16(ErrNone)      // No Error
-	enc.Int32(0)            // NodeID 0
-	enc.String("localhost") // Host
-	enc.Int32(19092)        // Port
+	// FindCoordinator Response:
+	//   V0: ErrorCode | NodeID | Host | Port
+	//   V1: ThrottleTimeMs | ErrorCode | ErrorMessage | NodeID | Host | Port
+	if version >= 1 {
+		enc.Int32(0) // ThrottleTimeMs
+	}
+	enc.Int16(ErrNone)
+	if version >= 1 {
+		enc.String("") // ErrorMessage
+	}
+	enc.Int32(0) // NodeID: this agent is the only coordinator
+	enc.String(cfg.AdvertisedHost)
+	enc.Int32(cfg.AdvertisedPort)
 
 	return enc.Bytes(), nil
 }
@@ -265,29 +504,26 @@ func handleJoinGroup(dec *Decoder, enc *Encoder, version int16) ([]byte, error) 
 	// JoinGroup Response V0
 	enc.Int16(errorCode)
 	enc.Int32(generationID)
-	// Kafka returns the *selected* protocol name (e.g. "range" or "roundrobin").
-	// Our coordinator simple picks protocols[0].Name
-	if len(protocols) > 0 {
-		enc.String(protocols[0].Name)
-	} else {
-		enc.String("")
+	selected := GlobalCoordinator.SelectedProtocol(groupID)
+	if selected == "" && len(protocols) > 0 {
+		selected = protocols[0].Name
 	}
+
+	// Kafka returns the group's *selected* protocol, and every member's
+	// metadata for that same protocol. Returning each member's own first
+	// protocol instead would hand the leader the wrong metadata whenever
+	// members disagree on ordering, and it would pick a balancer the group
+	// did not settle on.
+	enc.String(selected)
 	enc.String(leaderID)
 	enc.String(newMemberID)
 
-	// Members Array
 	enc.Int32(int32(len(members)))
 	for _, m := range members {
 		enc.String(m.MemberID)
-		// Protocols array in request had metadata.
-		// We need to return Metadata for the selected protocol.
-		// For MVP, just return the metadata provided by member for this protocol.
-
-		// Find metadata for the selected protocol
 		var meta []byte
 		for _, p := range m.Protocols {
-			// Match selected name?
-			if len(protocols) > 0 && p.Name == protocols[0].Name {
+			if p.Name == selected {
 				meta = p.Metadata
 				break
 			}
@@ -428,121 +664,113 @@ func handleOffsetCommit(dec *Decoder, enc *Encoder, store *storage.StorageEngine
 	return enc.Bytes(), nil
 }
 
+// handleOffsetFetch returns committed offsets for a group.
+//
+// v0 is a bare group id and answers with a flat partition list; v1 adds a
+// topic list to the request and answers with a topic-nested structure. The
+// request version is not optional here: parsing a v0 request as if it were v1
+// reads a topic count out of whatever bytes follow, and answers with a
+// structure the client cannot decode.
 func handleOffsetFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
-	// OffsetFetch Request V1:
-	// GroupID (string)
-	// Topics Array (int32)
-	//   TopicName (string)
-	//   Partitions Array (int32)
-	//     Partition (int32)
+	groupID, err := dec.String()
+	if err != nil {
+		return nil, err
+	}
 
-	groupID, _ := dec.String()
-	count, _ := dec.Int32()
+	if version == 0 {
+		// Response V0: offsets[] of (partition, offset, metadata, error)
+		enc.Int32(0)
+		return enc.Bytes(), nil
+	}
+
+	count, err := dec.Int32()
+	if err != nil {
+		return nil, err
+	}
 
 	log.Printf("OffsetFetch: Group=%s Count=%d", groupID, count)
 
-	// Response must mirror the request structure with offsets
-	enc.Int32(count) // Number of topics
+	// Response V1: topics[] of (name, partitions[] of
+	//              (partition, offset, metadata, error))
+	enc.Int32(count)
 
 	for i := 0; i < int(count); i++ {
-		topic, _ := dec.String()
+		topic, err := dec.String()
+		if err != nil {
+			return nil, err
+		}
 		enc.String(topic)
 
-		partitionCount, _ := dec.Int32()
+		partitionCount, err := dec.Int32()
+		if err != nil {
+			return nil, err
+		}
 		enc.Int32(partitionCount)
 
 		for j := 0; j < int(partitionCount); j++ {
-			partition, _ := dec.Int32()
+			partition, err := dec.Int32()
+			if err != nil {
+				return nil, err
+			}
 
-			// LOAD OFFSET
 			offset, err := GlobalCoordinator.FetchOffset(store, groupID, topic, partition)
+			if err != nil || offset < 0 {
+				// -1 is the protocol's "no committed offset", which is what
+				// tells the consumer to apply auto.offset.reset.
+				offset = -1
+			}
 
 			enc.Int32(partition)
-			if err != nil || offset == -1 {
-				enc.Int64(-1) // Unknown
-				enc.String("")
-				enc.Int16(ErrNone)
-			} else {
-				enc.Int64(offset)
-				enc.String("") // Metadata
-				enc.Int16(ErrNone)
-			}
+			enc.Int64(offset)
+			enc.String("") // Metadata
+			enc.Int16(ErrNone)
 		}
 	}
 
 	return enc.Bytes(), nil
 }
 
-func handleApiVersions(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
+// handleApiVersions answers the negotiation request.
+//
+// Only v0 is answered. A flexible-version client (v3+) expects a throttle
+// field and compact strings, so a v0-shaped body is not decodable; replying
+// UNSUPPORTED_VERSION in the v0 shape is the conventional way to make a client
+// retry at v0, and that is what librdkafka does.
+func handleApiVersions(dec *Decoder, enc *Encoder, version int16, cfg ServerConfig) ([]byte, error) {
 	if version > 0 {
-		// We only support V0.
-		// If client asks for V1+, we return UnsupportedVersion.
-		// Problem: Client expects response format of V(requested).
-		// Sending V0 format might crash client.
-		// But for ApiVersions, if we return error, client should handle it.
-		// Let's try returning Error and empty/safe body.
-
 		enc.Int16(ErrUnsupportedVersion)
-		// If V3, it expects Throttle(32) + CompactArray.
-		// If we write 0 (Throttle) + 0 (ArrayLen), it might parse.
-		// But we don't know EXACTLY what version was requested easily without mapping every version.
-		// Let's just try sending V0 format with Error.
-
-		// V0: Error(16) + Array(32)
-		enc.Int32(0) // Empty array
+		enc.Int32(0) // empty array
 		return enc.Bytes(), nil
 	}
 
-	// ApiVersions Response V0:
-	// ErrorCode (int16)
-	// ApiKeys (Array)
+	// Response V0: ErrorCode (int16) | ApiKeys (array of key/min/max)
+	enc.Int16(ErrNone)
 
-	enc.Int16(ErrNone) // No Error
-
-	// Array length: 5
-	// Listing: Produce, Fetch, ListOffsets, Metadata, ApiVersions
-	// Supported: Produce(0-3), Fetch(0-3), ListOffsets(0-1), Metadata(0-3), ApiVersions(0)
-	// + Group APIs: OffsetCommit(0), OffsetFetch(0-1), FindCoordinator(0), JoinGroup(0), SyncGroup(0), Heartbeat(0), LeaveGroup(0)
-	// + SASL: SaslHandshake(0-1), SaslAuthenticate(0)
-
-	numKeys := 18
-	enc.Int32(int32(numKeys)) // Array length is int32 usually?
-	// careful: Array length in V0 is int32.
-
-	// Function to write entry
-	writeEntry := func(key int16, minV, maxV int16) {
-		enc.Int16(key)
-		enc.Int16(minV)
-		enc.Int16(maxV)
+	entries := make([][3]int16, 0, len(supportedAPIVersions))
+	for key, maxV := range supportedAPIVersions {
+		// Advertising SASL when no mechanism is configured invites clients to
+		// attempt a handshake against a broker with nothing to offer.
+		if !cfg.Auth.Required() && (key == ApiKeySaslHandshake || key == ApiKeySaslAuthenticate) {
+			continue
+		}
+		entries = append(entries, [3]int16{key, 0, maxV})
 	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i][0] < entries[j][0] })
 
-	writeEntry(ApiKeyProduce, 0, 3)
-	writeEntry(ApiKeyFetch, 0, 3)
-	writeEntry(ApiKeyListOffsets, 0, 1)
-	writeEntry(ApiKeyMetadata, 0, 3)
-	writeEntry(ApiKeyApiVersions, 0, 0)
-	writeEntry(ApiKeyOffsetCommit, 0, 0)
-	writeEntry(ApiKeyOffsetFetch, 0, 1)
-	writeEntry(ApiKeyFindCoordinator, 0, 0)
-	writeEntry(ApiKeyJoinGroup, 0, 1)
-	writeEntry(ApiKeySyncGroup, 0, 0)
-	writeEntry(ApiKeyHeartbeat, 0, 0)
-	writeEntry(ApiKeyLeaveGroup, 0, 0)
-	writeEntry(ApiKeyCreateTopics, 0, 0)
-	writeEntry(ApiKeyDeleteTopics, 0, 0)
-	writeEntry(ApiKeyListGroups, 0, 0)
-	writeEntry(ApiKeyDescribeGroups, 0, 0)
-	writeEntry(ApiKeySaslHandshake, 0, 1)
-	writeEntry(ApiKeySaslAuthenticate, 0, 0)
+	enc.Int32(int32(len(entries)))
+	for _, e := range entries {
+		enc.Int16(e[0])
+		enc.Int16(e[1])
+		enc.Int16(e[2])
+	}
 
 	return enc.Bytes(), nil
 }
 
-func handleMetadata(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
-	// Metadata Request V0-V3:
-	// Topics (Array of Strings). Empty array means "all topics".
-	// V4+ adds allow_auto_topic_creation.
-
+func handleMetadata(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16, cfg ServerConfig) ([]byte, error) {
+	// Metadata Request V0-V6:
+	//   V0-V5: Topics (array of string). An empty array means "all topics".
+	//   V6:    adds allow_auto_topic_creation (boolean, one byte).
 	count, err := dec.Int32()
 	if err != nil {
 		return nil, err
@@ -550,40 +778,55 @@ func handleMetadata(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ve
 
 	var requestedTopics []string
 	for i := 0; i < int(count); i++ {
-		t, _ := dec.String()
+		t, err := dec.String()
+		if err != nil {
+			return nil, err
+		}
 		requestedTopics = append(requestedTopics, t)
 	}
+	if version >= 6 {
+		if _, err := dec.Int8(); err != nil { // allow_auto_topic_creation
+			return nil, err
+		}
+	}
 
-	// Metadata Response V3:
-	// ThrottleTimeMs (int32)
-	// Brokers (Array)
-	// ClusterId (Nullable String)
-	// ControllerId (int32)
-	// TopicMetadata (Array)
+	// Metadata Response, in the order the schema declares its fields:
+	//   V0:    Brokers | Topics
+	//   V1:    Brokers | ControllerId | Topics
+	//   V2:    Brokers | ClusterId | ControllerId | Topics
+	//   V3+:   ThrottleTimeMs | Brokers | ClusterId | ControllerId | Topics
+	//
+	// Kafka serialises fields in declaration order, so this ordering is the
+	// contract.
 
 	if version >= 3 {
 		enc.Int32(0) // ThrottleTimeMs
 	}
 
 	// 1. Brokers
-	// We are a single-node broker for now. ID=0.
 	enc.Int32(1) // Broker Count
 
-	// Broker 0
-	enc.Int32(0)            // NodeID
-	enc.String("localhost") // Host
-	enc.Int32(19092)        // Port
+	// The advertised address, not the bind address: this is what the client
+	// will dial. It has to be reachable from the client, which a loopback
+	// address is not.
+	enc.Int32(0) // NodeID
+	enc.String(cfg.AdvertisedHost)
+	enc.Int32(cfg.AdvertisedPort)
 
 	if version >= 1 {
-		enc.String("") // Rack (empty instead of null)
+		enc.String("") // Rack
 	}
 
+	// cluster_id arrived in Metadata v2 and is nullable from v2 onwards.
+	// Emitting it at v1, as an earlier version of this code did, puts four
+	// bytes where a v1 client expects the controller id and desynchronises
+	// every following field.
 	if version >= 2 {
-		enc.String("kimistore-cluster") // ClusterID
+		enc.String(clusterID)
 	}
 
 	if version >= 1 {
-		enc.Int32(0) // ControllerID (Node 0)
+		enc.Int32(0) // ControllerID
 	}
 
 	// 2. Topic Metadata
@@ -591,10 +834,30 @@ func handleMetadata(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ve
 	topicsToReturn := requestedTopics
 	if count <= 0 {
 		topicsToReturn = allTopics
+	} else if cfg.AutoCreateTopics {
+		// Kafka creates a topic when a client asks about one that does not
+		// exist, and clients depend on it: a producer needs partitions with a
+		// known leader before it can write anything, and without this it
+		// fails with "unknown partition leader" rather than producing.
+		for _, tName := range requestedTopics {
+			if store.TopicExists(tName) {
+				continue
+			}
+			partitions := cfg.AutoCreatePartitions
+			if partitions < 1 {
+				partitions = 1
+			}
+			if err := store.CreateTopicContext(ctx, tName, partitions); err != nil {
+				log.Printf("Metadata: could not auto-create topic %q: %v", tName, err)
+			} else {
+				log.Printf("Metadata: auto-created topic %q with %d partition(s)", tName, partitions)
+			}
+		}
 	}
 	if len(topicsToReturn) == 0 {
-		// Fallback for tests if store is empty
-		topicsToReturn = []string{"bench-topic", "bench-multi"}
+		// Nothing known yet. An empty topic list is a valid answer; inventing
+		// placeholder topics would hand clients partitions that do not exist.
+		topicsToReturn = nil
 	}
 
 	enc.Int32(int32(len(topicsToReturn)))
@@ -608,10 +871,14 @@ func handleMetadata(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ve
 
 		partitions, err := store.GetPartitions(tName)
 		if err != nil {
-			partitions = []int32{}
+			partitions = nil
 		}
 		if len(partitions) == 0 {
-			partitions = []int32{0}
+			// An unknown topic has no partitions. Reporting a synthetic
+			// partition 0 would make clients hash onto a partition the broker
+			// would then create on first write, outside any assignment.
+			enc.Int32(0)
+			continue
 		}
 
 		enc.Int32(int32(len(partitions)))
@@ -619,12 +886,16 @@ func handleMetadata(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ve
 			enc.Int16(0)   // PartitionErrorCode
 			enc.Int32(pid) // PartitionID
 			enc.Int32(0)   // Leader (Node 0)
-			// Replicas
-			enc.Int32(1) // Count
+			if version >= 7 {
+				enc.Int32(0) // LeaderEpoch
+			}
+			enc.Int32(1) // Replica Count
 			enc.Int32(0) // Node 0
-			// Isr
-			enc.Int32(1) // Count
+			enc.Int32(1) // Isr Count
 			enc.Int32(0) // Node 0
+			if version >= 5 {
+				enc.Int32(0) // OfflineReplicas
+			}
 		}
 	}
 
@@ -658,7 +929,7 @@ func handleSaslHandshake(dec *Decoder, enc *Encoder, version int16) ([]byte, err
 	return enc.Bytes(), nil
 }
 
-func handleSaslAuthenticate(dec *Decoder, enc *Encoder, version int16, session *Session, authConfig AuthConfig) ([]byte, error) {
+func handleSaslAuthenticate(dec *Decoder, enc *Encoder, version int16, session *Session, cfg ServerConfig) ([]byte, error) {
 	// SaslAuthenticate Request V0:
 	// AuthBytes (bytes)
 
@@ -700,16 +971,17 @@ func handleSaslAuthenticate(dec *Decoder, enc *Encoder, version int16, session *
 		return enc.Bytes(), nil
 	}
 
-	log.Printf("SaslAuthenticate: user=%s", username)
-
-	if username == authConfig.Username && password == authConfig.Password {
+	if cfg.Auth.Required() && subtle.ConstantTimeCompare([]byte(username), []byte(cfg.Auth.Username)) == 1 &&
+		subtle.ConstantTimeCompare([]byte(password), []byte(cfg.Auth.Password)) == 1 {
 		session.Authenticated = true
 		session.User = username
 		enc.Int16(ErrNone)
 		enc.String("")    // No error message
 		enc.PutBytes(nil) // No auth bytes
 	} else {
-		log.Printf("SaslAuthenticate: Authentication failed for user=%s", username)
+		// Do not log the attempted username on a failed handshake: this is
+		// attacker-controlled input on an unauthenticated path.
+		log.Printf("SaslAuthenticate: authentication failed")
 		enc.Int16(ErrSaslAuthenticationFailed)
 		enc.String("Authentication failed")
 		enc.PutBytes(nil)
@@ -717,3 +989,6 @@ func handleSaslAuthenticate(dec *Decoder, enc *Encoder, version int16, session *
 
 	return enc.Bytes(), nil
 }
+
+// Required reports whether SASL authentication is configured.
+func (a AuthConfig) Required() bool { return a.Username != "" }

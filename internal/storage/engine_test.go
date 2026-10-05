@@ -249,13 +249,26 @@ func TestDeleteTopicS3Cleanup(t *testing.T) {
 	otherKey := "other-topic/0/00000000000000000000.log"
 	mockStore.Put(context.Background(), otherKey, strings.NewReader("other-log-data"))
 
-	// Verify they are in MockStore
-	mockStore.Mu.Lock()
-	if len(mockStore.Data) != 3 {
-		mockStore.Mu.Unlock()
-		t.Fatalf("Expected 3 objects in mock S3 store, got %d", len(mockStore.Data))
+	// Verify the three topic objects are present. The engine also writes its
+	// own bookkeeping objects (checkpoint, manifest) under _meta/, so count
+	// only what belongs to the topic under test.
+	countTopicObjects := func(topic string) int {
+		mockStore.Mu.Lock()
+		defer mockStore.Mu.Unlock()
+		n := 0
+		for k := range mockStore.Data {
+			if strings.HasPrefix(k, topic+"/") {
+				n++
+			}
+		}
+		return n
 	}
-	mockStore.Mu.Unlock()
+	if n := countTopicObjects(topic); n != 2 {
+		t.Fatalf("Expected 2 objects for %s in mock S3 store, got %d", topic, n)
+	}
+	if n := countTopicObjects("other-topic"); n != 1 {
+		t.Fatalf("Expected 1 object for other-topic, got %d", n)
+	}
 
 	// Call DeleteTopic
 	err = se.DeleteTopic(topic)

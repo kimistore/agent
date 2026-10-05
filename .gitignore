@@ -1,5 +1,17 @@
+### Test scratch binaries
+
+These were interactive probes kept in the module by accident. The durable
+checks they approximated are `go test ./internal/storage/s3/...` (object-store
+semantics, driven through the real AWS client against `test/s3shim.py`) and
+`make e2e` (the Mimir end-to-end run).
+
 *.log
 /agent
 .claude/
+.antigravitycli/
 conductor/
 /kimistore-agent
+/bin/
+coverage.out
+coverage.html
+/tmp-storage-test-wal/

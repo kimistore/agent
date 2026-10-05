@@ -19,6 +19,8 @@
 package protocol
 
 import (
+	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"time"
@@ -28,7 +30,7 @@ import (
 	"kimistore/internal/storage/wal"
 )
 
-func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
+func handleProduce(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16, _ ServerConfig) ([]byte, error) {
 	// Produce Request V3:
 	// TransactionalID (Nullable String)
 	// Acks (int16)
@@ -69,9 +71,15 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 		return nil, err
 	}
 
-	// We will build the response as we process.
-	// Produce Response V0:
-	// TopicArray
+	// Produce Response:
+	//   V0: Responses
+	//   V1+: Responses | ThrottleTimeMs
+	//
+	// ThrottleTimeMs comes *after* the topic array. That is the order in
+	// ProduceResponse.json, and Kafka serialises fields in declaration order,
+	// so the trailing position is the correct one.
+	// ThrottleTimeMs is written after the topic array, once it is known; see
+	// the response schema note below.
 
 	enc.Int32(count) // Response Topic Count matches Request
 
@@ -131,16 +139,19 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 			batchData := dec.data[dec.off : dec.off+int(msgSetSize)]
 			dec.off += int(msgSetSize)
 
-			// APPEND TO STORAGE
-			// Parse batch to count messages (MessageSet V0/V1)
+			// The record count is what the log end offset advances by, so it
+			// has to be exactly right. CountMessageSet handles legacy
+			// messages, compressed wrappers, and RecordBatch V2 in both the
+			// bare and the message-set-wrapped encodings.
 			recordCount := wal.CountMessageSet(batchData)
 			if recordCount == 0 {
-				// Empty batch? or parse error?
-				// Just fallback to 1 to avoid sticking offset
+				// A blob we could not frame still holds at least one record;
+				// returning 0 would stall the offset and make every later
+				// write collide with it.
 				recordCount = 1
 			}
 
-			offset, err := store.Append(topic, partition, batchData, recordCount, durable)
+			offset, err := store.AppendContext(ctx, topic, partition, batchData, recordCount, durable)
 
 			// Write Response Partition
 			enc.Int32(partition)
@@ -163,13 +174,14 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 		}
 	}
 
-	// ThrottleTimeMs (int32) - V1+
-	if version >= 1 {
-		enc.Int32(0)
-	}
-
 	if acks == 0 {
+		// acks=0 means the producer does not want a response. The batch is
+		// already written; there is simply nothing to send back.
 		return nil, nil
+	}
+	if version >= 1 {
+		// Written after the topic array, per the response schema.
+		enc.Int32(0) // ThrottleTimeMs
 	}
 	return enc.Bytes(), nil
 }
@@ -178,6 +190,11 @@ func handleProduce(dec *Decoder, enc *Encoder, store *storage.StorageEngine, ver
 type fetchPart struct {
 	partition int32
 	offset    int64
+	// maxBytes is this partition's share of the response, from
+	// partition_max_bytes. It is the per-partition ceiling a client uses to
+	// size its receive buffers, so returning more than this makes a
+	// well-behaved client overrun them.
+	maxBytes int32
 }
 
 // fetchRequest is a decoded Fetch request. Decoding is separated from
@@ -189,9 +206,6 @@ type fetchRequest struct {
 	maxWaitMs     int32
 	totalMaxBytes int32
 	partsByTopic  []fetchTopic
-
-	// responseBytes accumulates bytes returned, to enforce totalMaxBytes.
-	responseBytes int32
 }
 
 type fetchTopic struct {
@@ -204,7 +218,45 @@ type fetchTopic struct {
 // shrink it rather than wait it out.
 var maxFetchWaitMs int32 = 1000
 
-func handleFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
+// defaultFetchBudget is the response ceiling used when a client sends no
+// MaxBytes, and the per-partition floor so a partition is never starved.
+const defaultFetchBudget = int32(50 * 1024 * 1024)
+
+// maxRecordsPerPartition caps how many stored records a single Fetch returns
+// for one partition, or zero for no cap.
+//
+// Filling the client's byte budget in one round trip is what stops a consumer
+// from becoming a request loop, so the default is no cap. The knob exists
+// because a client that cannot decode a multi-batch response would otherwise
+// silently see only the first one; set it to 1 for such clients.
+var maxRecordsPerPartition = 0
+
+// truncateToBlobs cuts a fetched blob after the first n message set entries.
+func truncateToBlobs(data []byte, n int64) []byte {
+	if n <= 0 {
+		return data
+	}
+	pos := 0
+	for i := int64(0); i < n; i++ {
+		if pos+msgSetHeaderLen > len(data) {
+			break
+		}
+		sz := int(int32(binary.BigEndian.Uint32(data[pos+8 : pos+12])))
+		if sz < 0 || pos+msgSetHeaderLen+sz > len(data) {
+			break
+		}
+		pos += msgSetHeaderLen + sz
+	}
+	if pos <= 0 || pos >= len(data) {
+		return data
+	}
+	return data[:pos]
+}
+
+// msgSetHeaderLen is the size of a message set entry header.
+const msgSetHeaderLen = 12
+
+func handleFetch(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
 	req, err := decodeFetch(dec, version)
 	if err != nil {
 		return nil, err
@@ -221,7 +273,7 @@ func handleFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, versi
 		if wait > maxFetchWaitMs {
 			wait = maxFetchWaitMs
 		}
-		waitForData(store, wait)
+		waitForData(ctx, store, wait)
 	}
 
 	// Response header. ThrottleTimeMs leads the body for V1+.
@@ -230,56 +282,115 @@ func handleFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, versi
 	}
 	enc.Int32(int32(len(req.partsByTopic)))
 
+	// remaining is what the response may still spend. A client's MaxBytes is
+	// the size of the receive buffer it has allocated, so overrunning it
+	// causes the client to drop the connection rather than the broker to be
+	// helpful.
+	remaining := req.totalMaxBytes
+	if remaining <= 0 {
+		remaining = defaultFetchBudget
+	}
+
 	for _, ft := range req.partsByTopic {
 		enc.String(ft.topic)
 		enc.Int32(int32(len(ft.parts)))
 
 		for _, p := range ft.parts {
-			// Enforce totalMaxBytes if V3+
-			if req.totalMaxBytes > 0 && req.responseBytes >= req.totalMaxBytes {
-				enc.Int32(p.partition)
-				enc.Int16(0) // No Error
-				enc.Int64(store.HighWaterMark(ft.topic, p.partition))
-				enc.Int32(0) // MessageSetSize 0
-				continue
-			}
-
 			hw := store.HighWaterMark(ft.topic, p.partition)
+			// This broker replicates nothing, so the last stable offset is the
+			// log end. log_start_offset is the retention-aware earliest offset,
+			// which is what lets a client find the log start without a
+			// separate ListOffsets round trip.
+			lastStable := hw
+			logStart := store.LogStartOffset(ft.topic, p.partition)
 
-			// Fast path: already at the end of the log. Answer without
-			// touching storage, so a caught-up consumer costs no S3 calls.
-			if p.offset == hw {
-				enc.Int32(p.partition)
-				enc.Int16(0)  // No Error
-				enc.Int64(hw) // HighwaterMark
-				enc.Int32(0)  // MessageSetSize 0
-				continue
+			// Budget for this partition: the smaller of its own request and
+			// whatever is left of the response budget.
+			budget := int64(remaining)
+			if p.maxBytes > 0 && int64(p.maxBytes) < budget {
+				budget = int64(p.maxBytes)
 			}
-			if p.offset > hw {
+			if budget <= 0 {
+				budget = 1 // always return at least the partition header
+			}
+
+			switch {
+			case p.offset == hw:
+				// Caught up. Answer without touching storage, so a
+				// caught-up consumer costs no object store calls.
 				enc.Int32(p.partition)
-				enc.Int16(1) // OffsetOutOfRange
+				enc.Int16(ErrNone)
 				enc.Int64(hw)
-				enc.Int32(0)
+				encodeFetchTail(enc, version, lastStable, logStart, nil)
+				continue
+			case p.offset > hw:
+				enc.Int32(p.partition)
+				enc.Int16(ErrOffsetOutOfRange)
+				enc.Int64(hw)
+				encodeFetchTail(enc, version, lastStable, logStart, nil)
 				continue
 			}
 
-			data, rerr := store.Read(ft.topic, p.partition, p.offset)
+			// Stop if the log start has moved past the requested offset, and
+			// say so with the real log start so the client can reset to
+			// something that exists. Reporting OffsetOutOfRange against a
+			// hardcoded log start of 0 is what turns a consumer that resets to
+			// "earliest" into an infinite retry loop.
+			if logStart > 0 && p.offset < logStart {
+				enc.Int32(p.partition)
+				enc.Int16(ErrOffsetOutOfRange)
+				enc.Int64(hw)
+				encodeFetchTail(enc, version, lastStable, logStart, nil)
+				continue
+			}
+
+			data, _, rerr := store.ReadBatchContext(ctx, ft.topic, p.partition, p.offset, budget)
+			if rerr == nil && maxRecordsPerPartition > 0 {
+				data = truncateToBlobs(data, int64(maxRecordsPerPartition))
+			}
 
 			enc.Int32(p.partition)
 			if rerr != nil {
-				enc.Int16(1) // OffsetOutOfRange
+				enc.Int16(ErrOffsetOutOfRange)
 				enc.Int64(hw)
-				enc.Int32(0)
-			} else {
-				enc.Int16(0) // No error
-				enc.Int64(hw)
-				enc.PutBytes(data)
-				req.responseBytes += int32(len(data))
+				encodeFetchTail(enc, version, lastStable, logStart, nil)
+				continue
 			}
+			enc.Int16(ErrNone)
+			enc.Int64(hw)
+			// The trailing fields vary by version and must always be written
+			// in the same order the protocol defines, so they are emitted in
+			// one place rather than per branch.
+			if version >= 4 {
+				enc.Int64(lastStable)
+			}
+			if version >= 5 {
+				enc.Int64(logStart)
+			}
+			if version >= 4 {
+				enc.Int32(0) // aborted transactions: none, this broker has none
+			}
+			enc.PutBytes(data)
+			remaining -= int32(len(data))
 		}
 	}
 
 	return enc.Bytes(), nil
+}
+
+// encodeFetchTail writes the per-partition fields that follow the high
+// watermark, then an empty record set.
+func encodeFetchTail(enc *Encoder, version int16, lastStable, logStart int64, records []byte) {
+	if version >= 4 {
+		enc.Int64(lastStable)
+	}
+	if version >= 5 {
+		enc.Int64(logStart)
+	}
+	if version >= 4 {
+		enc.Int32(0) // aborted transactions
+	}
+	enc.PutBytes(records)
 }
 
 // anyDataAvailable reports whether at least one requested partition has
@@ -299,7 +410,7 @@ func anyDataAvailable(store *storage.StorageEngine, req *fetchRequest) bool {
 // waitForData blocks until an append is signalled or the budget expires. The
 // caller re-checks availability afterwards, since the signal is a broadcast
 // and may have been triggered by an append to a different partition.
-func waitForData(store *storage.StorageEngine, waitMs int32) {
+func waitForData(ctx context.Context, store *storage.StorageEngine, waitMs int32) {
 	metrics.FetchLongPolls.Inc()
 
 	timer := time.NewTimer(time.Duration(waitMs) * time.Millisecond)
@@ -310,6 +421,11 @@ func waitForData(store *storage.StorageEngine, waitMs int32) {
 		metrics.FetchLongPollWakeups.WithLabelValues("data").Inc()
 	case <-timer.C:
 		metrics.FetchLongPollWakeups.WithLabelValues("timeout").Inc()
+	case <-ctx.Done():
+		// The client is gone, so there is nobody left to answer. Parking for
+		// the rest of the wait would hold a handler goroutine and an
+		// in-flight slot on a connection that has already moved on.
+		metrics.FetchLongPollWakeups.WithLabelValues("cancelled").Inc()
 	}
 }
 
@@ -340,6 +456,13 @@ func decodeFetch(dec *Decoder, version int16) (*fetchRequest, error) {
 		req.totalMaxBytes = totalMaxBytes
 	}
 
+	// V4+ adds IsolationLevel (int8) after MaxBytes.
+	if version >= 4 {
+		if _, err := dec.Int8(); err != nil {
+			return nil, err
+		}
+	}
+
 	count, err := dec.Int32()
 	if err != nil {
 		return nil, err
@@ -364,10 +487,11 @@ func decodeFetch(dec *Decoder, version int16) (*fetchRequest, error) {
 			if err != nil {
 				return nil, err
 			}
-			if _, err := dec.Int32(); err != nil { // partitionMaxBytes
+			partitionMaxBytes, err := dec.Int32()
+			if err != nil {
 				return nil, err
 			}
-			ft.parts = append(ft.parts, fetchPart{partition: partition, offset: offset})
+			ft.parts = append(ft.parts, fetchPart{partition: partition, offset: offset, maxBytes: partitionMaxBytes})
 		}
 		req.partsByTopic = append(req.partsByTopic, ft)
 	}

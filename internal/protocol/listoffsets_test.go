@@ -166,13 +166,10 @@ func TestListOffsets(t *testing.T) {
 			t.Fatalf("handleListOffsets failed: %v", err)
 		}
 
-		// Decode V1 response (has ThrottleTimeMs at start)
+		// Decode V1 response. There is no throttle field in v1, so the
+		// topic count comes first; reading a throttle here is what shifted
+		// every later field by four bytes.
 		respDec := NewDecoder(respBytes)
-
-		throttleTime, _ := respDec.Int32()
-		if throttleTime != 0 {
-			t.Errorf("Expected throttle time 0, got %d", throttleTime)
-		}
 
 		topicCount, _ := respDec.Int32()
 		if topicCount != 1 {
@@ -227,7 +224,9 @@ func TestListOffsets(t *testing.T) {
 		}
 
 		respDec := NewDecoder(respBytes)
-		respDec.Int32()  // throttle time
+		// ListOffsets v1 has no throttle field; it was added in v2. Skipping
+		// it here is what a conformant client does, and asserting on it is
+		// what hid the bug this replaced.
 		respDec.Int32()  // topic count
 		respDec.String() // topic
 		respDec.Int32()  // partition count
@@ -259,7 +258,9 @@ func TestListOffsets(t *testing.T) {
 		}
 
 		respDec := NewDecoder(respBytes)
-		respDec.Int32()  // throttle time
+		// ListOffsets v1 has no throttle field; it was added in v2. Skipping
+		// it here is what a conformant client does, and asserting on it is
+		// what hid the bug this replaced.
 		respDec.Int32()  // topic count
 		respDec.String() // topic
 		respDec.Int32()  // partition count
