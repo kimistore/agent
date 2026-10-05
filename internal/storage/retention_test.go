@@ -231,11 +231,12 @@ func TestRetention_DisabledByDefault(t *testing.T) {
 
 	se.applyRetention()
 
-	// The background rehydration goroutine does list _offsets/ at startup, but
-	// retention itself—with no policy configured—must not list anything.
+	// The background rehydration goroutine lists _offsets/ at startup, and
+	// recovery lists _topics/ to find per-partition manifests. Retention
+	// itself--with no policy configured--must not list anything else.
 	calls := store.listCallsSnapshot()
 	for _, prefix := range calls {
-		if prefix != "_offsets/" {
+		if prefix != "_offsets/" && prefix != "_topics/" {
 			t.Errorf("unexpected listing call %q when retention is disabled", prefix)
 		}
 	}

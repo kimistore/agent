@@ -69,6 +69,12 @@ type Config struct {
 	// each other's segments.
 	Lease LeaseConfig
 
+	// AgentID is this agent's stable durable identity. It namespaces the
+	// checkpoint object (see storage.WithAgentID) so two agents sharing a
+	// bucket cannot overwrite each other's. Empty selects the hostname, which
+	// is stable across a restart of the same agent.
+	AgentID string
+
 	// RequireLease makes an object store that cannot enforce conditional
 	// writes a startup failure instead of a warning.
 	RequireLease bool
@@ -122,6 +128,7 @@ func FromEnv() Config {
 
 		S3Timeout:    time.Duration(envInt64("KIMISTORE_S3_TIMEOUT_MS", 30_000)) * time.Millisecond,
 		RequireLease: envBool("KIMISTORE_REQUIRE_LEASE", true),
+		AgentID:      os.Getenv("KIMISTORE_AGENT_ID"),
 
 		Lease: LeaseConfig{
 			Enabled: envBool("KIMISTORE_WRITER_LEASE", true),
@@ -206,6 +213,7 @@ func (c Config) Log() {
 		c.ListenAddr, c.AdvertisedHost, c.AdvertisedPort, c.MetricsAddr, c.WALDir, c.S3Bucket, c.S3Timeout)
 	log.Printf("Lease: enabled=%v key=%q holder=%s ttl=%s requireConditionalWrites=%v",
 		c.Lease.Enabled, orDefault(c.Lease.Key, "(default)"), orDefault(c.Lease.Holder, "hostname/pid"), c.Lease.TTL, c.RequireLease)
+	log.Printf("Agent: id=%s (namespaces the checkpoint object)", orDefault(c.AgentID, "hostname"))
 }
 
 func orDefault(v, def string) string {

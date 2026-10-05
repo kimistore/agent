@@ -294,7 +294,7 @@ func TestCheckpointRestoresCommittedOffsets(t *testing.T) {
 	}
 	se.Close()
 
-	raw, err := store.Get(context.Background(), "_meta/checkpoint.json")
+	raw, err := store.Get(context.Background(), se.checkpointKey())
 	if err != nil {
 		t.Fatalf("checkpoint missing: %v", err)
 	}

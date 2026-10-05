@@ -87,6 +87,12 @@ Every object-store call is bounded by `KIMISTORE_S3_TIMEOUT_MS`, and the request
 
 On shutdown, in-flight calls are cancelled once the final offset flush and checkpoint have landed, so a wedged store cannot hold the process open.
 
+### 2d. Durable Metadata Layout
+The log position and the checkpoint are not bucket-global singletons, so a second agent cannot overwrite them:
+
+* **Per-partition manifests**: `_topics/<topic>/_manifest/<partition>` holds one partition's log end offset, log start offset and segment inventory, stamped with the writer epoch. An agent rewrites only the partitions whose position moved -- one PUT per changed partition -- so a checkpoint no longer republishes the whole log, and recovery discovers the partitions with one bounded `LIST` under `_topics/`.
+* **Per-agent checkpoint**: `_agents/<agent-id>/checkpoint.json` carries committed offsets and coordinator state. Namespacing it by `KIMISTORE_AGENT_ID` (default: hostname) is what keeps a second agent sharing the bucket from replacing the first one's checkpoint. A bucket written by an older agent keeps its single `_meta/checkpoint.json` and `_meta/manifest.json`; they are read once on upgrade and re-persisted in the new shape.
+
 ## 📡 Supported Kafka APIs
 
 The following Kafka API Keys are currently implemented:
@@ -142,6 +148,7 @@ protocol bugs were found.
 | `KIMISTORE_WRITER_ID` | hostname/pid | Identifies this writer in the claim |
 | `KIMISTORE_LEASE_TTL_MS` | `60000` | How long a claim survives without renewal |
 | `KIMISTORE_REQUIRE_LEASE` | `true` | Refuse to start if the store cannot fence writers |
+| `KIMISTORE_AGENT_ID` | hostname | Stable identity that namespaces this agent's checkpoint object |
 
 The default configuration needs no flags to work with Grafana Mimir 3.0, and
 every advertised protocol version is implemented exactly as the Kafka message

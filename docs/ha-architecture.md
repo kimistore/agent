@@ -279,6 +279,14 @@ Ordered cheapest-risk-first. Each phase is independently shippable.
 | **5** | HRW group coordination + fencing + `NOT_COORDINATOR`; stop persisting group state | Group HA without durable state (D-4) | Medium |
 | **6** | Idempotent producer + sequence dedup; offset monotonic guard | Makes D2 safe under retry; closes duplicate window | High |
 
+> **Phase 0 is implemented.** The durable position now lives in per-partition
+> manifests under `_topics/<topic>/_manifest/<partition>`, written incrementally
+> (only partitions whose position moved), and the checkpoint is namespaced per
+> agent at `_agents/<agentID>/checkpoint.json`. A bucket written by an older
+> agent still has its bucket-global `_meta/checkpoint.json` and
+> `_meta/manifest.json`; those are read once on upgrade and re-persisted in the
+> new shape. New configuration: `KIMISTORE_AGENT_ID` (default: hostname).
+
 Pull **6** forward to sit immediately with **1** where possible: shipping D2
 without idempotence substitutes a worse failure mode for the one it removes.
 

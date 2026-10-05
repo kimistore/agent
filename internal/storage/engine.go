@@ -29,7 +29,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -108,6 +107,22 @@ type StorageEngine struct {
 	metadataCache *MetadataCache
 	coordinator   *coordinator.Coordinator
 
+	// agentID names this agent's durable metadata namespace. The checkpoint
+	// lives under _agents/<agentID>/, so two agents sharing a bucket cannot
+	// overwrite each other's checkpoint. See WithAgentID.
+	agentID string
+
+	// manifestDirty tracks partitions whose durable manifest is behind the
+	// in-memory state, each with the generation at which it was marked. Only
+	// dirty partitions are rewritten, so a checkpoint costs one PUT per
+	// changed partition rather than one per partition.
+	manifestMu    sync.Mutex
+	manifestDirty map[string]uint64
+	manifestGen   uint64
+	// manifestSaved flips once the first full save has completed, so a cold
+	// start writes a manifest for every recovered partition exactly once.
+	manifestSaved atomic.Bool
+
 	// dataCh is a broadcast latch signalled on every successful append, so a
 	// long-polling Fetch can park until there is something to read instead of
 	// returning empty immediately and being re-polled at full speed. Guarded
@@ -140,6 +155,30 @@ func WithOperationTimeout(d time.Duration) Option {
 	}
 }
 
+// WithAgentID sets the durable identity used to namespace this agent's
+// checkpoint. It must be stable across restarts, which is what lets a restart
+// pick up its own checkpoint again rather than the bucket-global one the
+// previous version wrote. Empty keeps defaultAgentID.
+func WithAgentID(id string) Option {
+	return func(se *StorageEngine) {
+		if strings.TrimSpace(id) != "" {
+			se.agentID = id
+		}
+	}
+}
+
+// defaultAgentID is the hostname, which is stable across a restart of the
+// same agent. It replaces the writer id (hostname/pid) for the checkpoint key:
+// a pid changes on every start and a checkpoint keyed by it would never be
+// read back.
+func defaultAgentID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		return "unknown-agent"
+	}
+	return host
+}
+
 func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retentionCfg RetentionConfig, opts ...Option) (*StorageEngine, error) {
 	closedCtx, cancelClosed := context.WithCancel(context.Background())
 	se := &StorageEngine{
@@ -157,6 +196,8 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 		opTimeout:        DefaultOperationTimeout,
 		closedCtx:        closedCtx,
 		cancelClosed:     cancelClosed,
+		agentID:          defaultAgentID(),
+		manifestDirty:    make(map[string]uint64),
 	}
 	for _, opt := range opts {
 		opt(se)
@@ -300,6 +341,7 @@ func (s *StorageEngine) AppendContext(ctx context.Context, topic string, partiti
 	}
 	if err == nil {
 		s.metadataCache.AdvancePartition(topic, partition, offset+int64(recordCount))
+		s.markManifestDirty(topic, partition)
 		// Wake any long-polling Fetch requests. Signalled after the write so
 		// a woken reader is guaranteed to observe the new high watermark.
 		s.signalData()
@@ -562,6 +604,9 @@ func (s *StorageEngine) CreateTopicContext(ctx context.Context, topic string, pa
 		s.metadataCache.AddTopic(topic)
 		for i := int32(0); i < partitions; i++ {
 			s.metadataCache.AddPartition(topic, i)
+			// A topic that only exists in memory vanishes on restart, so
+			// its partitions are written to their manifests immediately.
+			s.markManifestDirty(topic, i)
 		}
 		// Persist immediately: a topic whose creation only exists in memory
 		// is a topic that vanishes on restart.
@@ -594,6 +639,7 @@ func (s *StorageEngine) DeleteTopicContext(ctx context.Context, topic string) er
 	err := s.walMgr.DeleteTopic(topic)
 	if err == nil {
 		s.metadataCache.RemoveTopic(topic)
+		s.forgetManifestDirty(topic)
 		// Drop retention bookkeeping for the topic across every group.
 		s.committedMu.Lock()
 		for _, byGroup := range s.committedByGroup {
@@ -642,20 +688,30 @@ func (s *StorageEngine) asyncDeleteTopicOffsets(ctx context.Context, topic strin
 }
 
 func (s *StorageEngine) asyncDeleteTopicFromS3(ctx context.Context, topic string) {
-	prefix := topic + "/"
+	// Both the segments and the Phase 0 per-partition manifests live outside a
+	// topic's data prefix, so deleting one does not delete the other.
+	s.deletePrefix(ctx, topic+"/")
+	s.deletePrefix(ctx, topicsMetadataPrefix+topic+"/")
+}
+
+// deletePrefix removes every object under prefix, logging each failure and
+// carrying on: a topic deletion is cleanup, and one stuck object must not
+// abandon the rest.
+func (s *StorageEngine) deletePrefix(ctx context.Context, prefix string) {
 	objects, err := s.objList(ctx, prefix)
 	if err != nil {
-		log.Printf("Async S3 cleanup: Failed to list S3 objects for topic %s: %v", topic, err)
+		log.Printf("Async S3 cleanup: Failed to list S3 objects under %s: %v", prefix, err)
 		return
 	}
 
 	for _, obj := range objects {
-		if strings.HasPrefix(obj.Key, prefix) {
-			if err := s.objDelete(ctx, obj.Key); err != nil {
-				log.Printf("Async S3 cleanup: Failed to delete cold object %s: %v", obj.Key, err)
-			} else {
-				log.Printf("Async S3 cleanup: Deleted cold object %s", obj.Key)
-			}
+		if !strings.HasPrefix(obj.Key, prefix) {
+			continue
+		}
+		if err := s.objDelete(ctx, obj.Key); err != nil {
+			log.Printf("Async S3 cleanup: Failed to delete cold object %s: %v", obj.Key, err)
+		} else {
+			log.Printf("Async S3 cleanup: Deleted cold object %s", obj.Key)
 		}
 	}
 }
@@ -1120,6 +1176,48 @@ func (s *StorageEngine) applySeeds() {
 	}
 }
 
+// markManifestDirty records that a partition's durable manifest no longer
+// matches the in-memory position and must be rewritten.
+func (s *StorageEngine) markManifestDirty(topic string, partition int32) {
+	key := topic + "/" + strconv.Itoa(int(partition))
+	s.manifestMu.Lock()
+	s.manifestGen++
+	s.manifestDirty[key] = s.manifestGen
+	s.manifestMu.Unlock()
+}
+
+// forgetManifestDirty drops every pending mark for a topic. A deleted
+// partition is gone from the snapshot, so a mark left behind would never be
+// written and never be cleared.
+func (s *StorageEngine) forgetManifestDirty(topic string) {
+	prefix := topic + "/"
+	s.manifestMu.Lock()
+	for k := range s.manifestDirty {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.manifestDirty, k)
+		}
+	}
+	s.manifestMu.Unlock()
+}
+
+// legacyCheckpointKey is where the checkpoint lived before Phase 0. Recovery
+// still reads it so an upgrade does not lose the fast path.
+const legacyCheckpointKey = "_meta/checkpoint.json"
+
+// checkpointKey is this agent's private checkpoint object. Namespacing it by
+// agent id is what stops a second agent sharing the bucket from overwriting
+// the checkpoint, which carried the whole topic inventory.
+func (s *StorageEngine) checkpointKey() string {
+	id := s.agentID
+	if id == "" {
+		id = defaultAgentID()
+	}
+	// A configured id may contain a slash; the key must not grow an extra
+	// path segment from it.
+	id = strings.ReplaceAll(id, "/", "_")
+	return "_agents/" + id + "/checkpoint.json"
+}
+
 func (s *StorageEngine) SaveCheckpoint() error {
 	return s.SaveCheckpointContext(context.Background())
 }
@@ -1155,7 +1253,7 @@ func (s *StorageEngine) SaveCheckpointContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	key := "_meta/checkpoint.json"
+	key := s.checkpointKey()
 
 	if err := s.objPut(ctx, key, bytes.NewReader(data)); err != nil {
 		log.Printf("Failed to save checkpoint: %v", err)
@@ -1189,9 +1287,17 @@ func (s *StorageEngine) LoadCheckpoint() error {
 // withRecovery also re-applies the consumer offset map, which only a caller
 // explicitly asking for a reload needs.
 func (s *StorageEngine) loadCheckpointInto(ctx context.Context, withRecovery bool) error {
-	key := "_meta/checkpoint.json"
+	key := s.checkpointKey()
 
 	r, err := s.objGet(ctx, key)
+	if err != nil {
+		// Migration: a bucket written before Phase 0 keeps its checkpoint at
+		// the bucket-global key. Read it once so an upgrade preserves the
+		// fast path; the next checkpoint writes the namespaced object.
+		if lr, legacyErr := s.objGet(ctx, legacyCheckpointKey); legacyErr == nil {
+			key, r, err = legacyCheckpointKey, lr, nil
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -1388,13 +1494,19 @@ func (s *StorageEngine) GetPartitionCount() int {
 // Durable log position
 // ---------------------------------------------------------------------------
 
-// manifestKey is where the per-partition log position is written. It exists
-// because the checkpoint is written on a timer and on shutdown: a process
-// killed with SIGKILL leaves neither, and the only remaining record of how far
-// a partition had advanced is the segment inventory in object storage.
-const manifestKey = "_meta/manifest.json"
+// legacyManifestKey is where the whole-log position lived before Phase 0. It
+// exists because the checkpoint is written on a timer and on shutdown: a
+// process killed with SIGKILL leaves neither, and the only remaining record of
+// how far a partition had advanced is the segment inventory in object storage.
+//
+// Phase 0 replaced it with one object per partition (see
+// partition_manifest.go). It is still read on startup so an upgrade recovers
+// the position the previous version would have, rather than falling all the
+// way back to the segment inventory.
+const legacyManifestKey = "_meta/manifest.json"
 
-// manifestEntry is the durable position of one partition.
+// manifestEntry is the durable position of one partition, as written by the
+// legacy whole-log manifest. New writes use perPartitionManifest.
 type manifestEntry struct {
 	Topic          string             `json:"topic"`
 	Partition      int32              `json:"partition"`
@@ -1403,7 +1515,7 @@ type manifestEntry struct {
 	Segments       []*SegmentMetadata `json:"segments"`
 }
 
-// manifest is the durable log position document.
+// manifest is the legacy whole-log position document.
 //
 // It used to be a bare array of entries. The writer epoch was added later, so
 // readers accept both shapes: an agent that meets an older manifest must still
@@ -1418,47 +1530,14 @@ func (s *StorageEngine) SaveManifest() error {
 	return s.SaveManifestContext(context.Background())
 }
 
-// SaveManifestContext is SaveManifest with a caller context.
+// SaveManifestContext writes the durable position of every partition whose
+// state has changed since the last save. See savePartitionManifests.
 func (s *StorageEngine) SaveManifestContext(ctx context.Context) error {
-	snapshot := s.metadataCache.TopicsSnapshot()
-	entries := make([]manifestEntry, 0, len(snapshot))
-	for topic, parts := range snapshot {
-		for pid, ps := range parts {
-			entries = append(entries, manifestEntry{
-				Topic:          topic,
-				Partition:      pid,
-				LogEndOffset:   ps.LogEndOffset,
-				LogStartOffset: ps.LogStartOffset,
-				Segments:       ps.Segments,
-			})
-		}
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].Topic != entries[j].Topic {
-			return entries[i].Topic < entries[j].Topic
-		}
-		return entries[i].Partition < entries[j].Partition
-	})
-
-	if entries == nil {
-		entries = []manifestEntry{}
-	}
-
-	data, err := json.MarshalIndent(manifest{
-		WriterEpoch: s.lease.Epoch(),
-		Writer:      s.lease.fencedWriter(),
-		Partitions:  entries,
-	}, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := s.objPut(ctx, manifestKey, bytes.NewReader(data)); err != nil {
-		return err
-	}
-	return nil
+	return s.savePartitionManifests(ctx)
 }
 
-// parseManifest reads both the current object shape and the legacy array.
+// parseManifest reads both the legacy object shape and the bare array that
+// preceded it.
 func parseManifest(data []byte) (manifest, error) {
 	var m manifest
 	if err := json.Unmarshal(data, &m); err == nil && m.Partitions != nil {
@@ -1480,35 +1559,30 @@ func parseManifest(data []byte) (manifest, error) {
 func (s *StorageEngine) recoverManifest(ctx context.Context) error {
 	restored := 0
 
-	// Preferred source: the manifest written on every roll and checkpoint.
-	rc, err := s.objGet(ctx, manifestKey)
-	if err == nil {
-		data, readErr := io.ReadAll(rc)
-		_ = rc.Close()
-		if readErr != nil {
-			return readErr
+	// Preferred source: the per-partition manifests written on every
+	// checkpoint and segment roll. One bounded LIST under _topics/ discovers
+	// them, which is also how a partition whose topic is gone from local disk
+	// and from the checkpoint is still found.
+	n, found, err := s.loadPartitionManifests(ctx)
+	if err != nil {
+		return err
+	}
+	restored += n
+
+	// Migration: a bucket written before Phase 0 still has the whole-log
+	// manifest and no per-partition objects. Read it once, and rewrite it in
+	// the new shape at the next checkpoint.
+	if !found {
+		n, err := s.loadLegacyManifest(ctx)
+		if err != nil {
+			return err
 		}
-		parsed, parseErr := parseManifest(data)
-		switch {
-		case parseErr != nil:
-			log.Printf("Manifest at %s is unreadable (%v); falling back to segment inventory", manifestKey, parseErr)
-		case parsed.WriterEpoch > s.lease.Epoch():
-			// Another writer advanced the log while this agent was down or
-			// was fenced out. Recovering its positions and then serving
-			// writes would reissue offsets it already handed out.
-			return fmt.Errorf("%w: manifest at %s was written at epoch %d by %q, this agent holds epoch %d",
-				errSuperseded, manifestKey, parsed.WriterEpoch, parsed.Writer, s.lease.Epoch())
-		default:
-			for _, e := range parsed.Partitions {
-				s.metadataCache.SetPartitionState(e.Topic, e.Partition, e.LogEndOffset, e.LogStartOffset, e.Segments)
-				restored++
-			}
-		}
+		restored += n
 	}
 
 	// Fallback: derive the log end offset from the segments themselves, for
-	// any partition the manifest does not cover. This also repairs a manifest
-	// written before a partition's final segments were uploaded.
+	// any partition no manifest covers. This also repairs a manifest written
+	// before a partition's final segments were uploaded.
 	for _, topic := range s.discoverTopics(ctx) {
 		for _, partition := range s.metadataCache.GetPartitions(topic) {
 			if s.metadataCache.LogEndOffset(topic, partition) > 0 && !s.needsObjectRecovery(topic, partition) {
@@ -1525,6 +1599,9 @@ func (s *StorageEngine) recoverManifest(ctx context.Context) error {
 			}
 			if leo > s.metadataCache.LogEndOffset(topic, partition) {
 				s.metadataCache.SetPartitionState(topic, partition, leo, start, segments)
+				// Persist the repaired position so the next restart does not
+				// pay for the same segment read.
+				s.markManifestDirty(topic, partition)
 				restored++
 			}
 		}
