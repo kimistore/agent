@@ -36,7 +36,7 @@ As of the current version, the following core components are working:
 
 ### 1. Storage Layer (S3-Backed WAL)
 *   **Write-Ahead Log (WAL)**: Records are locally appended to partitioned WAL files for low-latency writes.
-*   **Durability**: When a producer sets `acks=1` (or `all`), the batch is fsynced to stable storage *before* the offset is returned, so a successful ack means the data survived a crash. `acks=0` skips the flush. Concurrent appends share one flush via group commit, so parallel producers do not each pay a separate fsync.
+*   **Durability**: With `acks=1`, the batch is fsynced to stable storage *before* the offset is returned. With `acks=all`, the offset is withheld until the segment holding it is in object storage, so an acknowledged offset is recoverable from the bucket (see "Durability of acks=all" below). `acks=0` skips the flush. Concurrent appends share one flush via group commit, so parallel producers do not each pay a separate fsync.
 *   **Crash Recovery**: A torn trailing record (the normal result of a crash mid-write) is truncated back to the last intact record on startup, and the partition continues serving from there instead of failing to open.
 *   **Asynchronous Uploads**: Background routines automatically roll segments (e.g., at 1MB or time intervals) and upload them to the configured Object Store.
 *   **Unified Read Path**: Consumers read from the "Hot" WAL (RAM/Local Disk) for real-time tailing and seamlessly fallback to "Cold" Object Storage for historical reads.
@@ -92,6 +92,14 @@ The log position and the checkpoint are not bucket-global singletons, so a secon
 
 * **Per-partition manifests**: `_topics/<topic>/_manifest/<partition>` holds one partition's log end offset, log start offset and segment inventory, stamped with the writer epoch. An agent rewrites only the partitions whose position moved -- one PUT per changed partition -- so a checkpoint no longer republishes the whole log, and recovery discovers the partitions with one bounded `LIST` under `_topics/`.
 * **Per-agent checkpoint**: `_agents/<agent-id>/checkpoint.json` carries committed offsets and coordinator state. Namespacing it by `KIMISTORE_AGENT_ID` (default: hostname) is what keeps a second agent sharing the bucket from replacing the first one's checkpoint. A bucket written by an older agent keeps its single `_meta/checkpoint.json` and `_meta/manifest.json`; they are read once on upgrade and re-persisted in the new shape.
+
+### 2e. Durability of acks\=all (posture D2)
+`acks=1` fsyncs locally and acknowledges; the strongest guarantee the agent can offer is reserved for `acks=all`. A record written with `acks=all` is **not acknowledged until the segment holding it is in object storage**, so an offset the producer was told about is one it can recover.
+
+* A background flush loop seals the active segment of any partition whose `acks=all` producers are waiting, every `KIMISTORE_FLUSH_INTERVAL_MS`. That interval is both the coalescing window for object-store PUTs and the upper bound on the extra ack latency.
+* The uploader reports each stored segment's offset range back to the engine, which advances a per-partition durable watermark. Waiters are released when it covers their offset.
+* The watermark only moves contiguously: if the upload pool finishes a later segment first, it is held until the gap ahead of it fills, so a producer can never be acknowledged against a hole.
+* If the segment does not reach object storage within the producer's own timeout (capped at 30s), the produce returns `REQUEST_TIMED_OUT` rather than a false acknowledgement. The record is still in the local WAL, so a retry may duplicate it until idempotent producers (phase 6) land.
 
 ## 📡 Supported Kafka APIs
 
@@ -149,6 +157,7 @@ protocol bugs were found.
 | `KIMISTORE_LEASE_TTL_MS` | `60000` | How long a claim survives without renewal |
 | `KIMISTORE_REQUIRE_LEASE` | `true` | Refuse to start if the store cannot fence writers |
 | `KIMISTORE_AGENT_ID` | hostname | Stable identity that namespaces this agent's checkpoint object |
+| `KIMISTORE_FLUSH_INTERVAL_MS` | `1000` | How long an `acks=all` write may wait for its segment to reach object storage; the coalescing window for PUTs and the extra ack latency |
 
 The default configuration needs no flags to work with Grafana Mimir 3.0, and
 every advertised protocol version is implemented exactly as the Kafka message

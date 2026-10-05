@@ -123,6 +123,17 @@ type StorageEngine struct {
 	// start writes a manifest for every recovered partition exactly once.
 	manifestSaved atomic.Bool
 
+	// flushInterval is how often a partition that has an acks=all producer
+	// waiting on it is sealed and uploaded. See WithFlushInterval.
+	flushInterval time.Duration
+
+	// durableMu guards durable and waiters; durableCh is the broadcast latch
+	// an acks=all producer parks on. See durable.go.
+	durableMu sync.Mutex
+	durable   map[string]*durableState
+	waiters   map[string]int64
+	durableCh chan struct{}
+
 	// dataCh is a broadcast latch signalled on every successful append, so a
 	// long-polling Fetch can park until there is something to read instead of
 	// returning empty immediately and being re-polled at full speed. Guarded
@@ -167,6 +178,19 @@ func WithAgentID(id string) Option {
 	}
 }
 
+// WithFlushInterval sets how long an acks=all produce may wait for its segment
+// to be sealed and uploaded before the flush loop forces the issue. It is
+// therefore both the coalescing window (how many appends share one object
+// store PUT) and the upper bound on the ack latency D2 adds. Non-positive
+// keeps DefaultFlushInterval.
+func WithFlushInterval(d time.Duration) Option {
+	return func(se *StorageEngine) {
+		if d > 0 {
+			se.flushInterval = d
+		}
+	}
+}
+
 // defaultAgentID is the hostname, which is stable across a restart of the
 // same agent. It replaces the writer id (hostname/pid) for the checkpoint key:
 // a pid changes on every start and a checkpoint keyed by it would never be
@@ -198,6 +222,10 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 		cancelClosed:     cancelClosed,
 		agentID:          defaultAgentID(),
 		manifestDirty:    make(map[string]uint64),
+		flushInterval:    DefaultFlushInterval,
+		durable:          make(map[string]*durableState),
+		waiters:          make(map[string]int64),
+		durableCh:        make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(se)
@@ -245,12 +273,14 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 		go se.uploaderWorker(se.closedCtx)
 	}
 
-	// Start background uploader (reconciliation), offset flusher, retention, and checkpoint loop
-	se.wg.Add(4)
+	// Start background uploader (reconciliation), offset flusher, retention,
+	// checkpoint, and durability flush loops.
+	se.wg.Add(5)
 	go se.uploaderLoop()
 	go se.offsetFlusherLoop()
 	go se.retentionLoop()
 	go se.checkpointLoop()
+	go se.flushLoop()
 
 	// Recover the durable log position before the engine is handed out.
 	//
@@ -332,6 +362,13 @@ func (s *StorageEngine) AppendContext(ctx context.Context, topic string, partiti
 	if !s.metadataCache.Has(topic, partition) {
 		s.metadataCache.AddPartition(topic, partition)
 	}
+
+	// Seed the durability frontier before the write, while the log end offset
+	// is still the pre-append position: everything below it came from object
+	// storage at startup or an earlier confirmed upload, so it is a sound
+	// floor for the contiguity check that follows.
+	s.ensureDurable(topic, partition, s.metadataCache.LogEndOffset(topic, partition))
+
 	offset, err := s.walMgr.Append(topic, partition, batch, recordCount, sync)
 	if err == nil && ctx.Err() != nil {
 		// The client is gone. The record is already in the log, so it cannot
@@ -924,6 +961,11 @@ func (s *StorageEngine) handleUpload(ctx context.Context, task wal.UploadTask) {
 		log.Printf("Failed to upload %s: %v", key, err)
 		return
 	}
+
+	// The segment is in object storage. Release any acks=all producer whose
+	// offset falls inside it. A reconciliation task carries no end offset
+	// (its segment predates any waiter), and markSegmentDurable ignores it.
+	s.markSegmentDurable(task.Topic, task.Partition, task.BaseOffset, task.EndOffset)
 
 	// 4. Remove Local
 	if err := os.Remove(task.Path); err != nil {

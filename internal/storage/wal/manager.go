@@ -257,6 +257,19 @@ func (m *Manager) DeleteTopic(topic string) error {
 	return os.RemoveAll(topicDir)
 }
 
+// FlushPartition seals a partition's active segment so the uploader can store
+// it. It is a no-op when the partition has nothing buffered or does not exist
+// yet, so the durability loop can call it freely.
+func (m *Manager) FlushPartition(topic string, partition int32) {
+	p, err := m.getPartitionWAL(topic, partition)
+	if err != nil {
+		return
+	}
+	if err := p.Flush(); err != nil {
+		log.Printf("WAL: flushing %s/%d: %v", topic, partition, err)
+	}
+}
+
 // SealAll turns every partition's active segment into a sealed one, which
 // hands it to the uploader. Used on shutdown so nothing is stranded on local
 // disk.

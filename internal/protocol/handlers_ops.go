@@ -21,6 +21,7 @@ package protocol
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -29,6 +30,31 @@ import (
 	"kimistore/internal/storage"
 	"kimistore/internal/storage/wal"
 )
+
+// maxProduceTimeout caps how long an acks=all produce waits for its segment
+// to reach object storage, regardless of the client's own timeout field. A var
+// so tests can shrink it rather than wait out a deliberate stall.
+var maxProduceTimeout = 30 * time.Second
+
+// produceError maps a storage error onto the Kafka code a producer can act on.
+// The distinction that matters is retriability: REQUEST_TIMED_OUT tells the
+// producer the record may or may not be stored and that retrying is correct,
+// whereas the generic code tells it the request failed for a reason a retry
+// will not fix.
+func produceError(err error) int16 {
+	switch {
+	case errors.Is(err, storage.ErrDurableTimeout):
+		return ErrRequestTimedOut
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return ErrRequestTimedOut
+	case errors.Is(err, storage.ErrLeaseLost), errors.Is(err, storage.ErrLeaseHeld):
+		// Another agent owns the log, so this broker is the wrong one to
+		// retry against until routing exists (phase 3).
+		return ErrNotLeaderForPartition
+	default:
+		return ErrUnknown
+	}
+}
 
 func handleProduce(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16, _ ServerConfig) ([]byte, error) {
 	// Produce Request V3:
@@ -54,16 +80,28 @@ func handleProduce(ctx context.Context, dec *Decoder, enc *Encoder, store *stora
 	}
 
 	// log.Printf("Produce: Acks=%d Timeout=%d", acks, timeout)
-	_ = timeout
 
 	// Durability policy, matching Kafka's acks semantics:
 	//   acks=0  -> no response expected, producer does not want a durability
 	//              guarantee, so skip the fsync and absorb the cost.
-	//   acks=1  -> leader ack; the record must survive a crash.
-	//   acks=-1 -> all in-sync replicas ack; same requirement here, since
-	//              this agent is single-node.
-	// A single-node agent is its own only replica, so acks>=1 means fsync.
+	//   acks=1  -> the leader has it, so fsync locally and ack.
+	//   acks=-1 -> all in-sync replicas ack. This agent is single-node, so
+	//              "all" is taken to mean the strongest guarantee it can give:
+	//              the offset is not acknowledged until the segment holding it
+	//              is in object storage (posture D2, see
+	//              docs/ha-architecture.md). An offset a producer was told
+	//              about is then one it can recover.
 	durable := acks != 0
+	awaitObjectStore := acks < 0
+
+	// Bound the object-store wait by the producer's own timeout field, capped
+	// so a huge client value cannot pin a handler goroutine indefinitely.
+	durableTimeout := maxProduceTimeout
+	if timeout > 0 {
+		if d := time.Duration(timeout) * time.Millisecond; d < durableTimeout {
+			durableTimeout = d
+		}
+	}
 
 	// Topics Array
 	count, err := dec.Int32()
@@ -152,13 +190,18 @@ func handleProduce(ctx context.Context, dec *Decoder, enc *Encoder, store *stora
 			}
 
 			offset, err := store.AppendContext(ctx, topic, partition, batchData, recordCount, durable)
+			if err == nil && awaitObjectStore {
+				// The record is in the local WAL. Do not acknowledge the offset
+				// until the segment holding it is in object storage, so the
+				// producer is never told about a record it cannot recover.
+				err = store.WaitDurable(ctx, topic, partition, offset+int64(recordCount), durableTimeout)
+			}
 
 			// Write Response Partition
 			enc.Int32(partition)
 			if err != nil {
 				log.Printf("Storage append error: %v", err)
-				enc.Int16(10) // Error: MessageSizeTooLarge
-				// Generic error: 1 unknown
+				enc.Int16(produceError(err))
 				enc.Int64(-1)
 				if version >= 2 {
 					enc.Int64(-1) // LogAppendTime

@@ -162,6 +162,27 @@ var (
 		Help: "Object-store operations abandoned after exceeding the operation timeout",
 	})
 
+	// Durability of acks=all writes (posture D2). DurableWaitSeconds is how
+	// long a producer waited for its segment to land in object storage, which
+	// is the ack latency D2 adds on top of the local fsync. DurableTimeouts
+	// counts the waits that gave up, and DurableFlushes counts the forced
+	// segment seals they caused.
+	DurableWaitSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "kimistore_durable_wait_seconds",
+		Help:    "Time an acks=all produce waited for its segment to reach object storage",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+	})
+
+	DurableTimeouts = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_durable_timeouts_total",
+		Help: "acks=all produces that abandoned the wait for object storage before their deadline",
+	})
+
+	DurableFlushes = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_durable_flushes_total",
+		Help: "Active segments sealed to satisfy a pending acks=all durability wait",
+	})
+
 	// These will be registered manually via callbacks
 	TopicCount     prometheus.GaugeFunc
 	PartitionCount prometheus.GaugeFunc

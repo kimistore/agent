@@ -60,6 +60,11 @@ type Config struct {
 	// paths actually observe.
 	S3Timeout time.Duration
 
+	// FlushInterval is how often a partition with an acks=all producer waiting
+	// on it is sealed and uploaded. It is the coalescing window for object
+	// store PUTs and the upper bound on the ack latency D2 adds.
+	FlushInterval time.Duration
+
 	Retention RetentionConfig
 
 	// Lease configures the single-writer fence. The agent claims the log in
@@ -129,6 +134,8 @@ func FromEnv() Config {
 		S3Timeout:    time.Duration(envInt64("KIMISTORE_S3_TIMEOUT_MS", 30_000)) * time.Millisecond,
 		RequireLease: envBool("KIMISTORE_REQUIRE_LEASE", true),
 		AgentID:      os.Getenv("KIMISTORE_AGENT_ID"),
+
+		FlushInterval: time.Duration(envInt64("KIMISTORE_FLUSH_INTERVAL_MS", 1_000)) * time.Millisecond,
 
 		Lease: LeaseConfig{
 			Enabled: envBool("KIMISTORE_WRITER_LEASE", true),
@@ -209,8 +216,8 @@ func (c *Config) Validate() error {
 
 // Log writes the resolved configuration at startup.
 func (c Config) Log() {
-	log.Printf("Config: listen=%s advertised=%s:%d metrics=%s wal=%s bucket=%s s3Timeout=%s",
-		c.ListenAddr, c.AdvertisedHost, c.AdvertisedPort, c.MetricsAddr, c.WALDir, c.S3Bucket, c.S3Timeout)
+	log.Printf("Config: listen=%s advertised=%s:%d metrics=%s wal=%s bucket=%s s3Timeout=%s flushInterval=%s",
+		c.ListenAddr, c.AdvertisedHost, c.AdvertisedPort, c.MetricsAddr, c.WALDir, c.S3Bucket, c.S3Timeout, c.FlushInterval)
 	log.Printf("Lease: enabled=%v key=%q holder=%s ttl=%s requireConditionalWrites=%v",
 		c.Lease.Enabled, orDefault(c.Lease.Key, "(default)"), orDefault(c.Lease.Holder, "hostname/pid"), c.Lease.TTL, c.RequireLease)
 	log.Printf("Agent: id=%s (namespaces the checkpoint object)", orDefault(c.AgentID, "hostname"))

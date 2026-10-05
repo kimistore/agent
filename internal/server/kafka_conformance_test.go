@@ -153,7 +153,12 @@ type broker struct {
 func startBroker(t *testing.T, addr string, store storage.ObjectStore, walDir string, cfg protocol.ServerConfig) *broker {
 	t.Helper()
 
-	engine, err := storage.NewStorageEngine(walDir, store, "bucket", storage.RetentionConfig{})
+	engine, err := storage.NewStorageEngine(walDir, store, "bucket", storage.RetentionConfig{},
+		// Keep the durability flush prompt in tests: the default one-second
+		// coalescing window is the right production trade, but it would add
+		// a second to every acks=all produce here.
+		storage.WithFlushInterval(10*time.Millisecond),
+	)
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}
@@ -299,11 +304,17 @@ func TestKafkaGoFetchFillsBudget(t *testing.T) {
 	}
 
 	w := &kafka.Writer{
-		Addr:         kafka.TCP(addr),
-		Topic:        topic,
-		Balancer:     &kafka.LeastBytes{},
-		RequiredAcks: kafka.RequireAll,
-		BatchSize:    1, // force many small batches
+		Addr:      kafka.TCP(addr),
+		Topic:     topic,
+		Balancer:  &kafka.LeastBytes{},
+		BatchSize: 1, // force many small batches
+		// acks=1 on purpose. This test is about the fetch byte budget, not
+		// durability: with acks=all, each synchronous single-record write is
+		// sealed and uploaded on its own by the D2 flush, so one fetch would
+		// only ever see one record per object. acks=1 keeps the batches in
+		// the active local segment, which is exactly the state this test
+		// needs to prove one fetch drains many batches.
+		RequiredAcks: kafka.RequireOne,
 		WriteTimeout: 20 * time.Second,
 	}
 	for i := 0; i < 50; i++ {

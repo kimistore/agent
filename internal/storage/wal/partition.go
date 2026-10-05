@@ -49,7 +49,12 @@ type UploadTask struct {
 	Partition  int32
 	Path       string // Local disk path
 	BaseOffset int64  // Starting offset for the segment
-	Source     string // fast-path or reconciliation
+	// EndOffset is the offset just past the last record in the segment. It is
+	// what the uploader reports back as the durable watermark once the object
+	// lands, so an acks=all producer waiting on the segment can be released.
+	// It is zero for a reconciliation task, whose segment predates any waiter.
+	EndOffset int64
+	Source    string // fast-path or reconciliation
 }
 
 type PartitionWAL struct {
@@ -660,10 +665,22 @@ func (p *PartitionWAL) roll() error {
 			Partition:  p.partition,
 			Path:       newPath,
 			BaseOffset: baseOffset,
+			// The new active segment is empty, so nextOffset is exactly the
+			// end of the segment just sealed.
+			EndOffset: p.nextOffset,
 		})
 	}
 
 	return nil
+}
+
+// Flush seals the active segment if it holds any records, handing it to the
+// uploader. It is the durability barrier behind acks=all: a segment that is
+// still active exists only on local disk, so sealing it is what lets the
+// uploader put it in object storage and release the producers waiting on it.
+// An empty active segment is a no-op, so a periodic flush is cheap.
+func (p *PartitionWAL) Flush() error {
+	return p.roll()
 }
 
 // Read returns the stored record blob covering offset, re-addressed so the

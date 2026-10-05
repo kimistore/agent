@@ -286,6 +286,15 @@ Ordered cheapest-risk-first. Each phase is independently shippable.
 > agent still has its bucket-global `_meta/checkpoint.json` and
 > `_meta/manifest.json`; those are read once on upgrade and re-persisted in the
 > new shape. New configuration: `KIMISTORE_AGENT_ID` (default: hostname).
+>
+> **Phase 1 is implemented.** `acks=all` no longer shares `acks=1`'s local
+> fsync: the offset is withheld until the segment holding it is in object
+> storage. A background flush seals a waiting partition every
+> `KIMISTORE_FLUSH_INTERVAL_MS` (default 1000ms), and the uploader advances a
+> per-partition durable watermark that only moves contiguously. The wait is
+> bounded by the producer's timeout (capped at 30s) and returns
+> `REQUEST_TIMED_OUT` on expiry rather than a false ack. Idempotent producers
+> (phase 6) are still required to make retries safe.
 
 Pull **6** forward to sit immediately with **1** where possible: shipping D2
 without idempotence substitutes a worse failure mode for the one it removes.

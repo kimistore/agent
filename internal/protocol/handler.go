@@ -60,6 +60,8 @@ const (
 	ErrNone                       = 0
 	ErrUnknown                    = -1
 	ErrUnknownTopicOrPartition    = 3
+	ErrNotLeaderForPartition      = 6
+	ErrRequestTimedOut            = 7
 	ErrGroupAuthorizationFailed   = 30
 	ErrClusterAuthorizationFailed = 31
 	ErrUnsupportedVersion         = 35

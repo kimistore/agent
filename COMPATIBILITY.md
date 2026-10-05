@@ -34,19 +34,22 @@ This server implements a subset of the Kafka Protocol (primarily V0-V2). It is d
     or librdkafka producer would otherwise be unreadable to a client built on
     it. Both framings are valid Kafka. See `wal.UnwrapBatches`.
 *   **Decompression**: Automatic decompression of GZIP, Snappy, and LZ4 compressed message batches for accurate offset tracking.
-*   **Durability**: Acknowledged writes are fsynced before the producer is
-    given its offset. This follows Kafka's `acks` semantics:
+*   **Durability**: Acknowledged writes follow Kafka's `acks` semantics, with
+the single-node agent treating `acks=all` as the strongest guarantee it can
+offer:
 
     | `acks` | Behaviour |
     | :--- | :--- |
     | `0` | No response expected. The batch is written to the WAL but **not** fsynced. Fastest; a crash may lose it. |
-    | `1` | Batch is fsynced before the offset is returned. A successful ack means the data survived a crash. |
-    | `-1` | Same as `1`. This agent is single-node, so it is its own only replica. |
+    | `1` | Batch is fsynced locally before the offset is returned. A successful ack means the data survived a local crash, but not the loss of the agent. |
+    | `-1` (all) | Batch is fsynced locally **and** the offset is withheld until the segment holding it is in object storage (**posture D2**). A successful ack then means the data is recoverable from the bucket. The wait is bounded by the producer's timeout (capped at 30s); on expiry the produce returns `REQUEST_TIMED_OUT` rather than a false ack. |
 
     Concurrent appends share a single flush (group commit), so many producers
-    writing in parallel do not each pay for their own fsync. A single
-    sequential producer still costs roughly one device flush per batch, which
-    is the floor for any `acks=1` broker.
+    writing in parallel do not each pay for their own fsync. For `acks=all`,
+    a background flush seals and uploads a waiting partition every
+    `KIMISTORE_FLUSH_INTERVAL_MS`, which is both the coalescing window for
+    object-store PUTs and the extra ack latency. `acks=all` without idempotent
+    producers can duplicate a retried batch; idempotence is phase 6.
 *   **Consumer Groups**: Features a built-in "Lite" Group Coordinator supporting:
     *   Dynamic partition assignment and load balancing (`JoinGroup`, `SyncGroup`, `LeaveGroup`).
     *   Background session/heartbeat tracking (`Heartbeat`).
@@ -169,7 +172,7 @@ kcat -b localhost:19092 -G my-group my-topic
 | | Consumer Groups | ✅ Supported | `subscribe()` is fully operational via Lite Coordinator |
 | | Offset Commit | ✅ Supported | Group progress committed/loaded from S3 |
 | **Durability** | Local Persistence | ✅ Supported | Synchronous WAL |
-| | Acked-write fsync | ✅ Supported | Group-committed; honours `acks` |
+| | Acked-write fsync | ✅ Supported | Group-committed; `acks=1` is local, `acks=all` waits for object storage |
 | | S3 Offload | ✅ Supported | Asynchronous upload |
 | | S3 Recovery | ✅ Supported | Transparent fallback to S3 |
 | **Durability** | Log position across restart | ✅ Supported | checkpoint + manifest + segment-tail recovery |

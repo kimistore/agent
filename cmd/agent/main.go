@@ -78,6 +78,7 @@ func main() {
 		}),
 		storage.WithOperationTimeout(cfg.S3Timeout),
 		storage.WithAgentID(cfg.AgentID),
+		storage.WithFlushInterval(cfg.FlushInterval),
 	)
 	if err != nil {
 		// A lease refusal and a superseded-writer refusal are both "another
