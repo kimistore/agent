@@ -1,7 +1,8 @@
 # Kimistore High Availability — Architecture Design
 
-Status: **partially implemented.** Phases 0, 1, 2, 3, 5 and 6 are on `main`; phase 4
-is designed but not built. See §13 for the handoff.
+Status: **all six phases implemented** and on `main`. §13 is the handoff: what
+landed, the two silent bugs a volume test found, and §14 what is still missing.
+`mimir-integrity-e2e.sh` verifies the result under load; see §13.7.
 Scope: single-region HA for the `kimistore-agent`. Supersedes the ad-hoc
 roadmap discussed earlier.
 
@@ -652,8 +653,8 @@ That was the phase's actual deliverable. Every handover records
 `kimistore_handover_seconds` (seal to released claim) and
 `kimistore_handover_completed_total`. A clean handover costs one seal plus one
 manifest PUT, so the interesting number is the crash path: a takeover waits out the
-claim TTL (default 15s), and the RTO that matters to a producer is the TTL, not the
-drain. A healthy cluster should show `handover_kept_total` at zero — a non-zero
+claim TTL (`KIMISTORE_OWNERSHIP_TTL_MS`, default 60s, renewed every TTL/3), and
+the RTO that matters to a producer is the TTL, not the drain. A healthy cluster should show `handover_kept_total` at zero — a non-zero
 value means object storage is too slow to hand anything over safely, which is a
 capacity problem worth seeing before it is a data-loss problem.
 
@@ -816,3 +817,142 @@ rm -rf /tmp/kimi-mimir-e2e
 The GitHub Actions workflow (`.github/workflows/ci.yml`) has **never run
 remotely**. Watch the first push-triggered run and the nightly/manual Mimir job;
 the lint and e2e jobs in particular have only ever been run locally.
+
+---
+
+## 14. What is still missing
+
+Honest inventory, in rough order of how much it matters. Everything here was read
+out of the code, not inferred from the roadmap.
+
+### 14.1 There is no replication, so failover is an outage
+
+This is the structural difference from Kafka and everything else follows from it.
+
+Kafka survives a broker dying because in-sync followers *already hold the data*,
+so a failover is a metadata change. We survive an agent dying because the data is
+already in object storage — a real property, but not the same one. There is exactly
+one copy: the Metadata response reports one replica (`internal/protocol/handler.go`),
+`CreateTopics` parses `replicationFactor` and discards it
+(`internal/protocol/handlers_admin.go`), and `handleUpload` writes one `.log` and
+one `.index` per segment with no second writer anywhere.
+
+The consequence is that nothing is *redundant*: there is no second agent that could
+take over serving a partition without first claiming it. Fetch on an unowned
+partition is now served from object storage (§14.2), which turns a total outage into
+a degraded read path, but a consumer still cannot get past the durable frontier
+until a peer claims the partition and writes more. That wait is bounded by the claim
+TTL — `KIMISTORE_OWNERSHIP_TTL_MS`, 60s by default, renewed every TTL/3 — plus a
+consumer group rebalance on top.
+
+So the honest summary: durability is strong, read availability during a failover is
+degraded rather than absent, and the tail of new data is delayed by up to one TTL.
+
+### 14.2 Stale reads during failover — implemented
+
+`Fetch` on a partition this agent does not own used to be refused with
+`LEADER_NOT_AVAILABLE`. It is now served from object storage when there is anything
+durable to serve, and refused only when there is nothing.
+
+The original reasoning was right about the guessing and wrong about the
+conclusion. A non-owner's high watermark has to come from somewhere, but the place
+it comes from is object storage — the authoritative copy — and reading it there is
+not a guess. Refusing instead meant a partition was unreadable from *every* live
+agent for as long as its owner was gone, which with no replication was the entire
+outage rather than a degraded window.
+
+What the change deliberately does not do:
+
+- **It never reports more than is durable.** The position returned is the log end
+  the objects actually hold, so a consumer is never told it is caught up while the
+  live owner is still writing. A consumer that needs newer records gets an empty
+  response and keeps polling, which is honest.
+- **It never consults the local WAL for an unowned partition.** A former owner's
+  WAL holds records written before the partition moved away, and serving those
+  would hand a consumer data the current owner has since replaced. `ReadBatch`
+  keeps its existing WAL-only-if-owned guard.
+- **It does not park.** The append latch fires on local writes, so a long poll for
+  a partition someone else owns waits out the full timeout and returns nothing.
+  Partitions that already have records in object storage skip the park entirely.
+
+Two consequences worth being explicit about:
+
+- **`ListOffsets` splits.** "earliest" is served from object storage, because the
+  log start only moves forward, so a stale answer is still a valid one — and
+  answering 0 for a log that starts at 90000 is what turns a consumer resetting to
+  earliest into an infinite `OffsetOutOfRange` loop. "latest" still returns
+  `NOT_LEADER_OR_FOLLOWER`, because a consumer told it is caught up at a stale
+  offset stops asking and never learns about the records it was waiting for.
+- **Convergence is client-driven.** A successful stale read is not an error, so a
+  client has no signal to migrate to the new owner. It will get there on its own
+  metadata refresh — `Metadata` already names the peer owner — but nothing here
+  actively moves it. Making failover converge faster would need a mechanism Kafka
+  does not have.
+
+One supporting fix was needed. Losing a claim now discards this agent's in-memory
+position for that partition (`OwnershipConfig.OnLost`). It used to be kept, and it
+mixed confirmed and unconfirmed records indistinguishably, so an agent that had just
+lost a partition would keep reporting a log end that only its own unflushed WAL
+could justify. The WAL directory itself is left on disk deliberately: for a few
+seconds after losing a partition it is the only copy of anything written but never
+flushed.
+
+### 14.3 Graceful handover is unreachable
+
+`DrainPartition` exists and is correct, but nothing calls it. A partition moves by
+crashing or by a clean shutdown; there is no operator path to move one without
+paying the TTL. This needs an authenticated mutating endpoint or an operator
+protocol — a trust-boundary decision, deliberately not invented here.
+
+Deleting the claim out of band is **not** a substitute: it releases the partition
+immediately while the old owner keeps serving until its next renewal, which is
+precisely the split-brain window the epoch mitigates but does not close.
+
+### 14.4 Consumer offsets: acked before persisted, and no read-your-writes
+
+`SaveOffset` only writes to an in-memory buffer and acks the client
+(`internal/storage/engine.go`); a flusher persists every 5s. An acked commit is
+lost on SIGKILL up to 5 seconds later. Separately, `LoadOffset` reads only from
+object storage and never consults the buffer, so an `OffsetFetch` issued
+immediately after an `OffsetCommit` can answer `-1` — which a client interprets as
+"no committed offset" and applies `auto.offset.reset`. After a restart that is a
+replay-from-the-start storm rather than a bounded one.
+
+### 14.5 OffsetCommit and OffsetFetch are not fenced
+
+`coordinatorFence` runs at exactly three sites — JoinGroup, SyncGroup, Heartbeat.
+Both offset handlers bypass it, so any agent accepts and serves offset commits and
+writes to the shared flat `_offsets/` prefix: last-writer-wins, with no generation
+fencing. `LeaveGroup` being unfenced is deliberate and documented; this one reads
+as an oversight and is not documented anywhere.
+
+### 14.6 Idempotent producer state does not survive a machine change
+
+Only the ID allocator counter is persisted. `producerEntry{epoch, nextSeq,
+lastOffset}` is in-memory and recovered from the local WAL tail only, and the epoch
+is hardcoded to 0 with no increment path. After a failover to a *different*
+machine the dedup window is empty, so a retried `acks=all` batch duplicates. This
+follows directly from §14.1 and is accepted rather than fixed.
+
+### 14.7 Kafka feature gaps
+
+- **Transactions absent.** `AddPartitionsToTxn` and `EndTxn` are not in
+  `supportedAPIVersions`, so they get `UNSUPPORTED_VERSION` — but
+  `InitProducerId` still hands a transactional producer an ID and the
+  `transactional_id` is silently discarded. Rejecting cleanly would be safer.
+- **No controller, no KRaft.** Every agent reports itself as controller. No
+  inter-agent TLS or authentication.
+- **No flexible/tagged-field versions.** Every ceiling is the newest non-flexible
+  one (Metadata v7 and so on), which will eventually block client upgrades.
+- **No multi-tenancy or ACLs.** `ErrGroupAuthorizationFailed` (30) is returned for
+  *any* coordinator error, which is misleading rather than an authorization check.
+- **Timestamp-based ListOffsets** is not implemented; it answers log end so callers
+  make progress.
+
+### 14.8 One latent footgun
+
+With `KIMISTORE_REQUIRE_LEASE=false` against a store that cannot do conditional
+writes, `Claim` returns early without recording anything, so `Owns()` reports false
+for *every* partition: writes still succeed and every Fetch is answered
+`LEADER_NOT_AVAILABLE`. Unreachable with defaults, but it is a broker that accepts
+writes and serves no reads.

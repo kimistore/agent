@@ -414,7 +414,7 @@ func HandleRequest(ctx context.Context, data []byte, store *storage.StorageEngin
 	case ApiKeyFetch:
 		resp, errProc = handleFetch(ctx, dec, enc, store, apiVersion)
 	case ApiKeyListOffsets:
-		resp, errProc = handleListOffsets(dec, enc, store, apiVersion)
+		resp, errProc = handleListOffsets(ctx, dec, enc, store, apiVersion)
 	case ApiKeyApiVersions:
 		resp, errProc = handleApiVersions(dec, enc, apiVersion, cfg)
 	case ApiKeyMetadata:

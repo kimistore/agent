@@ -625,11 +625,13 @@ func TestProduce_ForAPartitionThisAgentDoesNotOwnIsRefused(t *testing.T) {
 	}
 }
 
-// A fetch for a partition this agent does not own must not be answered from its
-// local WAL. Records written before a partition moved away have been replaced by
-// the new owner, and a guessed high watermark would make the consumer skip
-// records it never read.
-func TestFetch_ForAPartitionThisAgentDoesNotOwnIsRefused(t *testing.T) {
+// A non-owner serves a partition from object storage when there is something
+// durable to serve. With no replication there is no follower to ask, so refusing
+// meant a partition was unreadable from every live agent for as long as its owner
+// was gone -- which was the whole failover outage. Object storage is the
+// authoritative copy, so the records can be read from anywhere; only the position
+// lags.
+func TestFetch_ANonOwnerServesWhatObjectStorageHolds(t *testing.T) {
 	store := newProtocolCASStore()
 
 	owner := startAgent(t, store, "agent-1", 1)
@@ -641,32 +643,55 @@ func TestFetch_ForAPartitionThisAgentDoesNotOwnIsRefused(t *testing.T) {
 			t.Fatalf("append %d: %v", i, err)
 		}
 	}
+	if err := owner.Close(); err != nil {
+		t.Fatalf("close owner: %v", err)
+	}
 
 	other := startAgent(t, store, "agent-2", 2)
 	defer other.Close()
 
-	dec := dispatch(t, other, agentConfig(2), ApiKeyFetch, 5, fetchRequestFor(t, "orders", 0, 0, 1, 0))
-	if _, err := dec.Int32(); err != nil { // throttle
-		t.Fatalf("throttle: %v", err)
+	res := fetchPartition(t, other, "orders", 0, 0, 0)
+
+	if res.code != ErrNone {
+		t.Fatalf("error = %d, want %d: a non-owner should serve durable data", res.code, ErrNone)
 	}
-	if _, err := dec.Int32(); err != nil { // topic count
-		t.Fatalf("topic count: %v", err)
+	if len(res.records) == 0 {
+		t.Fatal("a non-owner returned no records for a partition that is in object storage")
 	}
-	if _, err := dec.String(); err != nil { // topic
-		t.Fatalf("topic: %v", err)
+	// The high watermark must be the durable log end and nothing more. A number
+	// past it would tell the consumer it is caught up when it is not, and it
+	// would stop asking for the records the live owner is still writing.
+	if res.highWatermark != 4 {
+		t.Errorf("high watermark = %d, want 4 (the durable log end)", res.highWatermark)
 	}
-	if _, err := dec.Int32(); err != nil { // partition count
-		t.Fatalf("partition count: %v", err)
+}
+
+// The other half: with nothing durable there is no honest answer, and an error is
+// more useful than an empty success, because it makes the client refresh its
+// metadata and go to the agent that can serve the partition.
+func TestFetch_ANonOwnerWithNothingDurableIsStillRefused(t *testing.T) {
+	store := newProtocolCASStore()
+
+	owner := startAgent(t, store, "agent-1", 1)
+	if err := owner.CreateTopic("orders", 1); err != nil {
+		t.Fatalf("create topic: %v", err)
 	}
-	if _, err := dec.Int32(); err != nil { // partition
-		t.Fatalf("partition: %v", err)
+	// Appended but never flushed: the records exist only in agent-1's local WAL.
+	for i := 0; i < 4; i++ {
+		if _, err := owner.Append("orders", 0, testBatch(1), 1, true); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
 	}
-	code, err := dec.Int16()
-	if err != nil {
-		t.Fatalf("error code: %v", err)
+
+	other := startAgent(t, store, "agent-2", 2)
+	defer other.Close()
+
+	res := fetchPartition(t, other, "orders", 0, 0, 0)
+	if res.code != ErrLeaderNotAvailable {
+		t.Errorf("error = %d, want %d (LEADER_NOT_AVAILABLE)", res.code, ErrLeaderNotAvailable)
 	}
-	if code != ErrLeaderNotAvailable {
-		t.Errorf("fetch error = %d, want %d (LEADER_NOT_AVAILABLE)", code, ErrLeaderNotAvailable)
+	if res.highWatermark != -1 {
+		t.Errorf("high watermark = %d, want -1: an unknown position must not be guessed", res.highWatermark)
 	}
 }
 
@@ -961,4 +986,54 @@ func coordinatorRequestFor(group string) []byte {
 	enc := NewEncoder()
 	enc.String(group)
 	return enc.Bytes()
+}
+
+// fetchResult is the per-partition part of a Fetch response.
+type fetchResult struct {
+	code          int16
+	highWatermark int64
+	records       []byte
+}
+
+// fetchPartition issues a Fetch for one partition and returns its result.
+func fetchPartition(t *testing.T, store *storage.StorageEngine, topic string, partition int32, offset int64, maxWaitMs int32) fetchResult {
+	t.Helper()
+	dec := dispatch(t, store, agentConfig(0), ApiKeyFetch, 5,
+		fetchRequestFor(t, topic, partition, offset, 1, maxWaitMs))
+
+	var r fetchResult
+	dec.Int32() // throttle
+	topics, err := dec.Int32()
+	if err != nil {
+		t.Fatalf("topic count: %v", err)
+	}
+	if topics == 0 {
+		return r
+	}
+	if _, err := dec.String(); err != nil { // topic
+		t.Fatalf("topic: %v", err)
+	}
+	parts, err := dec.Int32()
+	if err != nil {
+		t.Fatalf("partition count: %v", err)
+	}
+	if parts == 0 {
+		return r
+	}
+	if _, err := dec.Int32(); err != nil { // partition
+		t.Fatalf("partition: %v", err)
+	}
+	if r.code, err = dec.Int16(); err != nil {
+		t.Fatalf("error code: %v", err)
+	}
+	if r.highWatermark, err = dec.Int64(); err != nil {
+		t.Fatalf("high watermark: %v", err)
+	}
+	dec.Int64() // last stable offset
+	dec.Int64() // log start offset
+	dec.Int32() // aborted transactions
+	if r.records, err = dec.Bytes(); err != nil {
+		t.Fatalf("records: %v", err)
+	}
+	return r
 }

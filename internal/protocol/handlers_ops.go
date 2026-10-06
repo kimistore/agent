@@ -371,10 +371,11 @@ func handleFetch(ctx context.Context, dec *Decoder, enc *Encoder, store *storage
 	// asked for data (minBytes > 0) and none is available, park briefly so an
 	// arriving append is served in this same round trip.
 	//
-	// Only partitions this agent owns are worth waiting on: the append latch
-	// fires on this process's writes, so parking for a partition owned by another
-	// agent waits out the full timeout on every poll and then returns nothing.
-	if req.minBytes > 0 && req.maxWaitMs > 0 && !anyDataAvailable(store, req) {
+	// Only this agent's own writes can wake a parked fetch: the append latch
+	// fires locally, so parking for a partition another agent owns waits out the
+	// full timeout on every poll and returns nothing. Partitions with records
+	// already in object storage are served without parking at all.
+	if req.minBytes > 0 && req.maxWaitMs > 0 && !anyDataAvailable(ctx, store, req) {
 		wait := req.maxWaitMs
 		if wait > maxFetchWaitMs {
 			wait = maxFetchWaitMs
@@ -402,31 +403,48 @@ func handleFetch(ctx context.Context, dec *Decoder, enc *Encoder, store *storage
 		enc.Int32(int32(len(ft.parts)))
 
 		for _, p := range ft.parts {
-			// A partition this agent does not own is refused rather than served.
+			// A partition this agent does not own is served from object storage
+			// when there is anything durable to serve.
 			//
-			// The alternative, reading it cold from object storage, was rejected
-			// deliberately: this agent does not know the partition's log end
-			// offset, so every high watermark it reported would be a guess, and a
-			// wrong one is worse than an explicit error. A consumer told "caught
-			// up" at a guessed offset skips records; a consumer told
-			// LEADER_NOT_AVAILABLE refreshes its metadata and retries against the
-			// agent that owns the partition, which is the behaviour that gets it
-			// the data.
-			if !store.Owns(ft.topic, p.partition) {
-				enc.Int32(p.partition)
-				enc.Int16(ErrLeaderNotAvailable)
-				enc.Int64(-1) // HighWatermark: unknown, so -1 rather than a guess
-				encodeFetchTail(enc, version, -1, -1, nil)
-				continue
+			// It used to be refused outright, on the reasoning that a non-owner
+			// cannot know the partition's log end offset so any high watermark it
+			// reported would be a guess. That reasoning was right about the
+			// guessing and wrong about the conclusion: the log end is knowable
+			// from object storage, which is the authoritative copy, and refusing
+			// meant a partition was unreadable from every live agent for as long
+			// as its owner was gone. With no replication there is no follower to
+			// ask, so that window was the whole outage.
+			//
+			// The guess this must not make is the one about the *current* owner:
+			// the position below lags whatever the live owner is still writing.
+			// So the returned log end is reported as the high watermark and
+			// nothing beyond it is claimed. A consumer that needs newer records
+			// gets an empty response and keeps polling, which is honest; it does
+			// not get told it is caught up when it is not.
+			var hw, lastStable, logStart int64
+			if store.Owns(ft.topic, p.partition) {
+				hw = store.HighWaterMark(ft.topic, p.partition)
+				lastStable = hw
+				logStart = store.LogStartOffset(ft.topic, p.partition)
+			} else {
+				leo, lso, known := store.NonOwnerPosition(ctx, ft.topic, p.partition)
+				if !known {
+					// Nothing durable to serve, and no owner to point at. This
+					// is the one case where an error is the useful answer: it
+					// makes the client refresh its metadata and try elsewhere.
+					enc.Int32(p.partition)
+					enc.Int16(ErrLeaderNotAvailable)
+					enc.Int64(-1) // HighWatermark: unknown, so -1 rather than a guess
+					encodeFetchTail(enc, version, -1, -1, nil)
+					continue
+				}
+				hw, lastStable, logStart = leo, leo, lso
 			}
 
-			hw := store.HighWaterMark(ft.topic, p.partition)
 			// This broker replicates nothing, so the last stable offset is the
 			// log end. log_start_offset is the retention-aware earliest offset,
 			// which is what lets a client find the log start without a
 			// separate ListOffsets round trip.
-			lastStable := hw
-			logStart := store.LogStartOffset(ft.topic, p.partition)
 
 			// Budget for this partition: the smaller of its own request and
 			// whatever is left of the response budget.
@@ -521,17 +539,22 @@ func encodeFetchTail(enc *Encoder, version int16, lastStable, logStart int64, re
 // unread data. An offset at or beyond the high watermark has nothing to
 // return: equal means caught up, beyond means out of range.
 //
-// A partition this agent does not own never counts as available, even though
-// its high watermark may be non-zero. It is refused in the response, so waiting
-// for it would burn the whole long-poll timeout on every request and then tell
-// the client nothing it can use.
-func anyDataAvailable(store *storage.StorageEngine, req *fetchRequest) bool {
+// A partition this agent does not own counts as available only if there is
+// durable data behind the requested offset. The append latch fires on this
+// process's own writes, so parking for a partition someone else owns waits out
+// the full timeout and then returns nothing -- but if there are already records
+// in object storage to return, parking before serving them would just add latency
+// to a fetch that has its answer.
+func anyDataAvailable(ctx context.Context, store *storage.StorageEngine, req *fetchRequest) bool {
 	for _, ft := range req.partsByTopic {
 		for _, p := range ft.parts {
-			if !store.Owns(ft.topic, p.partition) {
+			if store.Owns(ft.topic, p.partition) {
+				if p.offset < store.HighWaterMark(ft.topic, p.partition) {
+					return true
+				}
 				continue
 			}
-			if p.offset < store.HighWaterMark(ft.topic, p.partition) {
+			if leo, _, known := store.NonOwnerPosition(ctx, ft.topic, p.partition); known && p.offset < leo {
 				return true
 			}
 		}

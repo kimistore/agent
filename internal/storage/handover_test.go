@@ -260,3 +260,135 @@ func refusedForOwnership(err error) bool {
 		errors.Is(err, ErrPartitionLost) ||
 		errors.Is(err, ErrPartitionHeld)
 }
+
+// The read-side twin of the write-side claim, and the one thing the stale-read
+// path must never get wrong. A partition's local WAL can hold records written
+// before the partition moved away; serving those to a consumer would hand it data
+// the current owner has since replaced. The same records are also the ones an
+// engine would otherwise report as its log end.
+//
+// This is at the engine level rather than the protocol level because the hazard is
+// a property of ReadBatch, and it needs a genuine loss of ownership -- a claim that
+// has aged out and been taken by a peer -- not merely a local view of one.
+func TestNonOwnerReads_NeverServeTheLocalWAL(t *testing.T) {
+	store := newCASStore()
+	// Claim expiry is stored in whole seconds, so a one-second TTL rounds to
+	// nothing and the two agents simply take the partition back from each other.
+	// Three seconds keeps the renewal interval at its one-second floor while
+	// leaving the claim long enough to lose.
+	const shortTTL = 3 * time.Second
+
+	first, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{},
+		WithOwnership(OwnershipConfig{Enabled: true, Agent: "agent-a", TTL: shortTTL}))
+	if err != nil {
+		t.Fatalf("agent-a: %v", err)
+	}
+	if err := first.CreateTopic("orders", 1); err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	// Written locally and deliberately not flushed: three records that exist only
+	// in agent-a's WAL.
+	for i := 0; i < 3; i++ {
+		if _, err := first.Append("orders", 0, batchOfN(1), 1, true); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+
+	// agent-a's claim ages out and agent-b takes the partition over.
+	store.expireClaim(t, "orders", 0)
+	second, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{},
+		WithOwnership(OwnershipConfig{Enabled: true, Agent: "agent-b", TTL: shortTTL}))
+	if err != nil {
+		t.Fatalf("agent-b: %v", err)
+	}
+	defer second.Close()
+	if !second.Owns("orders", 0) {
+		t.Fatal("agent-b did not take the partition")
+	}
+	// agent-b writes one record and gets it into object storage, so there is a
+	// legitimate answer for agent-a to fall back to.
+	if _, err := second.Append("orders", 0, batchOfN(1), 1, true); err != nil {
+		t.Fatalf("agent-b append: %v", err)
+	}
+	second.walMgr.FlushPartition("orders", 0)
+	// The segment carries the takeover epoch, which is whatever the claim
+	// advanced to -- not necessarily 1.
+	waitForClaimedSegment(t, store, "orders/0/"+walSegmentName(0, store.claim(t, "orders", 0).Epoch))
+
+	// Wait for agent-a to notice it lost the partition. It renews every TTL/3, so
+	// this is bounded by a couple of seconds rather than instant.
+	deadline := time.Now().Add(20 * time.Second)
+	for first.Owns("orders", 0) && time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+	}
+	if first.Owns("orders", 0) {
+		t.Fatal("agent-a never noticed it had lost the partition")
+	}
+
+	// The log end agent-a reports must be the durable one, never the three
+	// records that only its own WAL can justify.
+	if got := first.HighWaterMark("orders", 0); got > 1 {
+		t.Errorf("non-owner log end = %d, want at most 1: the extra records exist only in its local WAL", got)
+	}
+	if got, _, ok := first.NonOwnerPosition(context.Background(), "orders", 0); !ok || got > 1 {
+		t.Errorf("NonOwnerPosition = (%d, ok=%v), want at most 1 and ok", got, ok)
+	}
+
+	// And the read itself must come from object storage. agent-a's three local
+	// records are longer than agent-b's one, so a local read is detectable by
+	// size as well as by content.
+	local, _, err := first.walMgr.ReadBatch("orders", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("reading the local WAL: %v", err)
+	}
+	data, _, err := first.ReadBatchContext(context.Background(), "orders", 0, 0, 1<<20)
+	if err != nil {
+		t.Fatalf("ReadBatchContext: %v", err)
+	}
+	if len(data) == len(local) && len(local) > 0 && len(data) > 0 {
+		t.Errorf("ReadBatchContext returned %d bytes, the same as the local WAL: it served records object storage never received", len(data))
+	}
+}
+
+// A non-owner's answer must survive a stale manifest: the log end it reports is
+// what a consumer will use as its high watermark, so a manifest left behind by a
+// crash must not hide records that are demonstrably in object storage.
+func TestNonOwnerReads_ReconcileAgainstObjectStorageNotTheManifest(t *testing.T) {
+	store := newCASStore()
+
+	owner := newOwningEngine(t, store, "agent-a")
+	if err := owner.CreateTopic("orders", 1); err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := owner.Append("orders", 0, batchOfN(10), 10, true); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+		owner.walMgr.FlushPartition("orders", 0)
+	}
+	waitForClaimedSegment(t, store, "orders/0/"+walSegmentName(20, 1))
+	if err := owner.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Rewind the manifest to an offset that is behind the objects, which is what
+	// a crash between an upload and the next checkpoint leaves behind.
+	stored := readManifest(t, store, "orders", 0)
+	stored.LogEndOffset = 10
+	clobber(t, store, partitionManifestKey("orders", 0), stored)
+
+	reader, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{},
+		WithOwnership(OwnershipConfig{Enabled: true, Agent: "agent-b", TTL: time.Minute}))
+	if err != nil {
+		t.Fatalf("agent-b: %v", err)
+	}
+	defer reader.Close()
+
+	leo, _, ok := reader.NonOwnerPosition(context.Background(), "orders", 0)
+	if !ok {
+		t.Fatal("NonOwnerPosition found nothing in object storage")
+	}
+	if leo != 30 {
+		t.Errorf("non-owner log end = %d, want 30: a stale manifest must not hide records that are in object storage", leo)
+	}
+}

@@ -19,6 +19,7 @@
 package protocol
 
 import (
+	"context"
 	"os"
 	"testing"
 
@@ -72,7 +73,7 @@ func TestListOffsets(t *testing.T) {
 		dec := NewDecoder(reqEnc.Bytes())
 		respEnc := NewEncoder()
 
-		respBytes, err := handleListOffsets(dec, respEnc, engine, 0)
+		respBytes, err := handleListOffsets(context.Background(), dec, respEnc, engine, 0)
 		if err != nil {
 			t.Fatalf("handleListOffsets failed: %v", err)
 		}
@@ -129,7 +130,7 @@ func TestListOffsets(t *testing.T) {
 		dec := NewDecoder(reqEnc.Bytes())
 		respEnc := NewEncoder()
 
-		respBytes, err := handleListOffsets(dec, respEnc, engine, 0)
+		respBytes, err := handleListOffsets(context.Background(), dec, respEnc, engine, 0)
 		if err != nil {
 			t.Fatalf("handleListOffsets failed: %v", err)
 		}
@@ -161,7 +162,7 @@ func TestListOffsets(t *testing.T) {
 		dec := NewDecoder(reqEnc.Bytes())
 		respEnc := NewEncoder()
 
-		respBytes, err := handleListOffsets(dec, respEnc, engine, 1)
+		respBytes, err := handleListOffsets(context.Background(), dec, respEnc, engine, 1)
 		if err != nil {
 			t.Fatalf("handleListOffsets failed: %v", err)
 		}
@@ -218,7 +219,7 @@ func TestListOffsets(t *testing.T) {
 		dec := NewDecoder(reqEnc.Bytes())
 		respEnc := NewEncoder()
 
-		respBytes, err := handleListOffsets(dec, respEnc, engine, 1)
+		respBytes, err := handleListOffsets(context.Background(), dec, respEnc, engine, 1)
 		if err != nil {
 			t.Fatalf("handleListOffsets failed: %v", err)
 		}
@@ -252,7 +253,7 @@ func TestListOffsets(t *testing.T) {
 		dec := NewDecoder(reqEnc.Bytes())
 		respEnc := NewEncoder()
 
-		respBytes, err := handleListOffsets(dec, respEnc, engine, 1)
+		respBytes, err := handleListOffsets(context.Background(), dec, respEnc, engine, 1)
 		if err != nil {
 			t.Fatalf("handleListOffsets failed: %v", err)
 		}

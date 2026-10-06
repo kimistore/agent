@@ -91,6 +91,16 @@ type OwnershipConfig struct {
 	// Require makes an object store that cannot make writes conditional a
 	// startup failure instead of a degraded, unfenced run.
 	Require bool
+	// OnLost is called once for each partition this agent stops holding, after
+	// the claim is marked lost.
+	//
+	// The engine uses it to discard the in-memory position it accumulated for
+	// that partition. That position is a mix of records it appended locally and
+	// records confirmed in object storage, and once the claim is gone none of it
+	// can be told apart from what the new owner has replaced. Keeping it would
+	// let this agent report a log end -- to a consumer, or to a failover
+	// candidate -- that only its own unflushed WAL could justify.
+	OnLost func(topic string, partition int32)
 }
 
 // DefaultOwnershipTTL is the default per-partition claim lifetime.
@@ -398,6 +408,9 @@ func (om *ownershipManager) renewPartition(ctx context.Context, p *partitionOwne
 				log.Printf("Ownership: LOST %s/%d after failing to renew for %s; %v. Writes to it are refused "+
 					"because another writer may have taken the partition.",
 					p.topic, p.partition, age.Truncate(time.Second), err)
+				if om.cfg.OnLost != nil {
+					om.cfg.OnLost(p.topic, p.partition)
+				}
 			}
 			metrics.PartitionsOwned.Set(float64(om.count()))
 			return

@@ -246,18 +246,35 @@ winner over the live set, and every group request is fenced, so a coordinator
 change is a full rebalance rather than a split brain. Consumer offsets are durable,
 so a rebalance does not cost replay.
 
-**Handover is not implemented.** A partition still only moves by crashing or by a
-clean shutdown; a handover that flushes the unflushed tail before releasing is the
-one remaining item.
+**A partition still only moves by crashing or by a clean shutdown.** The handover
+path itself exists — `DrainPartition` seals, waits for the tail to become durable,
+re-checks the claim, writes the manifest, and only then releases — but it has no
+runtime trigger, so in practice it is unreachable. An owner can be moved by waiting
+out its claim instead.
+
+What failover costs is worth stating plainly. There is no replication, so nothing is
+redundant: no peer can take over a partition without first claiming it. Reads are
+no longer dead in that window — an agent that does not own a partition serves it
+from object storage, which is the authoritative copy, and reports the position the
+objects actually hold — so the failover is a degraded read path rather than an
+outage. What a consumer cannot get is data *newer* than the durable frontier, until a
+peer claims the partition and writes more. That wait is bounded by the claim TTL
+(60s by default). Kafka avoids it by having followers already holding the data.
 
 The full design is in [`docs/ha-architecture.md`](docs/ha-architecture.md); its
 §13 is a handoff with the current status, key files and where to start. As of
 today:
 
-- **Shipped:** per-partition manifests and per-agent checkpoints (phase 0);
-  `acks=all` waits until its segment is in object storage (phase 1);
+- **Shipped:** all six phases. Per-partition manifests and per-agent checkpoints
+  (phase 0); `acks=all` waits until its segment is in object storage (phase 1);
   per-partition ownership with per-partition epochs (phase 2); agent liveness,
-  routing tables and leader-aware `Metadata` (phase 3); HA group coordination by
+  routing tables and leader-aware `Metadata` (phase 3); graceful handover plus
+  recovery reconciled against object storage (phase 4); HA group coordination by
   rendezvous hashing with a point-of-use fence (phase 5); idempotent producers with
   duplicate-retry deduplication (phase 6).
-- **Not started:** graceful handover (phase 4).
+- **Known gaps:** no replication, so there is no standby to serve reads during a
+  failover and the claim TTL is the outage window; `DrainPartition` has no runtime
+  trigger; consumer offsets are acknowledged before they are persisted, and a
+  commit is not immediately readable; `OffsetCommit`/`OffsetFetch` are not fenced
+  to the group coordinator; idempotent producer state does not survive moving to a
+  different machine. See [`docs/ha-architecture.md`](docs/ha-architecture.md) §14.

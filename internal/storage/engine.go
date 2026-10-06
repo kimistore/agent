@@ -142,6 +142,12 @@ type StorageEngine struct {
 	// waiting on it is sealed and uploaded. See WithFlushInterval.
 	flushInterval time.Duration
 
+	// readPositions holds the durable position of partitions this agent does NOT
+	// own, so a non-owner can still serve reads from object storage. Guarded by
+	// readPosMu.
+	readPosMu sync.Mutex
+	readPos   map[string]readPosition
+
 	// durableMu guards durable and waiters; durableCh is the broadcast latch
 	// an acks=all producer parks on. See durable.go.
 	durableMu sync.Mutex
@@ -266,6 +272,7 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 		committedByGroup: make(map[string]map[string]int64),
 		retentionCfg:     retentionCfg,
 		metadataCache:    NewMetadataCache(),
+		readPos:          make(map[string]readPosition),
 		dataCh:           make(chan struct{}),
 		opTimeout:        DefaultOperationTimeout,
 		closedCtx:        closedCtx,
@@ -308,6 +315,11 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 	// because there would be two epochs per write and only one of them would
 	// fence anything.
 	if se.ownershipCfg.Enabled {
+		// Losing a claim must also discard the in-memory position built up for
+		// it, or this agent would keep reporting a log end that only its own
+		// unflushed WAL could justify -- to a consumer reading from this node,
+		// or to whoever takes the partition next.
+		se.ownershipCfg.OnLost = se.forgetLostPartition
 		om, err := newOwnershipManager(context.Background(), objStore, se.ownershipCfg)
 		if err != nil {
 			_ = mgr.Close()
@@ -1029,11 +1041,16 @@ func (s *StorageEngine) GetPartitions(topic string) ([]int32, error) {
 // A single-node agent replicates nothing, so the high watermark and the log
 // end offset are the same thing.
 func (s *StorageEngine) HighWaterMark(topic string, partition int32) int64 {
-	// Consulting the WAL for a partition this agent does not own would both
-	// report a stale position and create a local WAL directory for it as a side
-	// effect. A non-owner's answer comes from durable metadata alone, which lags
-	// the current owner -- correct, but behind, which is why a fetch for an
-	// unowned partition is refused rather than served.
+	// A partition this agent does not own has no high watermark here. The WAL is
+	// not consulted -- that would report a stale position and create a local WAL
+	// directory as a side effect -- and losing a claim discards this agent's
+	// in-memory position for the partition (see forgetLostPartition), so there is
+	// nothing durable cached either and the answer is 0.
+	//
+	// 0 is "this agent cannot describe that partition", not "the log is empty",
+	// and a caller must not put it in a response. Anything serving a partition
+	// this agent does not own -- a Fetch, a failover candidate -- has to go
+	// through NonOwnerPosition, which reads the real position from object storage.
 	if !s.Owns(topic, partition) {
 		return s.metadataCache.LogEndOffset(topic, partition)
 	}
@@ -1041,6 +1058,122 @@ func (s *StorageEngine) HighWaterMark(topic string, partition int32) int64 {
 		return l
 	}
 	return s.metadataCache.LogEndOffset(topic, partition)
+}
+
+// readPosition is a partition's durable log position, as learned from object
+// storage by an agent that does not own the partition.
+type readPosition struct {
+	logEnd   int64
+	logStart int64
+	// resolvedAt is when this was read. A negative result is cached only until
+	// the entry expires, because "nothing there" is true for a moment and
+	// wrong a second later.
+	resolvedAt time.Time
+}
+
+// NonOwnerPosition returns the durable position of a partition this agent does
+// not own, so that a non-owner can serve reads from object storage rather than
+// refusing them.
+//
+// This is what makes failover an inconvenience instead of an outage. There is no
+// replication, so a partition whose owner has died is unreadable until a peer
+// claims it -- but the data is in object storage the whole time, and object
+// storage is the authoritative copy. Reporting the position the objects actually
+// hold lets a consumer connected to any live agent keep reading during that
+// window.
+//
+// Two things are deliberately *not* done here:
+//
+//   - The local WAL is never consulted for a partition this agent does not own.
+//     It holds records written before the partition moved away, and serving those
+//     would hand a consumer data the current owner has since replaced.
+//   - The result is stale by construction: it lags whatever the current owner is
+//     writing. Callers must report the returned log end as the high watermark and
+//     nothing more, or a consumer will conclude it is caught up and stop asking.
+func (s *StorageEngine) NonOwnerPosition(ctx context.Context, topic string, partition int32) (logEnd, logStart int64, ok bool) {
+	if s.Owns(topic, partition) {
+		return s.HighWaterMark(topic, partition), s.LogStartOffset(topic, partition), true
+	}
+
+	key := partitionDurabilityKey(topic, partition)
+	s.readPosMu.Lock()
+	if cached, hit := s.readPos[key]; hit {
+		// A positive answer is stable: object storage only gains records.
+		// A negative one is re-checked after a short interval, since it usually
+		// means the partition simply has not been written yet.
+		if cached.logEnd > 0 || time.Since(cached.resolvedAt) < nonOwnerPosRetry {
+			logEnd, logStart, ok = cached.logEnd, cached.logStart, cached.logEnd > 0
+			s.readPosMu.Unlock()
+			return logEnd, logStart, ok
+		}
+		delete(s.readPos, key)
+	}
+	s.readPosMu.Unlock()
+
+	logEnd, logStart = s.resolveDurablePosition(ctx, topic, partition)
+
+	s.readPosMu.Lock()
+	s.readPos[key] = readPosition{logEnd: logEnd, logStart: logStart, resolvedAt: time.Now()}
+	s.readPosMu.Unlock()
+	return logEnd, logStart, logEnd > 0
+}
+
+// nonOwnerPosRetry bounds how long a "nothing here" answer is trusted, so a
+// partition that gains records shortly after a probe is not hidden behind it.
+const nonOwnerPosRetry = 5 * time.Second
+
+// resolveDurablePosition reads a partition's durable position out of object
+// storage, taking the highest log end and the lowest log start that either the
+// manifest or the objects can justify.
+//
+// It is the same reconciliation recovery performs, deliberately: a manifest is a
+// snapshot, and a manifest left behind by a crash can sit below the objects it
+// describes. Reading only the manifest here would serve a non-owner a log end
+// that hides records a consumer then cannot reach.
+func (s *StorageEngine) resolveDurablePosition(ctx context.Context, topic string, partition int32) (logEnd, logStart int64) {
+	if rc, err := s.objGet(ctx, partitionManifestKey(topic, partition)); err == nil {
+		data, readErr := io.ReadAll(rc)
+		_ = rc.Close()
+		if readErr == nil {
+			var m perPartitionManifest
+			if json.Unmarshal(data, &m) == nil {
+				logEnd, logStart = m.LogEndOffset, m.LogStartOffset
+			}
+		}
+	}
+
+	segments, err := s.objectSegments(ctx, topic, partition)
+	if err != nil || len(segments) == 0 {
+		return logEnd, logStart
+	}
+	leo, start, err := s.endOffsetsFromObject(ctx, topic, partition, segments)
+	if err != nil {
+		// The manifest answer stands on its own; a partition that exists but
+		// whose newest segment cannot be read is still worth serving up to
+		// wherever the manifest says it reached.
+		return logEnd, logStart
+	}
+	if leo > logEnd {
+		logEnd = leo
+	}
+	if logStart == 0 || (start >= 0 && start < logStart) {
+		logStart = start
+	}
+	return logEnd, logStart
+}
+
+// forgetLostPartition drops a partition this agent no longer holds from its
+// in-memory view.
+//
+// The WAL directory is deliberately left on disk: for a few seconds after losing a
+// partition its WAL is the only copy of anything written but never flushed, and
+// deleting it would turn a recoverable situation into a lost one. Only the
+// in-memory position goes, because it cannot be separated into "confirmed" and
+// "unconfirmed" after the fact.
+func (s *StorageEngine) forgetLostPartition(topic string, partition int32) {
+	log.Printf("Storage: dropping %s/%d from this agent's view; the partition is no longer ours to describe",
+		topic, partition)
+	s.dropPartitionFromView(topic, partition)
 }
 
 // LogStartOffset is the oldest offset still retrievable. It is what

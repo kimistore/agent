@@ -19,10 +19,12 @@
 package protocol
 
 import (
+	"context"
+
 	"kimistore/internal/storage"
 )
 
-func handleListOffsets(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
+func handleListOffsets(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
 	// ListOffsets Request V0-V1:
 	// ReplicaId (int32)
 	// Topics Array
@@ -93,13 +95,22 @@ func handleListOffsets(dec *Decoder, enc *Encoder, store *storage.StorageEngine,
 				}
 			}
 
-			// A partition this agent does not own has no log position it can
-			// report truthfully. Its durable state was dropped when the claim was
-			// taken over, so "latest" would be 0 and "earliest" would be 0 too --
-			// and a consumer that resets to offset 0 of a log that starts at 90000
-			// spins on OffsetOutOfRange for ever. NOT_LEADER_OR_FOLLOWER is the
-			// code that sends it to the agent that can answer.
-			if !store.Owns(topic, partition) {
+			// A partition this agent does not own still has an honest answer for
+			// one of the two boundaries, and refusing both strands a consumer
+			// during a failover for no gain.
+			//
+			// "earliest" can be served: the log start is read from object storage,
+			// and answering 0 for a log that starts at 90000 is what turns a
+			// consumer resetting to earliest into an infinite OffsetOutOfRange
+			// loop. It only ever moves forward, so a stale answer is still a
+			// valid one.
+			//
+			// "latest" cannot be served. It lags whatever the live owner is still
+			// writing, and a consumer told it is caught up at a stale offset stops
+			// asking and never learns about the records it was waiting for. That
+			// one keeps NOT_LEADER_OR_FOLLOWER, which sends it to the agent that
+			// can answer.
+			if !store.Owns(topic, partition) && timestamp != -2 {
 				tr.partitions = append(tr.partitions, partitionResponse{
 					partition: partition,
 					timestamp: -1,
@@ -121,7 +132,23 @@ func handleListOffsets(dec *Decoder, enc *Encoder, store *storage.StorageEngine,
 			case -1: // Latest: the offset the next record will be written at
 				offset = store.HighWaterMark(topic, partition)
 			case -2: // Earliest: the oldest offset still retrievable
-				offset = store.LogStartOffset(topic, partition)
+				if store.Owns(topic, partition) {
+					offset = store.LogStartOffset(topic, partition)
+				} else {
+					// Resolved from object storage, which is authoritative even
+					// when a peer owns the partition.
+					_, lso, known := store.NonOwnerPosition(ctx, topic, partition)
+					if !known {
+						tr.partitions = append(tr.partitions, partitionResponse{
+							partition: partition,
+							timestamp: -1,
+							offset:    -1,
+							errorCode: ErrNotLeaderForPartition,
+						})
+						continue
+					}
+					offset = lso
+				}
 				respTimestamp = -1
 			default:
 				// Timestamp-based lookup is not implemented; answer with the
