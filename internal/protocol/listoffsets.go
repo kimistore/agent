@@ -54,6 +54,7 @@ func handleListOffsets(dec *Decoder, enc *Encoder, store *storage.StorageEngine,
 		partition int32
 		timestamp int64
 		offset    int64
+		errorCode int16
 	}
 	type topicResponse struct {
 		topic      string
@@ -92,6 +93,22 @@ func handleListOffsets(dec *Decoder, enc *Encoder, store *storage.StorageEngine,
 				}
 			}
 
+			// A partition this agent does not own has no log position it can
+			// report truthfully. Its durable state was dropped when the claim was
+			// taken over, so "latest" would be 0 and "earliest" would be 0 too --
+			// and a consumer that resets to offset 0 of a log that starts at 90000
+			// spins on OffsetOutOfRange for ever. NOT_LEADER_OR_FOLLOWER is the
+			// code that sends it to the agent that can answer.
+			if !store.Owns(topic, partition) {
+				tr.partitions = append(tr.partitions, partitionResponse{
+					partition: partition,
+					timestamp: -1,
+					offset:    -1,
+					errorCode: ErrNotLeaderForPartition,
+				})
+				continue
+			}
+
 			// Resolve the requested boundary against the real log position.
 			// Reporting 0 for "earliest" is only correct while nothing has ever
 			// been reclaimed: once retention has deleted the first segments,
@@ -117,6 +134,7 @@ func handleListOffsets(dec *Decoder, enc *Encoder, store *storage.StorageEngine,
 				partition: partition,
 				timestamp: respTimestamp,
 				offset:    offset,
+				errorCode: ErrNone,
 			})
 		}
 		responses = append(responses, tr)
@@ -140,7 +158,7 @@ func handleListOffsets(dec *Decoder, enc *Encoder, store *storage.StorageEngine,
 
 		for _, pr := range tr.partitions {
 			enc.Int32(pr.partition)
-			enc.Int16(0) // No Error
+			enc.Int16(pr.errorCode)
 
 			if version == 0 {
 				// V0: Offsets Array

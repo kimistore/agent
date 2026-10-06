@@ -71,6 +71,21 @@ var (
 	ErrMemberNotFound      = fmt.Errorf("member not found")
 	ErrSyncTimeout         = fmt.Errorf("timed out waiting for assignment")
 	ErrNoProtocols         = fmt.Errorf("no consumer protocols provided")
+
+	// ErrNotCoordinator means this agent is not the coordinator for the group, so
+	// the request must be answered with NOT_COORDINATOR rather than acted on.
+	//
+	// This is the fence that makes group coordination safe with more than one
+	// agent. Coordinator selection is a hash over the live set, and two agents can
+	// briefly hold different views of that set; without a check at the point of
+	// use, both would accept the request and build independent group state.
+	ErrNotCoordinator = fmt.Errorf("this agent is not the coordinator for the group")
+
+	// ErrCoordinatorUnfenced means this agent cannot currently prove it is alive,
+	// so it must not hand out generations. A coordinator that has lost the ability
+	// to renew its liveness record may already have been replaced, and a second
+	// coordinator for one group is the split brain this exists to prevent.
+	ErrCoordinatorUnfenced = fmt.Errorf("this agent cannot prove it is alive")
 )
 
 type MemberMetadata struct {
@@ -88,78 +103,6 @@ type MemberMetadata struct {
 type GroupProtocol struct {
 	Name     string `json:"name"`
 	Metadata []byte `json:"metadata"`
-}
-
-type CoordinatorState struct {
-	Groups map[string]GroupSnapshot `json:"groups"`
-}
-
-type GroupSnapshot struct {
-	Name         string                    `json:"name"`
-	State        GroupState                `json:"state"`
-	GenerationID int32                     `json:"generation_id"`
-	ProtocolType string                    `json:"protocol_type"`
-	Protocol     string                    `json:"protocol"`
-	Members      map[string]MemberMetadata `json:"members"`
-	LeaderID     string                    `json:"leader_id"`
-}
-
-func (c *Coordinator) ToState() CoordinatorState {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	state := CoordinatorState{
-		Groups: make(map[string]GroupSnapshot),
-	}
-
-	for name, g := range c.groups {
-		g.mu.Lock()
-		members := make(map[string]MemberMetadata)
-		for mID, m := range g.Members {
-			members[mID] = *m
-		}
-		state.Groups[name] = GroupSnapshot{
-			Name:         g.Name,
-			State:        g.State,
-			GenerationID: g.GenerationID,
-			ProtocolType: g.ProtocolType,
-			Protocol:     g.Protocol,
-			Members:      members,
-			LeaderID:     g.LeaderID,
-		}
-		g.mu.Unlock()
-	}
-
-	return state
-}
-
-func (c *Coordinator) FromState(state CoordinatorState) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for name, gs := range state.Groups {
-		g := &Group{
-			Name:         gs.Name,
-			State:        gs.State,
-			GenerationID: gs.GenerationID,
-			ProtocolType: gs.ProtocolType,
-			Protocol:     gs.Protocol,
-			Members:      make(map[string]*MemberMetadata),
-			Offsets:      make(map[string]map[int32]int64),
-			LeaderID:     gs.LeaderID,
-			waitCh:       make(chan struct{}),
-		}
-		for mID, m := range gs.Members {
-			mCopy := m
-			// Restored members are always dead: their connections belonged to
-			// the process that just exited. Zeroing the heartbeat lets the
-			// reaper converge the group instead of leaving phantom members
-			// that hold partitions hostage.
-			mCopy.Heartbeat = time.Time{}
-			g.Members[mID] = &mCopy
-		}
-		c.groups[name] = g
-	}
 }
 
 type Group struct {
@@ -261,12 +204,28 @@ func (c *Coordinator) SelectedProtocol(groupID string) string {
 	return g.Protocol
 }
 
+// GetGroup returns a group's state, creating it if it does not exist.
+//
+// It creates on lookup because a member can arrive at SyncGroup or Heartbeat
+// before the group it belongs to exists locally, and those paths need somewhere
+// to record what they learned. Read paths must not use it: a DescribeGroups or
+// ListGroups on an unknown group would then materialise a phantom empty group
+// that shows up in the next ListGroups.
 func (c *Coordinator) GetGroup(groupID string) *Group {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.groupLocked(groupID)
+}
 
-	// Lazy create? Or explicitly CreateGroup?
-	// JoinGroup usually creates it.
+// lookupGroup returns a group only if it already exists.
+func (c *Coordinator) lookupGroup(groupID string) *Group {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.groups[groupID]
+}
+
+// groupLocked is the create-or-get path. Callers must hold c.mu.
+func (c *Coordinator) groupLocked(groupID string) *Group {
 	if g, ok := c.groups[groupID]; ok {
 		return g
 	}
@@ -493,11 +452,17 @@ func (c *Coordinator) ListGroups() []GroupOverview {
 
 	var list []GroupOverview
 	for name, g := range c.groups {
-		// Filter out dead/empty? Kafka usually lists all.
 		g.mu.Lock()
 		pType := g.ProtocolType
+		members := len(g.Members)
 		g.mu.Unlock()
 
+		// A group nobody has joined is not a group. It exists here only because
+		// some request touched it, and listing it would tell an operator a
+		// consumer group exists when no consumer has ever connected.
+		if members == 0 && pType == "" {
+			continue
+		}
 		list = append(list, GroupOverview{GroupID: name, ProtocolType: pType})
 	}
 	return list
@@ -519,7 +484,13 @@ type MemberDetail struct {
 }
 
 func (c *Coordinator) DescribeGroup(groupID string) (*GroupDetail, error) {
-	g := c.GetGroup(groupID)
+	// A read must not create what it is describing: asking about a group that
+	// does not exist should answer that it does not, not leave an empty shell
+	// behind for the next ListGroups to report.
+	g := c.lookupGroup(groupID)
+	if g == nil {
+		return nil, fmt.Errorf("group not found")
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 

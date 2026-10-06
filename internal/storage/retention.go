@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"kimistore/internal/metrics"
+	"kimistore/internal/storage/wal"
 )
 
 // RetentionConfig controls how long segments are kept. A zero value disables
@@ -101,8 +102,7 @@ func (s *StorageEngine) applyRetention() {
 				continue
 			}
 
-			deleted := s.processPartitionRetention(ctx, topic, partition, segments)
-			segmentsDeleted += deleted
+			segmentsDeleted += s.reclaimPartition(ctx, topic, partition, segments)
 		}
 	}
 
@@ -115,7 +115,11 @@ func partitionPrefix(topic string, partition int32) string {
 }
 
 // filterSegments keeps only log segments under this partition, dropping the
-// index sidecars that live alongside them.
+// index sidecars that live alongside them, and orders them oldest first.
+//
+// The order is by base offset and then by descending epoch, so that at a base
+// offset a superseded owner's segment sorts before the one that replaced it and
+// the retention sweep treats the newer epoch as the one that follows.
 func filterSegments(objects []ObjectMetadata) []ObjectMetadata {
 	out := make([]ObjectMetadata, 0, len(objects))
 	for _, obj := range objects {
@@ -124,9 +128,103 @@ func filterSegments(objects []ObjectMetadata) []ObjectMetadata {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return parseOffsetFromKey(out[i].Key) < parseOffsetFromKey(out[j].Key)
+		oi, ei, _ := parseSegmentKey(out[i].Key)
+		oj, ej, _ := parseSegmentKey(out[j].Key)
+		if oi != oj {
+			return oi < oj
+		}
+		return ei > ej
 	})
 	return out
+}
+
+// filterLiveSegments drops the segments a superseded owner left behind.
+//
+// Putting the ownership epoch in the segment key is what stops a stale writer's
+// upload from overwriting its successor's, but it also means both uploads can
+// exist. Only the highest epoch at a given base offset is part of the log: the
+// stale one is unreachable, because reads resolve to the highest epoch and the
+// manifest records the position the current owner advanced to. Keeping the stale
+// copies would make the segment inventory describe a log that never existed, and
+// would let retention reason about offsets twice.
+func filterLiveSegments(segments []ObjectMetadata) []ObjectMetadata {
+	live := make([]ObjectMetadata, 0, len(segments))
+	for i := 0; i < len(segments); {
+		j := i + 1
+		for j < len(segments) && parseOffsetFromKey(segments[j].Key) == parseOffsetFromKey(segments[i].Key) {
+			j++
+		}
+		// filterSegments puts the highest epoch first within one offset.
+		live = append(live, segments[i])
+		i = j
+	}
+	return live
+}
+
+// cacheKeyFor is the segment-cache key for a partition.
+func cacheKeyFor(topic string, partition int32) string {
+	return topic + "/" + strconv.Itoa(int(partition))
+}
+
+// staleEpochSegments returns the segments at a base offset that a higher epoch
+// has superseded. They are never the answer to a read and never appear in a
+// manifest, so holding them costs storage and nothing else.
+func staleEpochSegments(segments []ObjectMetadata) []ObjectMetadata {
+	live := make(map[string]bool)
+	for _, seg := range filterLiveSegments(segments) {
+		live[seg.Key] = true
+	}
+	var stale []ObjectMetadata
+	for _, seg := range segments {
+		if !live[seg.Key] {
+			stale = append(stale, seg)
+		}
+	}
+	return stale
+}
+
+// deleteStaleEpochSegments removes a superseded segment and its index sidecar,
+// and reports how many segment objects went.
+func (s *StorageEngine) deleteStaleEpochSegments(ctx context.Context, cacheKey string, stale []ObjectMetadata) int {
+	deleted := 0
+	for _, seg := range stale {
+		keys := []string{seg.Key, strings.TrimSuffix(seg.Key, ".log") + ".index"}
+		failed := false
+		for _, key := range keys {
+			if err := s.objDelete(ctx, key); err != nil {
+				log.Printf("Retention: failed to delete superseded segment object %s: %v", key, err)
+				failed = true
+			}
+		}
+		if failed {
+			continue
+		}
+		deleted++
+		metrics.RetentionSegmentsDeleted.Inc()
+		log.Printf("Retention: deleted %s, superseded by a newer ownership epoch", seg.Key)
+	}
+	if deleted > 0 {
+		s.cacheMu.Lock()
+		delete(s.segmentCache, cacheKey)
+		s.cacheMu.Unlock()
+	}
+	return deleted
+}
+
+// reclaimPartition reclaims everything a sweep may remove from one partition,
+// and returns how many segment objects went.
+//
+// It has two parts. Superseded-epoch segments go first and unconditionally: a
+// segment the current owner replaced is unreachable garbage rather than retained
+// data, so there is no reason to hold it until a consumer advances past offsets
+// it will never be asked for. Retention then applies its own policies to the
+// live log only, where the offset arithmetic is sound.
+func (s *StorageEngine) reclaimPartition(ctx context.Context, topic string, partition int32, segments []ObjectMetadata) int {
+	deleted := 0
+	if stale := staleEpochSegments(segments); len(stale) > 0 {
+		deleted += s.deleteStaleEpochSegments(ctx, cacheKeyFor(topic, partition), stale)
+	}
+	return deleted + s.processPartitionRetention(ctx, topic, partition, filterLiveSegments(segments))
 }
 
 // processPartitionRetention deletes segments for one partition, oldest first,
@@ -215,12 +313,15 @@ func (s *StorageEngine) processPartitionRetention(ctx context.Context, topic str
 		return 0
 	}
 
-	cacheKey := topic + "/" + strconv.Itoa(int(partition))
+	cacheKey := cacheKeyFor(topic, partition)
 	deleted := 0
 	for key := range toDelete {
-		if err := s.objStore.Delete(ctx, key); err != nil {
-			log.Printf("Retention: failed to delete %s: %v", key, err)
-			continue
+		// The index sidecar goes with the segment it describes; leaving it
+		// behind would be an object nothing can ever read again.
+		for _, k := range []string{key, strings.TrimSuffix(key, ".log") + ".index"} {
+			if err := s.objDelete(ctx, k); err != nil {
+				log.Printf("Retention: failed to delete %s: %v", k, err)
+			}
 		}
 		deleted++
 		metrics.RetentionSegmentsDeleted.Inc()
@@ -297,11 +398,19 @@ func (s *StorageEngine) offsetsAuthoritative() bool {
 	return s.committedAuthoritative
 }
 
-// parseOffsetFromKey extracts the start offset encoded in "..../<offset>.log".
+// parseOffsetFromKey extracts the start offset encoded in a segment name,
+// ignoring the ownership epoch a segment written under partition ownership
+// carries ("..../<offset>-e<epoch>.log"). Offsets are never negative, so an
+// unparseable name is reported as no offset rather than a plausible one.
 func parseOffsetFromKey(key string) int64 {
-	parts := strings.Split(key, "/")
-	filename := parts[len(parts)-1]
-	baseName := strings.TrimSuffix(filename, ".log")
-	off, _ := strconv.ParseInt(baseName, 10, 64)
+	off, _, _ := parseSegmentKey(key)
 	return off
+}
+
+// parseSegmentKey splits a segment object key into its base offset and the
+// ownership epoch that wrote it. A segment written before partition ownership
+// has no epoch suffix and parses as epoch 0.
+func parseSegmentKey(key string) (baseOffset, epoch int64, ok bool) {
+	parts := strings.Split(key, "/")
+	return wal.ParseSegmentName(parts[len(parts)-1])
 }

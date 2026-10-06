@@ -104,12 +104,27 @@ type StorageEngine struct {
 	// starts so the claim is held before recovery reads durable state.
 	leaseCfg LeaseConfig
 
+	// ownershipCfg is the requested per-partition ownership, applied before any
+	// goroutine starts so claims are held before recovery reads durable state.
+	ownershipCfg OwnershipConfig
+
+	// ownership holds the per-partition claims. It is nil when ownership is
+	// disabled, in which case the bucket-global lease in lease is the fence.
+	ownership *ownershipManager
+
+	// registry publishes this agent's liveness and ownership table, and caches
+	// the union of every live agent's. Metadata is answered from it. See
+	// registry.go.
+	registry    *registry
+	registryCfg RegistryConfig
+
 	metadataCache *MetadataCache
 	coordinator   *coordinator.Coordinator
 
 	// agentID names this agent's durable metadata namespace. The checkpoint
 	// lives under _agents/<agentID>/, so two agents sharing a bucket cannot
-	// overwrite each other's checkpoint. See WithAgentID.
+	// overwrite each other's checkpoint. See WithAgentID. It is also the
+	// identity recorded in partition ownership claims.
 	agentID string
 
 	// manifestDirty tracks partitions whose durable manifest is behind the
@@ -171,6 +186,24 @@ type Option func(*StorageEngine)
 // serves anything, and refuse writes if the claim is later lost.
 func WithLease(cfg LeaseConfig) Option {
 	return func(se *StorageEngine) { se.leaseCfg = cfg }
+}
+
+// WithOwnership makes the engine claim each (topic, partition) separately
+// rather than the whole bucket at once. It is on by default; with it off the
+// bucket-global writer lease in WithLease is the fence.
+func WithOwnership(cfg OwnershipConfig) Option {
+	return func(se *StorageEngine) { se.ownershipCfg = cfg }
+}
+
+// WithRegistry sets how this agent identifies itself to the cluster: the node id
+// clients see, and the address they dial to reach it.
+//
+// The address matters as much as the id. A hardcoded loopback makes every client
+// dial itself, and a per-agent host is what makes routing work at all -- without
+// a distinct advertised address per agent there is nothing for a client to be
+// redirected to.
+func WithRegistry(cfg RegistryConfig) Option {
+	return func(se *StorageEngine) { se.registryCfg = cfg }
 }
 
 // WithOperationTimeout bounds every object-store call. Non-positive values
@@ -269,17 +302,34 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 	}
 	se.walMgr = mgr
 
-	// Claim the log before reading any of it. Two agents pointed at one
-	// bucket would otherwise each assign offsets from their own recovered
-	// state and overwrite each other's segments, and nothing below would
-	// notice: the failure mode is silent data loss, not an error.
-	lease, err := acquireLease(context.Background(), objStore, se.leaseCfg)
-	if err != nil {
-		_ = mgr.Close()
-		cancelClosed()
-		return nil, err
+	// Ownership claims replace the bucket-global lease as the fence: a single
+	// bucket-global claim would refuse every second agent, which is exactly what
+	// per-partition ownership exists to allow. Both cannot be in force at once,
+	// because there would be two epochs per write and only one of them would
+	// fence anything.
+	if se.ownershipCfg.Enabled {
+		om, err := newOwnershipManager(context.Background(), objStore, se.ownershipCfg)
+		if err != nil {
+			_ = mgr.Close()
+			cancelClosed()
+			return nil, err
+		}
+		se.ownership = om
+		log.Printf("Ownership: enabled for agent %q (ttl %s); the bucket-global writer lease is not acquired",
+			om.agentID(), om.cfg.TTL)
+	} else {
+		// Claim the log before reading any of it. Two agents pointed at one
+		// bucket would otherwise each assign offsets from their own recovered
+		// state and overwrite each other's segments, and nothing below would
+		// notice: the failure mode is silent data loss, not an error.
+		lease, err := acquireLease(context.Background(), objStore, se.leaseCfg)
+		if err != nil {
+			_ = mgr.Close()
+			cancelClosed()
+			return nil, err
+		}
+		se.lease = lease
 	}
-	se.lease = lease
 
 	// Load/Merge Cache from WAL
 	if err := se.metadataCache.Load(walDir); err != nil {
@@ -328,7 +378,116 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 		se.rehydrateCommittedOffsets(context.Background())
 	}()
 
+	// Join the cluster: publish this agent's liveness and ownership table, and
+	// take a first look at everyone else's. It runs after recovery because the
+	// table has to name the partitions this agent actually owns, which is only
+	// known once the claims are taken.
+	regCfg := se.registryCfg
+	if regCfg.AgentID == "" {
+		regCfg.AgentID = se.agentID
+	}
+	if regCfg.TTL <= 0 {
+		regCfg.TTL = DefaultOwnershipTTL
+		if se.ownershipCfg.Enabled && se.ownershipCfg.TTL > 0 {
+			regCfg.TTL = se.ownershipCfg.TTL
+		}
+	}
+	se.registry = newRegistry(se, regCfg, se.routingPartitions)
+
 	return se, nil
+}
+
+// routingPartitions reports what this agent publishes as its ownership set.
+//
+// Under ownership it is exactly the claims held, which is the point: the table
+// and the fence are derived from one source, so a partition cannot be advertised
+// as owned without being claimed, or claimed without being advertised. Without
+// ownership the bucket-wide lease means this agent is the only writer of
+// everything it knows, so the set is the whole recovered inventory.
+func (s *StorageEngine) routingPartitions() []RoutingPartition {
+	var out []RoutingPartition
+	add := func(topic string, partition int32, epoch int64) {
+		out = append(out, RoutingPartition{Topic: topic, Partition: partition, Epoch: epoch})
+	}
+
+	if s.ownership != nil && s.ownership.fenced {
+		for _, key := range s.ownership.OwnedPartitions() {
+			if topic, pid, ok := splitRouteKey(key); ok {
+				add(topic, pid, s.ownership.Epoch(topic, pid))
+			}
+		}
+		return out
+	}
+
+	for topic, parts := range s.metadataCache.TopicsSnapshot() {
+		for pid := range parts {
+			add(topic, pid, 0)
+		}
+	}
+	return out
+}
+
+// Routing returns the cluster view Metadata is answered from.
+//
+// The remote half -- other agents' brokers and the partitions they own -- is a
+// cached snapshot, because Metadata is on the client-facing path and answering
+// it from object storage would put a LIST plus a GET per agent on every request.
+// That snapshot can be up to one refresh interval stale, which is the same order
+// as the failover it exists to survive.
+//
+// This agent's own half is overlaid fresh on every call. A topic created a
+// moment ago is not in the cache until the next refresh, and a client that asked
+// about it and been told it does not exist will not ask again for a while. Both
+// halves are in-memory reads, so this costs no object-store traffic.
+func (s *StorageEngine) Routing() RoutingSnapshot {
+	if s.registry == nil {
+		return RoutingSnapshot{}
+	}
+	snap := s.registry.view()
+	// Deep copy before touching anything: the snapshot's maps are the registry's
+	// live maps, shared with the goroutine that refreshes them. Overlaying local
+	// state into them would be a concurrent map write, and the caller would be
+	// reading a map another goroutine is rebuilding.
+	owners := make(map[string]PartitionRoute, len(snap.Owners)+8)
+	for k, v := range snap.Owners {
+		owners[k] = v
+	}
+	inventory := make(map[string][]int32, len(snap.Partitions)+4)
+	for topic, parts := range snap.Partitions {
+		inventory[topic] = append([]int32(nil), parts...)
+	}
+	snap.Owners = owners
+	snap.Partitions = inventory
+
+	for _, p := range s.routingPartitions() {
+		key := routeKey(p.Topic, p.Partition)
+		snap.Owners[key] = PartitionRoute{
+			AgentID: s.agentID, NodeID: snap.SelfNodeID, Epoch: p.Epoch,
+		}
+		snap.Partitions[p.Topic] = append(snap.Partitions[p.Topic], p.Partition)
+	}
+	for topic, parts := range snap.Partitions {
+		snap.Partitions[topic] = dedupePartitions(parts)
+	}
+	return snap
+}
+
+// dedupePartitions removes repeats from a partition list, which arise because
+// the cached inventory and the freshly overlaid local one both name partitions
+// this agent holds.
+func dedupePartitions(parts []int32) []int32 {
+	if len(parts) < 2 {
+		return parts
+	}
+	seen := make(map[int32]bool, len(parts))
+	out := parts[:0:0]
+	for _, p := range parts {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // restoreDurableState reloads the checkpoint and then repairs anything the
@@ -343,6 +502,16 @@ func (s *StorageEngine) restoreDurableState(ctx context.Context) error {
 		}
 		log.Printf("No usable checkpoint (%v); recovering log position from object storage", err)
 	}
+	// Claim every partition the checkpoint knows about before recovering its
+	// position. The manifest comparison needs our ownership epoch, and an agent
+	// that does not own a partition must not serve it at all, so the claim comes
+	// first.
+	s.claimKnownPartitions(ctx)
+	// The checkpoint carries a whole-bucket inventory, so under ownership it
+	// also carries partitions another agent owns. Dropping them here keeps this
+	// agent's view to what it is responsible for; the per-partition manifests
+	// re-add whatever of the rest exists.
+	s.dropUnownedPartitions()
 	if err := s.recoverManifest(ctx); err != nil {
 		if errors.Is(err, errSuperseded) {
 			return err
@@ -380,12 +549,23 @@ func (s *StorageEngine) appendCore(ctx context.Context, topic string, partition 
 	if err := ctx.Err(); err != nil {
 		return -1, err
 	}
-	// Refuse to write unless this agent still owns the log. A writer whose
-	// lease was taken over would assign offsets that collide with the new
-	// holder's and overwrite its segments; that is silent data loss, so it
-	// has to be a refusal rather than a best-effort write.
-	if err := s.lease.checkWrite(); err != nil {
-		metrics.LeasedOutRefusals.Inc()
+	// Refuse to write unless this agent still holds the fence. A writer whose
+	// claim was taken over would assign offsets that collide with the new
+	// holder's and overwrite its segments; that is silent data loss, so it has
+	// to be a refusal rather than a best-effort write.
+	if err := s.checkWriteFence(topic, partition); err != nil {
+		return -1, err
+	}
+	// A partition created since startup has no claim yet. Claiming costs one
+	// compare-and-swap, once per partition per process, and it happens here
+	// rather than on a request so a produce never pays for it.
+	if s.ownership != nil && !s.ownership.Owns(topic, partition) {
+		if _, err := s.claimPartition(ctx, topic, partition); err != nil {
+			return -1, err
+		}
+	}
+	if err := s.ownership.checkWrite(topic, partition); err != nil {
+		metrics.PartitionWriteRefusals.Inc()
 		return -1, err
 	}
 	// Take the read lock first: once a partition is known the write path
@@ -422,6 +602,187 @@ func (s *StorageEngine) appendCore(ctx context.Context, topic string, partition 
 		return offset, ctx.Err()
 	}
 	return offset, nil
+}
+
+// claimKnownPartitions takes an ownership claim on every partition the
+// recovered metadata knows about, so this agent owns the whole log it is about
+// to serve.
+//
+// A partition already claimed by another live agent is skipped rather than
+// treated as fatal: with ownership enabled, two agents sharing a bucket is the
+// intended steady state, and refusing to start would leave the partition with
+// nobody to serve it. Partitions this agent does not hold are refused at the
+// write path, and phase 3 stops them being read at all.
+func (s *StorageEngine) claimKnownPartitions(ctx context.Context) {
+	if s.ownership == nil || !s.ownership.fenced {
+		return
+	}
+	for topic, parts := range s.metadataCache.TopicsSnapshot() {
+		for pid := range parts {
+			if _, err := s.claimPartition(ctx, topic, pid); err != nil {
+				log.Printf("Ownership: not claiming %s/%d: %v", topic, pid, err)
+			}
+		}
+	}
+}
+
+// dropUnownedPartitions removes from the in-memory view every partition this
+// agent has no claim on.
+//
+// The checkpoint is agent-private but bucket-wide: it lists every partition in
+// the log, including ones another agent is responsible for. Keeping those would
+// let this agent serve a log end offset it cannot append to, and would let
+// Metadata advertise a leader for a partition whose data it does not hold.
+func (s *StorageEngine) dropUnownedPartitions() {
+	if s.ownership == nil || !s.ownership.fenced {
+		return
+	}
+	for _, topic := range s.metadataCache.GetTopics() {
+		for _, pid := range s.metadataCache.GetPartitions(topic) {
+			if !s.ownership.Owns(topic, pid) {
+				s.metadataCache.RemovePartition(topic, pid)
+			}
+		}
+	}
+}
+
+// claimPartition ensures this agent holds a partition's ownership claim and
+// records the epoch on the WAL, which stamps it into every segment the partition
+// seals from here on.
+func (s *StorageEngine) claimPartition(ctx context.Context, topic string, partition int32) (int64, error) {
+	if s.ownership == nil {
+		return 0, nil
+	}
+	epoch, err := s.ownership.Claim(ctx, topic, partition)
+	if err != nil {
+		return 0, err
+	}
+	if epoch > 0 {
+		s.walMgr.SetEpoch(topic, partition, epoch)
+		metrics.WriterEpoch.WithLabelValues(partitionDurabilityKey(topic, partition)).Set(float64(epoch))
+		s.publishRouting(ctx)
+	}
+	return epoch, nil
+}
+
+// publishRouting republishes this agent's routing table if what it owns changed.
+//
+// Waiting for the discovery tick would be wrong here. A partition is claimed on
+// create and on takeover, and a client asking Metadata in the seconds after a
+// topic is created would be told the partition has no leader -- so it would retry
+// against a broker that could serve it, for up to a whole refresh interval. The
+// cost is one conditional PUT per ownership change, which is a rare event, on a
+// path that has already paid for a compare-and-swap.
+func (s *StorageEngine) publishRouting(ctx context.Context) {
+	if s.registry == nil || !s.registry.cfg.Enabled {
+		return
+	}
+	if err := s.registry.publish(ctx, s.routingPartitions()); err != nil {
+		log.Printf("Routing: could not publish after an ownership change: %v", err)
+	}
+}
+
+// checkWriteFence refuses a write when this agent cannot prove it is the only
+// writer. With ownership enabled the fence is per partition; without it, it is
+// the bucket-global lease.
+func (s *StorageEngine) checkWriteFence(topic string, partition int32) error {
+	if s.ownership != nil {
+		return nil // the per-partition check runs separately
+	}
+	if err := s.lease.checkWrite(); err != nil {
+		metrics.LeasedOutRefusals.Inc()
+		return err
+	}
+	return nil
+}
+
+// Owns reports whether this agent may write a partition. With ownership
+// disabled there is nothing per-partition to check and the answer is always
+// yes; the bucket-global lease gates those writes instead.
+func (s *StorageEngine) Owns(topic string, partition int32) bool {
+	if s.ownership == nil {
+		return true
+	}
+	return s.ownership.Owns(topic, partition)
+}
+
+// AgentLive reports whether this agent can currently prove it is alive, which is
+// what gates the group-coordinator role. See registry.Live for why the fence is
+// stricter than partition ownership.
+func (s *StorageEngine) AgentLive() bool {
+	if s.registry == nil {
+		return true
+	}
+	return s.registry.Live()
+}
+
+// LiveAgents lists the live agents as coordinator candidates, sorted and
+// de-duplicated so every agent derives the same list from the same view.
+func (s *StorageEngine) LiveAgents() []coordinator.AgentRef {
+	snap := s.Routing()
+	out := make([]coordinator.AgentRef, 0, len(snap.Brokers))
+	for _, b := range snap.Brokers {
+		out = append(out, coordinator.AgentRef{
+			Agent: b.Agent, NodeID: b.NodeID, Host: b.Host, Port: b.Port,
+		})
+	}
+	return coordinator.SortAgents(out)
+}
+
+// CoordinatorFor names the agent that coordinates a group, by rendezvous hashing
+// over the live set.
+func (s *StorageEngine) CoordinatorFor(groupID string) (coordinator.AgentRef, bool) {
+	return coordinator.Rendezvous(groupID, s.LiveAgents())
+}
+
+// IsCoordinator reports whether this agent currently owns a group's
+// coordination. The protocol layer refuses the request when it does not, which
+// is what stops two agents building independent state for one group while their
+// views of the cluster differ.
+func (s *StorageEngine) IsCoordinator(groupID string) bool {
+	agents := s.LiveAgents()
+	if len(agents) == 0 {
+		// No routing view means no cluster: this agent is the only one there is,
+		// so it coordinates everything. Refusing here instead would make every
+		// group uncoordinated on an agent built without a registry, which is how
+		// unit tests and one-shot tools run it.
+		return true
+	}
+	return coordinator.IsCoordinator(groupID, s.agentID, agents)
+}
+
+// OwnedPartitions reports the partitions this agent holds a claim on.
+func (s *StorageEngine) OwnedPartitions() []string {
+	if s.ownership == nil {
+		return nil
+	}
+	return s.ownership.OwnedPartitions()
+}
+
+// partitionEpoch is the epoch a partition's durable records are stamped with.
+//
+// Under ownership that is the per-partition claim epoch, which is the token
+// that actually fences this partition's writes. Without ownership it falls back
+// to the bucket-global lease epoch, which is the only fence there is.
+func (s *StorageEngine) partitionEpoch(topic string, partition int32) int64 {
+	if s.ownership != nil {
+		if epoch := s.ownership.Epoch(topic, partition); epoch > 0 {
+			return epoch
+		}
+	}
+	return s.lease.Epoch()
+}
+
+// partitionWriter names the agent a partition's durable records are stamped
+// with, for an operator reading a manifest by hand.
+func (s *StorageEngine) partitionWriter(topic string, partition int32) string {
+	if s.ownership != nil {
+		if s.ownership.Owns(topic, partition) {
+			return s.ownership.agentID()
+		}
+		return ""
+	}
+	return s.lease.fencedWriter()
 }
 
 // signalData broadcasts that new data is available.
@@ -482,8 +843,17 @@ func (s *StorageEngine) ReadBatchContext(ctx context.Context, topic string, part
 	}
 
 	// 1. Hot path: the local WAL.
-	if data, next, err := s.walMgr.ReadBatch(topic, partition, offset, budgetFor(oneEntry, maxBytes)); err == nil {
-		return s.reframe(data, offset), next, nil
+	//
+	// Only for a partition this agent owns. A local WAL can hold records written
+	// before a partition moved away, and serving those would hand a consumer data
+	// the current owner has since replaced -- the read-side twin of the write-side
+	// corruption the claim prevents. A non-owner falls through to object storage,
+	// which is authoritative, though stale: it lags whatever the current owner is
+	// writing, which is why long-poll only works on the owner.
+	if s.Owns(topic, partition) {
+		if data, next, err := s.walMgr.ReadBatch(topic, partition, offset, budgetFor(oneEntry, maxBytes)); err == nil {
+			return s.reframe(data, offset), next, nil
+		}
 	}
 
 	// 2. Cold path: object storage.
@@ -596,19 +966,28 @@ func (s *StorageEngine) cachedSegments(ctx context.Context, prefix, cacheKey str
 
 // bestSegmentFor picks the newest segment whose start offset is at or below
 // the requested offset.
+//
+// At an equal start offset the highest ownership epoch wins. Two owners can
+// only write the same base offset if one of them was superseded, and the
+// segment belonging to the newer epoch is the one whose records the current log
+// position was derived from. Preferring the other would read offsets the log
+// has since assigned differently.
 func bestSegmentFor(keys []string, offset int64) string {
 	var bestKey string
-	var bestStart int64 = -1
+	var bestStart, bestEpoch int64 = -1, -1
 	for _, k := range keys {
 		if !strings.HasSuffix(k, ".log") {
 			continue
 		}
-		start := parseOffsetFromKey(k)
-		if start < 0 {
+		start, epoch, ok := parseSegmentKey(k)
+		if !ok || start < 0 {
 			continue
 		}
-		if start <= offset && start > bestStart {
-			bestStart, bestKey = start, k
+		if start > offset {
+			continue
+		}
+		if start > bestStart || (start == bestStart && epoch > bestEpoch) {
+			bestStart, bestEpoch, bestKey = start, epoch, k
 		}
 	}
 	return bestKey
@@ -650,6 +1029,14 @@ func (s *StorageEngine) GetPartitions(topic string) ([]int32, error) {
 // A single-node agent replicates nothing, so the high watermark and the log
 // end offset are the same thing.
 func (s *StorageEngine) HighWaterMark(topic string, partition int32) int64 {
+	// Consulting the WAL for a partition this agent does not own would both
+	// report a stale position and create a local WAL directory for it as a side
+	// effect. A non-owner's answer comes from durable metadata alone, which lags
+	// the current owner -- correct, but behind, which is why a fetch for an
+	// unowned partition is refused rather than served.
+	if !s.Owns(topic, partition) {
+		return s.metadataCache.LogEndOffset(topic, partition)
+	}
 	if l := s.walMgr.HighWaterMark(topic, partition); l > 0 {
 		return l
 	}
@@ -673,6 +1060,21 @@ func (s *StorageEngine) CreateTopic(topic string, partitions int32) error {
 func (s *StorageEngine) CreateTopicContext(ctx context.Context, topic string, partitions int32) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// Claim the new partitions before they can be written to. Doing it here
+	// rather than on first append keeps the compare-and-swap off the produce
+	// path.
+	//
+	// A partition another live agent already holds is not a reason to fail the
+	// whole create: under ownership the partitions of one topic routinely have
+	// different owners, and refusing to create the topic would leave its other
+	// partitions uncreatable by everyone. This agent simply does not own that
+	// one, and will refuse writes to it -- which is the state the other agent
+	// is already in.
+	for i := int32(0); i < partitions; i++ {
+		if _, err := s.claimPartition(ctx, topic, i); err != nil {
+			log.Printf("CreateTopic: not claiming %s/%d: %v", topic, i, err)
+		}
 	}
 	err := s.walMgr.CreateTopic(topic, partitions)
 	if err == nil {
@@ -763,10 +1165,17 @@ func (s *StorageEngine) asyncDeleteTopicOffsets(ctx context.Context, topic strin
 }
 
 func (s *StorageEngine) asyncDeleteTopicFromS3(ctx context.Context, topic string) {
-	// Both the segments and the Phase 0 per-partition manifests live outside a
-	// topic's data prefix, so deleting one does not delete the other.
+	// The segments, the per-partition manifests and the ownership claims all
+	// live outside the topic's data prefix, so deleting one does not delete the
+	// others.
 	s.deletePrefix(ctx, topic+"/")
 	s.deletePrefix(ctx, topicsMetadataPrefix+topic+"/")
+	// Dropping the claims lets another agent pick the topic's partitions up
+	// immediately instead of waiting out the claim TTL. The epoch is not
+	// reusable afterwards, and that is deliberate: a segment or manifest written
+	// under the deleted topic's epoch must never be mistaken for current data if
+	// the topic name is ever reused.
+	s.deletePrefix(ctx, ownersPrefix+topic+"/")
 }
 
 // deletePrefix removes every object under prefix, logging each failure and
@@ -877,10 +1286,12 @@ func (s *StorageEngine) close() {
 	s.walMgr.SealAll()
 	s.drainUploads(shutdownUploadBudget)
 
-	// Stop renewing the lease, but keep holding it: the final offset flush
-	// and checkpoint below still write durable state, and they must not race
-	// a replacement writer taking the log over half way through.
+	// Stop renewing the fence, but keep holding it: the final offset flush
+	// and checkpoint below still write durable state, and they must not race a
+	// replacement writer taking over half way through.
 	s.lease.close()
+	s.ownership.close()
+	s.registry.close()
 
 	close(s.quit)
 
@@ -899,12 +1310,20 @@ func (s *StorageEngine) close() {
 			shutdownFlushBudget)
 	}
 
-	// Hand the log over only once the last durable write has landed.
+	// Hand the log over only once the last durable write has landed. A release
+	// writes a tombstone rather than deleting the claim, so the epoch keeps
+	// moving forward for the next owner; the reasoning is in lease.go.
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownLeaseReleaseBudget)
 	if s.lease != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), shutdownLeaseReleaseBudget)
 		s.lease.release(ctx, s.objStore)
-		cancel()
 	}
+	if s.ownership != nil {
+		s.ownership.release(ctx, s.objStore)
+	}
+	if s.registry != nil {
+		s.registry.release(ctx)
+	}
+	cancel()
 
 	// Anything still parked on object storage is released now rather than
 	// being waited for.
@@ -972,7 +1391,17 @@ func (s *StorageEngine) handleUpload(ctx context.Context, task wal.UploadTask) {
 		return
 	}
 
-	key := fmt.Sprintf("%s/%d/%s", task.Topic, task.Partition, filepath.Base(task.Path))
+	// The sealed file is already named after its base offset and the ownership
+	// epoch that wrote it, so the object key inherits the epoch rather than
+	// deriving it from whatever the partition holds now. That is what makes a
+	// reconciliation re-upload land on the key it already had, and what stops a
+	// superseded owner's upload from overwriting its successor's segment.
+	name := filepath.Base(task.Path)
+	if _, _, ok := wal.ParseSegmentName(name); !ok {
+		log.Printf("Uploader: %s is not a segment name; using the task's base offset", name)
+		name = wal.SegmentName(task.BaseOffset, task.Epoch)
+	}
+	key := fmt.Sprintf("%s/%d/%s", task.Topic, task.Partition, name)
 	indexKey := strings.TrimSuffix(key, ".log") + ".index"
 
 	log.Printf("Uploader: Processing %s (size: %d, source: %s)", key, info.Size(), task.Source)
@@ -1069,14 +1498,23 @@ func (s *StorageEngine) uploadSegments() {
 		topic := parts[0]
 		pID, _ := strconv.ParseInt(parts[1], 10, 32)
 		filename := parts[2]
-		baseOffset, _ := strconv.ParseInt(strings.TrimSuffix(filename, ".log"), 10, 64)
+		baseOffset, fileEpoch, ok := wal.ParseSegmentName(filename)
+		if !ok {
+			return nil
+		}
 
 		task := wal.UploadTask{
 			Topic:      topic,
 			Partition:  int32(pID),
 			Path:       path,
 			BaseOffset: baseOffset,
-			Source:     "reconciliation",
+			// A sealed segment keeps the epoch it was written under, so a
+			// reconciliation re-upload lands on the key it originally had
+			// rather than on whatever epoch the partition holds now. Both are
+			// safe -- the key is what makes them safe -- but reproducing the
+			// original key is what makes the upload idempotent.
+			Epoch:  fileEpoch,
+			Source: "reconciliation",
 		}
 
 		select {
@@ -1225,18 +1663,15 @@ func (s *StorageEngine) checkpointLoop() {
 	}
 }
 
-// SetCoordinator links the group coordinator and replays any group state the
-// checkpoint carried.
+// SetCoordinator links the group coordinator.
 //
 // The durable log position is already restored by NewStorageEngine; this only
-// adds the coordinator, which may not exist yet at engine construction.
+// adds the coordinator, which may not exist yet at engine construction. No group
+// state is replayed: group state is in-memory only (D-4), so a restarted agent
+// starts at generation 0 for every group and members rejoin. Consumer offsets are
+// durable separately and are read from object storage.
 func (s *StorageEngine) SetCoordinator(c *coordinator.Coordinator) {
 	s.coordinator = c
-	if c == nil || s.metadataCache.Coordinator == nil {
-		return
-	}
-	c.FromState(*s.metadataCache.Coordinator)
-	log.Printf("Restored coordinator state from checkpoint")
 }
 
 // applySeeds hands the recovered log end offsets to the WAL manager so the
@@ -1284,18 +1719,29 @@ func (s *StorageEngine) forgetManifestDirty(topic string) {
 // still reads it so an upgrade does not lose the fast path.
 const legacyCheckpointKey = "_meta/checkpoint.json"
 
+// agentNamespace is the key-space name for an agent id.
+//
+// It is the agent id with slashes replaced, because a configured id may contain
+// one and the key must not grow an extra path segment from it. Everything under
+// _agents/<ns>/ has to agree on this, or one agent's checkpoint would be
+// discovered as another's liveness record.
+func agentNamespace(id string) string {
+	if strings.TrimSpace(id) == "" {
+		return defaultAgentID()
+	}
+	return strings.ReplaceAll(id, "/", "_")
+}
+
+// agentsPrefix is this namespace's private area in object storage. It holds one
+// agent's checkpoint plus the cluster routing records (registry.go); nothing
+// else may write under it.
+const agentsPrefix = "_agents/"
+
 // checkpointKey is this agent's private checkpoint object. Namespacing it by
 // agent id is what stops a second agent sharing the bucket from overwriting
 // the checkpoint, which carried the whole topic inventory.
 func (s *StorageEngine) checkpointKey() string {
-	id := s.agentID
-	if id == "" {
-		id = defaultAgentID()
-	}
-	// A configured id may contain a slash; the key must not grow an extra
-	// path segment from it.
-	id = strings.ReplaceAll(id, "/", "_")
-	return "_agents/" + id + "/checkpoint.json"
+	return agentsPrefix + agentNamespace(s.agentID) + "/checkpoint.json"
 }
 
 func (s *StorageEngine) SaveCheckpoint() error {
@@ -1313,11 +1759,6 @@ func (s *StorageEngine) SaveCheckpointContext(ctx context.Context) error {
 	if stored := s.metadataCache.WriterEpoch; stored > s.lease.Epoch() {
 		return fmt.Errorf("refusing to write checkpoint: it was written at epoch %d, this agent holds epoch %d",
 			stored, s.lease.Epoch())
-	}
-
-	if s.coordinator != nil {
-		state := s.coordinator.ToState()
-		s.metadataCache.Coordinator = &state
 	}
 
 	// Carry consumer offsets into the checkpoint so a graceful restart does
@@ -1400,11 +1841,6 @@ func (s *StorageEngine) loadCheckpointInto(ctx context.Context, withRecovery boo
 	if stored := s.metadataCache.WriterEpoch; stored > s.lease.Epoch() {
 		return fmt.Errorf("%w: checkpoint %s was written at epoch %d by %q, this agent holds epoch %d",
 			errSuperseded, key, stored, s.metadataCache.Writer, s.lease.Epoch())
-	}
-
-	if s.coordinator != nil && s.metadataCache.Coordinator != nil {
-		s.coordinator.FromState(*s.metadataCache.Coordinator)
-		log.Printf("Restored coordinator state from checkpoint")
 	}
 
 	if !withRecovery {
@@ -1660,16 +2096,30 @@ func (s *StorageEngine) recoverManifest(ctx context.Context) error {
 		restored += n
 	}
 
-	// Fallback: derive the log end offset from the segments themselves, for
-	// any partition no manifest covers. This also repairs a manifest written
-	// before a partition's final segments were uploaded.
+	// Reconcile against the segments themselves. This is not a fallback for
+	// partitions no manifest covers -- it runs for every partition that has
+	// segments, because a manifest is a snapshot and a crash can leave one
+	// behind the objects it describes.
+	//
+	// The failure that makes this mandatory: an owner appends to offset 20,
+	// uploads the segment, and dies before the next checkpoint. Its manifest
+	// still says 10. The next owner trusts that, and starts writing at 10 --
+	// over records the previous owner had already acknowledged, because D2
+	// releases an acks=all producer the moment the segment lands, not when the
+	// manifest catches up. Nothing in the manifest hints that the objects are
+	// further ahead, so nothing short of looking can notice.
+	//
+	// Object storage is the system of record here, so recovery derives the truth
+	// from it and takes the maximum of the two.
 	for _, topic := range s.discoverTopics(ctx) {
+		segmentsByPartition, err := s.objectSegmentsByPartition(ctx, topic)
+		if err != nil {
+			log.Printf("Recovery: could not list segments of %s: %v", topic, err)
+			continue
+		}
 		for _, partition := range s.metadataCache.GetPartitions(topic) {
-			if s.metadataCache.LogEndOffset(topic, partition) > 0 && !s.needsObjectRecovery(topic, partition) {
-				continue
-			}
-			segments, err := s.objectSegments(ctx, topic, partition)
-			if err != nil || len(segments) == 0 {
+			segments := segmentsByPartition[partition]
+			if len(segments) == 0 {
 				continue
 			}
 			leo, start, err := s.endOffsetsFromObject(ctx, topic, partition, segments)
@@ -1677,11 +2127,38 @@ func (s *StorageEngine) recoverManifest(ctx context.Context) error {
 				log.Printf("Recovery: could not determine end of %s/%d: %v", topic, partition, err)
 				continue
 			}
-			if leo > s.metadataCache.LogEndOffset(topic, partition) {
+			// Both ends are reconciled, and in opposite directions.
+			//
+			// The log end is raised to what the objects hold: a manifest behind
+			// its own segments is the crash case, and trusting it makes the next
+			// writer append over acknowledged records.
+			//
+			// The log start is lowered to the oldest segment present. It has to
+			// move even when the log end was already right, because ListOffsets
+			// reports this value to every consumer that resets to the start of
+			// the log -- and a start that is too high hides data that is still
+			// there, with no error anywhere. That is the same object storage is
+			// the system of record argument, applied to the other end.
+			manifestEnd := s.metadataCache.LogEndOffset(topic, partition)
+			manifestStart := s.metadataCache.LogStartOffset(topic, partition)
+
+			if leo > manifestEnd || start < manifestStart {
 				s.metadataCache.SetPartitionState(topic, partition, leo, start, segments)
 				// Persist the repaired position so the next restart does not
 				// pay for the same segment read.
 				s.markManifestDirty(topic, partition)
+				metrics.ObjectsReconciled.Inc()
+				if leo > manifestEnd {
+					// Loud on purpose: a manifest that lags the objects is the
+					// signature of a crash mid-append, and it is the thing that
+					// would silently truncate the log if it went unnoticed.
+					log.Printf("Recovery: %s/%d objects end at %d but the manifest said %d; taking the objects",
+						topic, partition, leo, manifestEnd)
+				}
+				if start < manifestStart {
+					log.Printf("Recovery: %s/%d manifest reported log start %d but segments from %d are present; lowering it",
+						topic, partition, manifestStart, start)
+				}
 				restored++
 			}
 		}
@@ -1691,28 +2168,6 @@ func (s *StorageEngine) recoverManifest(ctx context.Context) error {
 		log.Printf("Storage: recovered log position for %d partition(s) from object storage", restored)
 	}
 	return nil
-}
-
-// needsObjectRecovery reports whether the durable position might lag the
-// segments in object storage. Conservative on purpose: an extra range read is
-// cheap next to handing out a duplicate offset.
-func (s *StorageEngine) needsObjectRecovery(topic string, partition int32) bool {
-	snapshot := s.metadataCache.TopicsSnapshot()
-	parts, ok := snapshot[topic]
-	if !ok {
-		return true
-	}
-	ps, ok := parts[partition]
-	if !ok {
-		return true
-	}
-	// The log end offset must cover the last known segment.
-	for _, seg := range ps.Segments {
-		if seg.EndOffset > ps.LogEndOffset {
-			return true
-		}
-	}
-	return false
 }
 
 // discoverTopics lists the topic prefixes present in object storage. A topic
@@ -1732,16 +2187,69 @@ func (s *StorageEngine) discoverTopics(ctx context.Context) []string {
 	return s.metadataCache.GetTopics()
 }
 
+// objectSegmentsByPartition lists the uploaded segments of every partition of a
+// topic in one pass.
+//
+// Recovery verifies every partition against object storage, so a LIST per
+// partition would make startup cost scale with partitions times a round trip.
+// One LIST per topic, grouped in memory, keeps it to one LIST per topic plus a
+// small read per partition.
+func (s *StorageEngine) objectSegmentsByPartition(ctx context.Context, topic string) (map[int32][]*SegmentMetadata, error) {
+	objects, err := s.objList(ctx, topic+"/")
+	if err != nil {
+		return nil, err
+	}
+
+	// filterSegments has already ordered by base offset and then by descending
+	// epoch, and dropped anything that is not a segment, so the first entry seen
+	// for an offset is the live one.
+	byPartition := make(map[int32][]*SegmentMetadata)
+	seen := make(map[string]bool) // "<partition>:<base offset>"
+	for _, o := range filterSegments(objects) {
+		off, _, ok := parseSegmentKey(o.Key)
+		if !ok {
+			continue
+		}
+		rest := strings.TrimPrefix(o.Key, topic+"/")
+		slash := strings.LastIndex(rest, "/")
+		if slash <= 0 {
+			continue
+		}
+		pid, convErr := strconv.ParseInt(rest[:slash], 10, 32)
+		if convErr != nil {
+			continue
+		}
+		// Every partition has a segment at offset 0, so the key has to include
+		// the partition: deduping on the offset alone would drop all but the
+		// first partition's opening segment.
+		key := rest[:slash] + ":" + strconv.FormatInt(off, 10)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		byPartition[int32(pid)] = append(byPartition[int32(pid)], &SegmentMetadata{
+			StartOffset: off, S3Key: o.Key, EndOffset: -1,
+		})
+	}
+	return byPartition, nil
+}
+
 // objectSegments lists the uploaded segments of a partition, oldest first.
+//
+// A base offset can appear more than once when a superseded owner uploaded after
+// its successor had already written at that offset. Only the highest epoch at
+// each offset is part of the live log; the rest are unreachable garbage that
+// bestSegmentFor would never pick, and retention reclaims them.
 func (s *StorageEngine) objectSegments(ctx context.Context, topic string, partition int32) ([]*SegmentMetadata, error) {
 	objects, err := s.objList(ctx, partitionPrefix(topic, partition))
 	if err != nil {
 		return nil, err
 	}
-	segs := filterSegments(objects)
-	out := make([]*SegmentMetadata, 0, len(segs))
-	for _, o := range segs {
-		out = append(out, &SegmentMetadata{StartOffset: parseOffsetFromKey(o.Key), S3Key: o.Key, EndOffset: -1})
+	live := filterLiveSegments(filterSegments(objects))
+	out := make([]*SegmentMetadata, 0, len(live))
+	for _, o := range live {
+		off, _, _ := parseSegmentKey(o.Key)
+		out = append(out, &SegmentMetadata{StartOffset: off, S3Key: o.Key, EndOffset: -1})
 	}
 	return out, nil
 }
@@ -1752,6 +2260,14 @@ func (s *StorageEngine) objectSegments(ctx context.Context, topic string, partit
 // It uses the index sidecar to seek to the final indexed entry, then reads
 // forward. The result is the offset just past the last record, which is what
 // the next append must use.
+//
+// The second return value is the partition's log start: the base offset of the
+// *oldest* segment, which is what ListOffsets("earliest") has to report. It is
+// deliberately derived from the segment list rather than from the entries walked
+// below: those all belong to the newest segment, so returning one of them would
+// make the log start the newest segment's base offset and point every consumer
+// that resets to the start of the log past every older segment -- silently, and
+// with the data still present in object storage.
 func (s *StorageEngine) endOffsetsFromObject(ctx context.Context, topic string, partition int32, segments []*SegmentMetadata) (int64, int64, error) {
 	last := segments[len(segments)-1]
 	baseOffset := last.StartOffset
@@ -1786,7 +2302,7 @@ func (s *StorageEngine) endOffsetsFromObject(ctx context.Context, topic string, 
 	}
 	defer func() { _ = rc.Close() }()
 
-	end, start := baseOffset, baseOffset
+	end := baseOffset
 	for {
 		hdr := make([]byte, entryHeader)
 		if _, err := io.ReadFull(rc, hdr); err != nil {
@@ -1805,12 +2321,20 @@ func (s *StorageEngine) endOffsetsFromObject(ctx context.Context, topic string, 
 		if count == 0 {
 			count = 1
 		}
-		if off >= start {
-			start = off
-		}
 		end = off + int64(count)
 	}
 
 	last.EndOffset = end
+
+	// The log start is the base offset of the *oldest* segment present, not of
+	// anything walked above -- every entry walked above belongs to the newest
+	// segment. Returning one of them would make the log start the newest
+	// segment's base offset, which is what ListOffsets("earliest") then reports
+	// to every consumer that resets to the start of the log. The data is still in
+	// object storage, nothing errors, and those consumers skip it silently.
+	start := int64(0)
+	if segments[0].StartOffset >= 0 {
+		start = segments[0].StartOffset
+	}
 	return end, start, nil
 }

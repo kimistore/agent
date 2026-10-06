@@ -36,6 +36,7 @@ func clearEnv(t *testing.T) {
 		"KIMISTORE_RETENTION_BYTES", "KIMISTORE_RETENTION_MS", "KIMISTORE_RETENTION_CHECK_MS",
 		"KIMISTORE_S3_TIMEOUT_MS", "KIMISTORE_WRITER_LEASE", "KIMISTORE_LEASE_KEY",
 		"KIMISTORE_WRITER_ID", "KIMISTORE_LEASE_TTL_MS", "KIMISTORE_REQUIRE_LEASE",
+		"KIMISTORE_PARTITION_OWNERSHIP", "KIMISTORE_OWNERSHIP_TTL_MS", "KIMISTORE_AGENT_ID",
 	} {
 		t.Setenv(name, "")
 	}
@@ -52,15 +53,18 @@ func TestFromEnv_DefaultsAreValid(t *testing.T) {
 		t.Fatalf("the default configuration does not validate: %v", err)
 	}
 
-	if !cfg.Lease.Enabled {
-		t.Error("the writer lease must be on by default; it is what stops a second agent corrupting the log")
+	if !cfg.Ownership.Enabled {
+		t.Error("per-partition ownership must be on by default; it is what stops a second agent corrupting the log")
+	}
+	if cfg.Lease.Enabled {
+		t.Error("the bucket-global lease must be off when ownership is on: one fence at a time")
 	}
 	if !cfg.RequireLease {
 		t.Error("a store that cannot fence writers should be fatal by default")
 	}
-	if cfg.Lease.TTL <= cfg.S3Timeout {
-		t.Errorf("default lease TTL %s must exceed the default S3 timeout %s, or a slow renewal reads as a lost lease",
-			cfg.Lease.TTL, cfg.S3Timeout)
+	if cfg.Ownership.TTL <= cfg.S3Timeout {
+		t.Errorf("default ownership TTL %s must exceed the default S3 timeout %s, or a slow renewal reads as a lost claim",
+			cfg.Ownership.TTL, cfg.S3Timeout)
 	}
 	if cfg.AdvertisedPort != 19092 {
 		t.Errorf("advertised port = %d, want the listen port", cfg.AdvertisedPort)
@@ -70,24 +74,63 @@ func TestFromEnv_DefaultsAreValid(t *testing.T) {
 	}
 }
 
-// A lease TTL at or below the storage timeout turns every slow renewal into a
+// A claim TTL at or below the storage timeout turns every slow renewal into a
 // lost claim, and lets a replacement start while the previous agent is alive.
-func TestValidate_RejectsLeaseTTLShorterThanTheStorageTimeout(t *testing.T) {
+func TestValidate_RejectsClaimTTLShorterThanTheStorageTimeout(t *testing.T) {
+	clearEnv(t)
+
 	cfg := FromEnv()
-	cfg.Lease.TTL = cfg.S3Timeout
+	cfg.Ownership.TTL = cfg.S3Timeout
 
 	err := cfg.Validate()
 	if err == nil {
-		t.Fatal("a lease TTL equal to the storage timeout should be rejected")
+		t.Fatal("an ownership TTL equal to the storage timeout should be rejected")
 	}
-	if !strings.Contains(err.Error(), "lease TTL") {
-		t.Fatalf("the error should name the lease, got %v", err)
+	if !strings.Contains(err.Error(), "partition ownership TTL") {
+		t.Fatalf("the error should name the fence in force, got %v", err)
 	}
 
-	// Disabling the lease removes the constraint: there is no claim to lose.
-	cfg.Lease.Enabled = false
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("with the lease off there is no TTL constraint: %v", err)
+	// The bucket-global lease is subject to the same rule when it is the fence.
+	clearEnv(t)
+	t.Setenv("KIMISTORE_PARTITION_OWNERSHIP", "false")
+	cfg = FromEnv()
+	cfg.Lease.TTL = cfg.S3Timeout
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a lease TTL equal to the storage timeout should be rejected")
+	}
+	if err := cfg.Validate(); !strings.Contains(err.Error(), "lease TTL") {
+		t.Fatalf("the error should name the lease, got %v", err)
+	}
+}
+
+// The two fences are alternatives. Turning ownership on has to turn the
+// bucket-global claim off, or a second agent would be refused outright and
+// per-partition ownership would buy nothing.
+func TestFromEnv_OwnershipReplacesTheBucketLease(t *testing.T) {
+	clearEnv(t)
+	cfg := FromEnv()
+	if cfg.Ownership.Enabled != true || cfg.Lease.Enabled != false {
+		t.Fatalf("defaults are ownership=%v lease=%v, want ownership on and the bucket lease off",
+			cfg.Ownership.Enabled, cfg.Lease.Enabled)
+	}
+
+	// Opting out restores the previous behaviour exactly.
+	clearEnv(t)
+	t.Setenv("KIMISTORE_PARTITION_OWNERSHIP", "false")
+	cfg = FromEnv()
+	if cfg.Ownership.Enabled {
+		t.Error("KIMISTORE_PARTITION_OWNERSHIP=false must disable ownership")
+	}
+	if !cfg.Lease.Enabled {
+		t.Error("with ownership off the bucket-global writer lease must come back")
+	}
+
+	// And the bucket lease can still be switched off independently.
+	clearEnv(t)
+	t.Setenv("KIMISTORE_PARTITION_OWNERSHIP", "false")
+	t.Setenv("KIMISTORE_WRITER_LEASE", "false")
+	if cfg = FromEnv(); cfg.Lease.Enabled {
+		t.Error("KIMISTORE_WRITER_LEASE=false must be honoured")
 	}
 }
 
@@ -114,6 +157,7 @@ func TestFromEnv_ReadsTheEnvironment(t *testing.T) {
 	t.Setenv("KIMISTORE_WAL_DIR", "/var/lib/kimi")
 	t.Setenv("KIMISTORE_ADVERTISED_HOST", "ingest.example.com")
 	t.Setenv("KIMISTORE_S3_TIMEOUT_MS", "5000")
+	t.Setenv("KIMISTORE_PARTITION_OWNERSHIP", "false")
 	t.Setenv("KIMISTORE_WRITER_LEASE", "false")
 	t.Setenv("KIMISTORE_WRITER_ID", "writer-a")
 	t.Setenv("KIMISTORE_LEASE_TTL_MS", "20000")
@@ -135,6 +179,9 @@ func TestFromEnv_ReadsTheEnvironment(t *testing.T) {
 	}
 	if cfg.S3Timeout != 5*time.Second {
 		t.Errorf("S3Timeout = %s, want 5s", cfg.S3Timeout)
+	}
+	if cfg.Ownership.Enabled {
+		t.Error("KIMISTORE_PARTITION_OWNERSHIP=false must disable ownership")
 	}
 	if cfg.Lease.Enabled {
 		t.Error("KIMISTORE_WRITER_LEASE=false must disable the lease")
@@ -163,13 +210,14 @@ func TestFromEnv_InvalidValuesFallBackWithDefaults(t *testing.T) {
 
 	t.Setenv("KIMISTORE_S3_TIMEOUT_MS", "not-a-number")
 	t.Setenv("KIMISTORE_WRITER_LEASE", "yes-please")
+	t.Setenv("KIMISTORE_PARTITION_OWNERSHIP", "yes-please")
 	t.Setenv("KIMISTORE_AUTO_CREATE_PARTITIONS", "3.5")
 
 	cfg := FromEnv()
 	if cfg.S3Timeout != 30*time.Second {
 		t.Errorf("S3Timeout = %s, want the 30s default", cfg.S3Timeout)
 	}
-	if !cfg.Lease.Enabled {
+	if !cfg.Ownership.Enabled {
 		t.Error("an unparseable boolean should fall back to the default, which is on")
 	}
 	if cfg.AutoCreatePartitions != 1 {

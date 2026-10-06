@@ -103,5 +103,20 @@ bench: ## Run the WAL append benchmarks
 e2e: build ## Run the Mimir end-to-end test (needs Docker)
 	./test/mimir-e2e.sh
 
+# e2e checks that the data is there. e2e-integrity checks that it is intact: it
+# pushes a volume whose every sample value is computable, then verifies per-series
+# counts and value sums, per-slice counts, and all of it again after a broker
+# crash, a broker restart, and a full Mimir restart. It takes several minutes and
+# needs the logprobe built for the container it verifies ListOffsets with.
+.PHONY: e2e-integrity
+e2e-integrity: build ## Run the volume integrity end-to-end test (needs Docker, slow)
+	@case "$$(uname -m)" in \
+	  arm64) arch=arm64 ;; \
+	  *)     arch=amd64 ;; \
+	esac; \
+	echo "building the linux/$$arch logprobe for the docker check"; \
+	GOOS=linux GOARCH=$$arch go build -o /tmp/kimi-logprobe ./test/logprobe
+	./test/mimir-integrity-e2e.sh
+
 .PHONY: ci
 ci: fmt-check vet tidy-check race ## Everything CI runs on a pull request

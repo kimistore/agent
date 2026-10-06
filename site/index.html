@@ -808,13 +808,15 @@ p.<span class="c-fn">put</span>(<span class="c-str">"value.deserializer"</span>,
             <li>Transparent tiered storage: hot local WAL with 64 MB rolling segments and parallel S3 uploader pool</li>
             <li>MessageSet v0/v1 and RecordBatch v2 with exact record-level offset accounting across GZIP, Snappy, and LZ4</li>
             <li>CreateTopics, DeleteTopics, ListGroups, DescribeGroups, and SASL PLAIN authentication</li>
-            <li>Comprehensive Prometheus metrics on port 9091 covering request latencies, WAL recoveries, retention, and the writer lease</li>
+            <li>Partition ownership and routing: each agent claims the partitions it writes in S3, publishes where it can be reached, and Metadata routes clients to the agent that owns each partition</li>
+            <li>HA consumer groups: the coordinator is picked by rendezvous hashing over the live agent set and every group request is fenced, so only the elected agent acts on a group</li>
+            <li>Comprehensive Prometheus metrics on port 9091 covering request latencies, WAL recoveries, retention, ownership claims and cluster routing</li>
           </ul>
         </div>
         <div class="reveal">
           <h3 class="status-h status-h--todo">Architectural scope &amp; non-goals</h3>
           <ul class="todo-list">
-            <li>Single-node architecture by design: no multi-broker replication, ISR quorums, or partition leader elections. One agent owns one log: a writer lease in object storage stops a second agent from silently corrupting it</li>
+            <li>No replication or ISR quorums: durability comes from object storage, not replicas. One writer per partition, fenced by a compare-and-swap claim in S3, so a second agent cannot silently corrupt a partition</li>
             <li>Standard Kafka at-least-once streaming: no 2PC distributed transactions or transactional producer IDs</li>
             <li>Built-in SASL PLAIN authentication: topic-level ACL authorization is not enforced</li>
             <li>Dynamic consumer rebalance assignment: delegates partition assignment to group leader without cooperative sticky protocols</li>

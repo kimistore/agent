@@ -25,8 +25,6 @@ import (
 	"sort"
 	"strconv"
 	"sync"
-
-	"kimistore/internal/coordinator"
 )
 
 // MetadataCache is the broker's authoritative view of what exists: which
@@ -38,12 +36,23 @@ import (
 // trusted the WAL alone would rewind the log to zero and start handing out
 // offsets that are already taken.
 type MetadataCache struct {
-	Topics      map[string]*TopicState        `json:"topics"`
-	Coordinator *coordinator.CoordinatorState `json:"coordinator,omitempty"`
+	Topics map[string]*TopicState `json:"topics"`
 	// Committed carries per-group consumer offsets so retention's log start
 	// survives a restart without re-reading every offset object. Object
 	// storage remains authoritative; this is a fast path on top of it.
 	Committed map[string]map[string]int64 `json:"committed_offsets,omitempty"`
+
+	// Consumer group state is deliberately absent, and used to be here.
+	//
+	// Group state cannot be persisted across a coordinator change: the members
+	// in a restored group belonged to connections on a process that has exited,
+	// and their assignments were computed against a member set that no longer
+	// exists. Replaying it produces a group that looks alive and rebalances
+	// wrongly. It is rebuilt from JoinGroup instead, which is the same cost as a
+	// full rebalance -- the cost D-4 already accepts.
+	//
+	// Offsets are the exception and are still carried here, because they are the
+	// one part of a group that is genuinely durable and genuinely needed.
 
 	// WriterEpoch is the writer-lease epoch of the agent that wrote this
 	// checkpoint. A restart that reads a checkpoint stamped with a higher
@@ -353,7 +362,6 @@ func (mc *MetadataCache) FromJSON(data []byte) error {
 		}
 	}
 	mc.Topics = state.Topics
-	mc.Coordinator = state.Coordinator
 	mc.Committed = state.Committed
 	mc.WriterEpoch = state.WriterEpoch
 	mc.Writer = state.Writer

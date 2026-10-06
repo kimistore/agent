@@ -35,7 +35,7 @@ import (
 
 func benchAppend(b *testing.B, sync bool) {
 	dir := b.TempDir()
-	pw, err := NewPartitionWAL(dir, "bench", 0, 0, nil)
+	pw, err := NewPartitionWAL(dir, "bench", 0, 0, 0, nil)
 	if err != nil {
 		b.Fatalf("open: %v", err)
 	}
@@ -65,7 +65,7 @@ func BenchmarkAppendAcksAll_Sync(b *testing.B) { benchAppend(b, true) }
 // that used to corrupt the position index.
 func BenchmarkAppendRoundTrip(b *testing.B) {
 	dir := b.TempDir()
-	pw, err := NewPartitionWAL(dir, "bench", 0, 0, nil)
+	pw, err := NewPartitionWAL(dir, "bench", 0, 0, 0, nil)
 	if err != nil {
 		b.Fatalf("open: %v", err)
 	}
@@ -97,7 +97,7 @@ func BenchmarkAppendRoundTrip(b *testing.B) {
 // that the barrier is affordable under concurrent load.
 func BenchmarkAppendConcurrentSync(b *testing.B) {
 	dir := b.TempDir()
-	pw, err := NewPartitionWAL(dir, "bench", 0, 0, nil)
+	pw, err := NewPartitionWAL(dir, "bench", 0, 0, 0, nil)
 	if err != nil {
 		b.Fatalf("open: %v", err)
 	}
@@ -123,7 +123,7 @@ func BenchmarkAppendConcurrentSync(b *testing.B) {
 // BenchmarkAppendConcurrentNoSync is the control for the benchmark above.
 func BenchmarkAppendConcurrentNoSync(b *testing.B) {
 	dir := b.TempDir()
-	pw, err := NewPartitionWAL(dir, "bench", 0, 0, nil)
+	pw, err := NewPartitionWAL(dir, "bench", 0, 0, 0, nil)
 	if err != nil {
 		b.Fatalf("open: %v", err)
 	}

@@ -76,18 +76,36 @@ func main() {
 			TTL:     cfg.Lease.TTL,
 			Require: cfg.RequireLease,
 		}),
+		storage.WithOwnership(storage.OwnershipConfig{
+			Enabled: cfg.Ownership.Enabled,
+			Agent:   cfg.Ownership.Agent,
+			TTL:     cfg.Ownership.TTL,
+			Require: cfg.RequireLease,
+		}),
 		storage.WithOperationTimeout(cfg.S3Timeout),
 		storage.WithAgentID(cfg.AgentID),
 		storage.WithFlushInterval(cfg.FlushInterval),
+		storage.WithRegistry(storage.RegistryConfig{
+			Enabled: true,
+			AgentID: cfg.AgentID,
+			NodeID:  cfg.NodeID,
+			Host:    cfg.AdvertisedHost,
+			Port:    cfg.AdvertisedPort,
+			TTL:     cfg.Ownership.TTL,
+		}),
 	)
 	if err != nil {
 		// A lease refusal and a superseded-writer refusal are both "another
 		// agent owns this log" and both are fatal. Serving anyway would
 		// reissue offsets that are already taken and overwrite the segments
 		// behind them, which is silent data loss rather than a failed start.
+		// A partition that is merely already claimed by a live peer is not
+		// fatal: this agent serves the rest of the log.
 		switch {
 		case errors.Is(err, storage.ErrLeaseHeld):
 			log.Fatalf("Another agent already holds the writer lease for this bucket: %v", err)
+		case errors.Is(err, storage.ErrPartitionHeld):
+			log.Fatalf("Another agent holds a partition this agent needs to serve: %v", err)
 		case strings.Contains(err.Error(), "newer writer"):
 			log.Fatalf("Refusing to start: %v", err)
 		}
@@ -131,6 +149,7 @@ func main() {
 		},
 		AdvertisedHost:       cfg.AdvertisedHost,
 		AdvertisedPort:       cfg.AdvertisedPort,
+		NodeID:               cfg.NodeID,
 		AutoCreateTopics:     cfg.AutoCreateTopics,
 		AutoCreatePartitions: cfg.AutoCreatePartitions,
 	})

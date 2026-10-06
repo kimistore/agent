@@ -26,9 +26,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
+	"sync/atomic"
 
 	"kimistore/internal/metrics"
 )
@@ -54,7 +53,12 @@ type UploadTask struct {
 	// lands, so an acks=all producer waiting on the segment can be released.
 	// It is zero for a reconciliation task, whose segment predates any waiter.
 	EndOffset int64
-	Source    string // fast-path or reconciliation
+	// Epoch is the ownership epoch in force when the segment was sealed. It
+	// goes into the object-store key so a segment written by an owner that has
+	// since been superseded cannot overwrite its successor's segment at the
+	// same base offset. Zero for a partition with no ownership claim.
+	Epoch  int64
+	Source string // fast-path or reconciliation
 }
 
 type PartitionWAL struct {
@@ -98,6 +102,12 @@ type PartitionWAL struct {
 	// files, because local files understate the log once segments have been
 	// offloaded.
 	seed int64
+
+	// epoch is the ownership epoch this partition is being written under. It is
+	// stamped into every sealed segment name, so it has to be readable by roll
+	// without holding mu (roll is called from the append path) and updated
+	// without the same lock when ownership is claimed or re-claimed.
+	epoch atomic.Int64
 }
 
 // NewPartitionWAL opens (or creates) the WAL for a partition.
@@ -107,7 +117,7 @@ type PartitionWAL struct {
 // the log stands, because the local directory cannot answer that question
 // once sealed segments have been offloaded and deleted. Pass 0 when there is
 // nothing durable to restore, in which case the local files are used.
-func NewPartitionWAL(dir string, topic string, partition int32, seed int64, onRoll func(UploadTask)) (*PartitionWAL, error) {
+func NewPartitionWAL(dir string, topic string, partition int32, seed int64, epoch int64, onRoll func(UploadTask)) (*PartitionWAL, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
@@ -120,12 +130,28 @@ func NewPartitionWAL(dir string, topic string, partition int32, seed int64, onRo
 		onRoll:    onRoll,
 		seed:      seed,
 	}
+	pw.epoch.Store(epoch)
 
 	if err := pw.loadState(); err != nil {
 		return nil, err
 	}
 
 	return pw, nil
+}
+
+// SetEpoch records the ownership epoch this partition is written under. It
+// applies from the next sealed segment onward: a segment already named on disk
+// keeps the epoch it was written with, which is the whole point of putting the
+// epoch in the name.
+func (p *PartitionWAL) SetEpoch(epoch int64) {
+	if epoch > p.epoch.Load() {
+		p.epoch.Store(epoch)
+	}
+}
+
+// Epoch is the ownership epoch this partition is currently written under.
+func (p *PartitionWAL) Epoch() int64 {
+	return p.epoch.Load()
 }
 
 // SeedPartition tells an already-open partition where the log actually ends.
@@ -242,22 +268,18 @@ func (p *PartitionWAL) findMaxSealedOffset() (int64, error) {
 		return 0, err
 	}
 
-	var offsets []int64
+	var names []string
 	for _, file := range files {
-		if file.IsDir() || file.Name() == "active.log" {
+		if file.IsDir() {
 			continue
 		}
-		if strings.HasSuffix(file.Name(), ".log") {
-			name := strings.TrimSuffix(file.Name(), ".log")
-			off, err := strconv.ParseInt(name, 10, 64)
-			if err == nil {
-				offsets = append(offsets, off)
-			}
+		if _, _, ok := ParseSegmentName(file.Name()); !ok {
+			continue
 		}
+		names = append(names, file.Name())
 	}
-	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
 
-	if len(offsets) == 0 {
+	if len(names) == 0 {
 		return 0, nil
 	}
 
@@ -266,9 +288,19 @@ func (p *PartitionWAL) findMaxSealedOffset() (int64, error) {
 	// If we have 0.log, 100.log.
 	// nextOffset is effectively unknown without reading the last file.
 	// So let's open the last file and read it to end.
-
-	lastStart := offsets[len(offsets)-1]
-	lastPath := filepath.Join(p.dir, fmt.Sprintf("%020d.log", lastStart))
+	//
+	// The newest segment is the highest base offset, and at a tie the highest
+	// epoch: that is the one a re-claimed partition wrote last, so its end
+	// offset is the one the log must continue from.
+	last := names[0]
+	lastStart, lastEpoch, _ := ParseSegmentName(last)
+	for _, name := range names[1:] {
+		off, ep, _ := ParseSegmentName(name)
+		if off > lastStart || (off == lastStart && ep > lastEpoch) {
+			last, lastStart, lastEpoch = name, off, ep
+		}
+	}
+	lastPath := filepath.Join(p.dir, last)
 
 	f, err := os.Open(lastPath)
 	if err != nil {
@@ -625,9 +657,11 @@ func (p *PartitionWAL) roll() error {
 	}
 	p.activeFile = nil
 
-	// Rename to sealed (using 0-padded activeBaseOffset)
+	// Rename to sealed, naming the segment after its base offset and the
+	// ownership epoch that wrote it. The epoch is what keeps a superseded
+	// writer's segment from landing on top of its successor's.
 	oldPath := filepath.Join(p.dir, "active.log")
-	newPath := filepath.Join(p.dir, fmt.Sprintf("%020d.log", p.activeBaseOffset))
+	newPath := filepath.Join(p.dir, SegmentName(p.activeBaseOffset, p.epoch.Load()))
 
 	if err := os.Rename(oldPath, newPath); err != nil {
 		// The rename failed but the data is still intact under the old name.
@@ -668,6 +702,7 @@ func (p *PartitionWAL) roll() error {
 			// The new active segment is empty, so nextOffset is exactly the
 			// end of the segment just sealed.
 			EndOffset: p.nextOffset,
+			Epoch:     p.epoch.Load(),
 		})
 	}
 
@@ -900,24 +935,28 @@ func (p *PartitionWAL) readFromSealedBatch(offset int64, maxBytes int64, single 
 		return nil, 0, err
 	}
 
-	var candidates []int64
+	var candidates []string
 	for _, file := range files {
-		if strings.HasSuffix(file.Name(), ".log") && file.Name() != "active.log" {
-			name := strings.TrimSuffix(file.Name(), ".log")
-			off, err := strconv.ParseInt(name, 10, 64)
-			if err == nil && off <= offset {
-				candidates = append(candidates, off)
-			}
+		if off, _, ok := ParseSegmentName(file.Name()); ok && off <= offset {
+			candidates = append(candidates, file.Name())
 		}
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i] > candidates[j] })
+	// Newest segment first: highest base offset, and at a tie the highest
+	// epoch, since that is the copy a re-claimed partition wrote last.
+	sort.Slice(candidates, func(i, j int) bool {
+		oi, ei, _ := ParseSegmentName(candidates[i])
+		oj, ej, _ := ParseSegmentName(candidates[j])
+		if oi != oj {
+			return oi > oj
+		}
+		return ei > ej
+	})
 
 	if len(candidates) == 0 {
 		return nil, 0, fmt.Errorf("offset %d not found in any local segment", offset)
 	}
 
-	targetStart := candidates[0]
-	path := filepath.Join(p.dir, fmt.Sprintf("%020d.log", targetStart))
+	path := filepath.Join(p.dir, candidates[0])
 
 	f, err := os.Open(path)
 	if err != nil {

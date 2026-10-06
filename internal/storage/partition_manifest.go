@@ -67,9 +67,15 @@ func parsePartitionManifestKey(key string) (topic string, partition int32, ok bo
 }
 
 // perPartitionManifest is the durable position of one partition, including the
-// writer epoch that makes it possible to tell a stale writer's record from a
-// current one.
+// epoch that makes it possible to tell a stale writer's record from a current
+// one.
+//
+// With partition ownership that is the per-partition ownership epoch, stamped
+// from the claim this agent holds rather than from the bucket-global lease.
+// Epoch is the newer name for it; WriterEpoch is what pre-ownership agents
+// wrote and is still read so an upgrade recovers the same position.
 type perPartitionManifest struct {
+	Epoch          int64              `json:"epoch,omitempty"`
 	WriterEpoch    int64              `json:"writer_epoch,omitempty"`
 	Writer         string             `json:"writer,omitempty"`
 	Topic          string             `json:"topic"`
@@ -77,6 +83,15 @@ type perPartitionManifest struct {
 	LogEndOffset   int64              `json:"log_end_offset"`
 	LogStartOffset int64              `json:"log_start_offset"`
 	Segments       []*SegmentMetadata `json:"segments,omitempty"`
+}
+
+// storedEpoch is the epoch this manifest was written under, accepting either
+// field so a manifest from before per-partition ownership still fences.
+func (m perPartitionManifest) storedEpoch() int64 {
+	if m.Epoch > 0 {
+		return m.Epoch
+	}
+	return m.WriterEpoch
 }
 
 // savePartitionManifests writes the durable position of every partition whose
@@ -114,8 +129,6 @@ func (s *StorageEngine) savePartitionManifests(ctx context.Context) error {
 		}
 	}
 
-	epoch := s.lease.Epoch()
-	writer := s.lease.fencedWriter()
 	written := 0
 	var firstErr error
 
@@ -127,13 +140,21 @@ func (s *StorageEngine) savePartitionManifests(ctx context.Context) error {
 				continue
 			}
 
+			// Never write a partition this agent does not own. Under ownership
+			// the record would be stamped with an epoch it has no claim for, and
+			// the real owner would then read a position it did not write.
+			if s.ownership != nil && !s.ownership.Owns(topic, pid) {
+				continue
+			}
+
 			segments := ps.Segments
 			if segments == nil {
 				segments = []*SegmentMetadata{}
 			}
 			data, err := json.MarshalIndent(perPartitionManifest{
-				WriterEpoch:    epoch,
-				Writer:         writer,
+				Epoch:          s.partitionEpoch(topic, pid),
+				WriterEpoch:    s.lease.Epoch(),
+				Writer:         s.partitionWriter(topic, pid),
 				Topic:          topic,
 				Partition:      pid,
 				LogEndOffset:   ps.LogEndOffset,
@@ -190,10 +211,22 @@ func (s *StorageEngine) loadPartitionManifests(ctx context.Context) (restored in
 	}
 
 	for _, obj := range objects {
-		if _, _, ok := parsePartitionManifestKey(obj.Key); !ok {
+		topic, pid, ok := parsePartitionManifestKey(obj.Key)
+		if !ok {
 			continue
 		}
 		found = true
+
+		// A manifest found by LIST may name a partition the checkpoint did not
+		// know about, so claim it here too. Claiming before comparing epochs is
+		// what makes the comparison meaningful: our epoch is the newest one
+		// anyone can have written under.
+		if s.ownership != nil && !s.ownership.Owns(topic, pid) {
+			if _, claimErr := s.claimPartition(ctx, topic, pid); claimErr != nil {
+				log.Printf("Ownership: not claiming %s/%d: %v", topic, pid, claimErr)
+				continue
+			}
+		}
 
 		rc, getErr := s.objGet(ctx, obj.Key)
 		if getErr != nil {
@@ -212,13 +245,15 @@ func (s *StorageEngine) loadPartitionManifests(ctx context.Context) (restored in
 			log.Printf("Manifest %s does not parse (%v); continuing with the others", obj.Key, jsonErr)
 			continue
 		}
-		// A manifest stamped with a higher writer epoch was written by an
-		// agent that held the log after us. Its position is authoritative and
-		// ours is not, so serving from here would reissue offsets it already
-		// handed out.
-		if m.WriterEpoch > s.lease.Epoch() {
+		// A manifest stamped with a higher epoch was written by an owner that
+		// held this partition after us. Its position is authoritative and ours
+		// is not, so serving from here would reissue offsets it already handed
+		// out. This cannot normally happen -- claiming bumps our epoch above
+		// anything already recorded -- but the check is what makes a corrupted
+		// or hand-edited manifest fail closed instead of rewinding a log.
+		if stored := m.storedEpoch(); stored > s.partitionEpoch(m.Topic, m.Partition) {
 			return restored, found, fmt.Errorf("%w: manifest at %s was written at epoch %d by %q, this agent holds epoch %d",
-				errSuperseded, obj.Key, m.WriterEpoch, m.Writer, s.lease.Epoch())
+				errSuperseded, obj.Key, stored, m.Writer, s.partitionEpoch(m.Topic, m.Partition))
 		}
 
 		s.metadataCache.SetPartitionState(m.Topic, m.Partition, m.LogEndOffset, m.LogStartOffset, m.Segments)
@@ -250,6 +285,21 @@ func (s *StorageEngine) loadLegacyManifest(ctx context.Context) (int, error) {
 	if parsed.WriterEpoch > s.lease.Epoch() {
 		return 0, fmt.Errorf("%w: legacy manifest at %s was written at epoch %d by %q, this agent holds epoch %d",
 			errSuperseded, legacyManifestKey, parsed.WriterEpoch, parsed.Writer, s.lease.Epoch())
+	}
+
+	// The legacy manifest is bucket-global, so it describes partitions this
+	// agent may not own. Under ownership only its unclaimed partitions can be
+	// applied: another owner may already have moved past the position recorded
+	// here, and adopting its partition state would rewind a log someone else is
+	// writing.
+	if s.ownership != nil {
+		applicable := parsed.Partitions[:0:0]
+		for _, e := range parsed.Partitions {
+			if s.ownership.Owns(e.Topic, e.Partition) {
+				applicable = append(applicable, e)
+			}
+		}
+		parsed.Partitions = applicable
 	}
 
 	restored := 0

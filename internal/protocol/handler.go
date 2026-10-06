@@ -61,7 +61,12 @@ const (
 	ErrNone                       = 0
 	ErrUnknown                    = -1
 	ErrUnknownTopicOrPartition    = 3
+	ErrLeaderNotAvailable         = 5
 	ErrNotLeaderForPartition      = 6
+	ErrNotCoordinator             = 16
+	ErrCoordinatorNotAvailable    = 15
+	ErrIllegalGeneration          = 22
+	ErrUnknownMemberID            = 25
 	ErrRequestTimedOut            = 7
 	ErrOutOfOrderSequence         = 45
 	ErrDuplicateSequence          = 46
@@ -96,6 +101,15 @@ type ServerConfig struct {
 	// FindCoordinator.
 	AdvertisedHost string
 	AdvertisedPort int32
+
+	// NodeID is this broker's id, as reported in Metadata and returned by
+	// FindCoordinator. It must match the id this agent publishes in its routing
+	// record: a client that is told a partition's leader is node 7 then looks
+	// node 7 up in the broker list it was just given, so the two have to agree.
+	//
+	// Zero is a legal id. Storage derives a stable one from the agent id when
+	// the operator does not set it, and the registry publishes the same value.
+	NodeID int32
 
 	// AutoCreateTopics mirrors Kafka's auto.create.topics.enable: a Metadata
 	// request naming an unknown topic creates it.
@@ -143,7 +157,10 @@ func VersionCeilingReason(apiKey int16) string {
 			"is dropped. Grafana Mimir keeps each write's wire format in a record header and " +
 			"ingests every record as the wrong version without it."
 	case ApiKeyMetadata:
-		return "v6, the newest version that is not flexible."
+		return "v7, which adds LeaderEpoch to each partition -- the ownership epoch of the agent " +
+			"that leads it, which is how a client detects that the leader it cached has been " +
+			"replaced. v7 is the newest non-flexible version; v8 adds topic authorization, which " +
+			"is not implemented."
 	case ApiKeyFetch:
 		return "v5, which adds log_start_offset so a client can find the log start without a " +
 			"separate ListOffsets round trip."
@@ -187,7 +204,7 @@ var supportedAPIVersions = map[int16]int16{
 	ApiKeyProduce:          3,
 	ApiKeyFetch:            5,
 	ApiKeyListOffsets:      2,
-	ApiKeyMetadata:         6,
+	ApiKeyMetadata:         7,
 	ApiKeyApiVersions:      0,
 	ApiKeyOffsetCommit:     0,
 	ApiKeyOffsetFetch:      1,
@@ -403,15 +420,15 @@ func HandleRequest(ctx context.Context, data []byte, store *storage.StorageEngin
 	case ApiKeyMetadata:
 		resp, errProc = handleMetadata(ctx, dec, enc, store, apiVersion, cfg)
 	case ApiKeyFindCoordinator:
-		resp, errProc = handleFindCoordinator(dec, enc, apiVersion, cfg)
+		resp, errProc = handleFindCoordinator(ctx, dec, enc, store, apiVersion, cfg)
 	case ApiKeyJoinGroup:
-		resp, errProc = handleJoinGroup(dec, enc, apiVersion)
+		resp, errProc = handleJoinGroup(dec, enc, store, apiVersion)
 	case ApiKeySyncGroup:
-		resp, errProc = handleSyncGroup(dec, enc, apiVersion)
+		resp, errProc = handleSyncGroup(dec, enc, store, apiVersion)
 	case ApiKeyHeartbeat:
-		resp, errProc = handleHeartbeat(dec, enc, apiVersion)
+		resp, errProc = handleHeartbeat(dec, enc, store, apiVersion)
 	case ApiKeyLeaveGroup:
-		resp, errProc = handleLeaveGroup(dec, enc, apiVersion)
+		resp, errProc = handleLeaveGroup(dec, enc, store, apiVersion)
 	case ApiKeyOffsetCommit:
 		resp, errProc = handleOffsetCommit(dec, enc, store, apiVersion)
 	case ApiKeyOffsetFetch:
@@ -441,12 +458,62 @@ func HandleRequest(ctx context.Context, data []byte, store *storage.StorageEngin
 }
 
 // ----------------------------------------------------------------------
-// Group Coordinator Handlers (Stubs for MVP)
+// Group Coordinator Handlers
 // ----------------------------------------------------------------------
 
 var GlobalCoordinator = coordinator.NewCoordinator()
 
-func handleFindCoordinator(dec *Decoder, enc *Encoder, version int16, cfg ServerConfig) ([]byte, error) {
+// coordinatorFor answers which agent coordinates a group.
+//
+// Rendezvous hashing over the live set, so the answer is the same on every agent
+// that shares a view, and an agent leaving moves only the groups it held. The
+// client treats this as a hint and does not have to trust it: whichever agent it
+// ends up talking to re-checks, and answers NOT_COORDINATOR if it is not the one.
+func coordinatorFor(store *storage.StorageEngine, groupID string, cfg ServerConfig) (coordinator.AgentRef, bool) {
+	if store != nil {
+		if ref, ok := store.CoordinatorFor(groupID); ok {
+			return ref, true
+		}
+	}
+	// No routing view: this agent is the whole cluster.
+	return coordinator.AgentRef{
+		Agent:  "self",
+		NodeID: cfg.NodeID,
+		Host:   cfg.AdvertisedHost,
+		Port:   cfg.AdvertisedPort,
+	}, true
+}
+
+// coordinatorFence decides whether this agent may act as a group's coordinator.
+//
+// Two checks, and both are refusals rather than degradations:
+//
+//   - If this agent is not the rendezvous winner for the group over its own live
+//     set, another agent is. Acting anyway is what produces two coordinators for
+//     one group: two independent assignment states, consumers handed different
+//     partitions, and no way for either side to notice.
+//   - If this agent cannot prove it is alive, it may already have been replaced.
+//     There is no grace window here, unlike partition ownership, because a
+//     coordinator has no epoch token to fence it with.
+//
+// NOT_COORDINATOR is the right answer for both: it tells the client to re-resolve
+// the coordinator, which is exactly the recovery.
+func coordinatorFence(store *storage.StorageEngine, groupID string) error {
+	if store == nil {
+		return nil
+	}
+	if !store.AgentLive() {
+		metrics.CoordinatorRequestsRefused.Inc()
+		return coordinator.ErrCoordinatorUnfenced
+	}
+	if !store.IsCoordinator(groupID) {
+		metrics.CoordinatorRequestsRefused.Inc()
+		return coordinator.ErrNotCoordinator
+	}
+	return nil
+}
+
+func handleFindCoordinator(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16, cfg ServerConfig) ([]byte, error) {
 	// FindCoordinator Request V0:
 	// GroupID (string)
 
@@ -454,7 +521,6 @@ func handleFindCoordinator(dec *Decoder, enc *Encoder, version int16, cfg Server
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("FindCoordinator: GroupID=%s", groupID)
 
 	// V1 adds KeyType (int8) and V2 adds an error message.
 	if version >= 1 {
@@ -462,6 +528,9 @@ func handleFindCoordinator(dec *Decoder, enc *Encoder, version int16, cfg Server
 			return nil, err
 		}
 	}
+
+	ref, _ := coordinatorFor(store, groupID, cfg)
+	log.Printf("FindCoordinator: group=%s coordinator=%s (node %d)", groupID, ref.Agent, ref.NodeID)
 
 	// FindCoordinator Response:
 	//   V0: ErrorCode | NodeID | Host | Port
@@ -473,14 +542,17 @@ func handleFindCoordinator(dec *Decoder, enc *Encoder, version int16, cfg Server
 	if version >= 1 {
 		enc.String("") // ErrorMessage
 	}
-	enc.Int32(0) // NodeID: this agent is the only coordinator
-	enc.String(cfg.AdvertisedHost)
-	enc.Int32(cfg.AdvertisedPort)
+	// The node id has to be one Metadata advertised for this agent: a client
+	// told "the coordinator is node 7" looks node 7 up in the broker list it was
+	// given, and an id that is not in that list cannot be connected to.
+	enc.Int32(ref.NodeID)
+	enc.String(ref.Host)
+	enc.Int32(ref.Port)
 
 	return enc.Bytes(), nil
 }
 
-func handleJoinGroup(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
+func handleJoinGroup(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
 	// JoinGroup Request V0:
 	groupID, _ := dec.String()
 	sessionTimeout, _ := dec.Int32()
@@ -505,6 +577,21 @@ func handleJoinGroup(dec *Decoder, enc *Encoder, version int16) ([]byte, error) 
 	}
 
 	log.Printf("JoinGroup: Group=%s Member=%s ProtocolType=%s RebalanceTimeout=%d", groupID, memberID, protocolType, rebalanceTimeout)
+
+	// Refuse before touching any group state if this agent is not the one that
+	// coordinates this group, or cannot prove it is alive.
+	if err := coordinatorFence(store, groupID); err != nil {
+		metrics.CoordinatorOwner.Inc()
+		// JoinGroup v0 has no error message field.
+		enc.Int16(ErrNotCoordinator)
+		enc.Int32(-1) // generation id: no group exists here
+		enc.String("")
+		enc.String("")
+		enc.String("")
+		enc.Int32(0)
+		return enc.Bytes(), nil
+	}
+	metrics.CoordinatorOwner.Inc()
 
 	// Call Coordinator
 	newMemberID, generationID, leaderID, members, err := GlobalCoordinator.JoinGroup(groupID, memberID, protocolType, protocols, sessionTimeout, rebalanceTimeout)
@@ -546,7 +633,7 @@ func handleJoinGroup(dec *Decoder, enc *Encoder, version int16) ([]byte, error) 
 	return enc.Bytes(), nil
 }
 
-func handleSyncGroup(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
+func handleSyncGroup(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
 	// SyncGroup Request V0
 	groupID, _ := dec.String()
 	generationID, _ := dec.Int32()
@@ -561,6 +648,15 @@ func handleSyncGroup(dec *Decoder, enc *Encoder, version int16) ([]byte, error) 
 	}
 
 	log.Printf("SyncGroup: Group=%s Member=%s Gen=%d", groupID, memberID, generationID)
+
+	// Same fence as JoinGroup. A SyncGroup from a member the group no longer
+	// holds must not be answered: its assignment came from a coordinator that
+	// may not be this one.
+	if err := coordinatorFence(store, groupID); err != nil {
+		enc.Int16(ErrNotCoordinator)
+		enc.PutBytes(nil)
+		return enc.Bytes(), nil
+	}
 
 	myAssignment, err := GlobalCoordinator.SyncGroup(groupID, memberID, generationID, assignments)
 
@@ -592,14 +688,22 @@ func handleSyncGroup(dec *Decoder, enc *Encoder, version int16) ([]byte, error) 
 	return enc.Bytes(), nil
 }
 
-func handleHeartbeat(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
+func handleHeartbeat(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
 	groupID, _ := dec.String()
 	generationID, _ := dec.Int32()
 	memberID, _ := dec.String()
 
-	err := GlobalCoordinator.Heartbeat(groupID, memberID, generationID)
+	err := coordinatorFence(store, groupID)
 	errorCode := int16(ErrNone)
+	if err == nil {
+		err = GlobalCoordinator.Heartbeat(groupID, memberID, generationID)
+	}
 	if err != nil {
+		if errors.Is(err, coordinator.ErrNotCoordinator) || errors.Is(err, coordinator.ErrCoordinatorUnfenced) {
+			errorCode = ErrNotCoordinator
+			enc.Int16(errorCode)
+			return enc.Bytes(), nil
+		}
 		// A member the reaper has already evicted should be told to rejoin
 		// rather than simply "in progress", so its client regenerates state
 		// and picks up a fresh assignment.
@@ -614,9 +718,15 @@ func handleHeartbeat(dec *Decoder, enc *Encoder, version int16) ([]byte, error) 
 	return enc.Bytes(), nil
 }
 
-func handleLeaveGroup(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
+func handleLeaveGroup(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
 	groupID, _ := dec.String()
 	memberID, _ := dec.String()
+
+	// Leaving is not fenced: a member must be able to tell *someone* it is going
+	// away, and the coordinator it thought it was talking to is the one most
+	// likely to have changed. The reaper converges the group regardless, so
+	// dropping a leave that arrived at the wrong agent costs nothing beyond the
+	// member's own session timeout.
 
 	// Leaving is best-effort: a client may leave after the reaper has already
 	// evicted it, and that is not an error worth failing the request over.
@@ -780,9 +890,12 @@ func handleApiVersions(dec *Decoder, enc *Encoder, version int16, cfg ServerConf
 }
 
 func handleMetadata(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16, cfg ServerConfig) ([]byte, error) {
-	// Metadata Request V0-V6:
+	// Metadata Request V0-V8:
 	//   V0-V5: Topics (array of string). An empty array means "all topics".
 	//   V6:    adds allow_auto_topic_creation (boolean, one byte).
+	// The response is identical in shape from v6 to v7; v7 only adds
+	// LeaderEpoch to each partition, and v8 adds topic authorization which is
+	// not implemented, so the ceiling is v7.
 	count, err := dec.Int32()
 	if err != nil {
 		return nil, err
@@ -815,18 +928,42 @@ func handleMetadata(ctx context.Context, dec *Decoder, enc *Encoder, store *stor
 		enc.Int32(0) // ThrottleTimeMs
 	}
 
+	// The cluster view. Brokers are every live agent and each partition's leader
+	// is the agent that claims it, so a client ends up talking to whoever owns
+	// what it wants to read and write. This is the whole point of phase 3: the
+	// write side was already fenced per partition, but without a leader per
+	// partition a client had no way to find the agent holding one.
+	routing := store.Routing()
+
 	// 1. Brokers
-	enc.Int32(1) // Broker Count
+	brokers := routing.Brokers
+	// With no brokers in the view there is nobody to route to, so this agent
+	// describes itself from its own configuration. That happens when the
+	// registry is not enabled, or before its first refresh has completed.
+	//
+	// In that mode every partition in the view belongs to this agent, so the
+	// leader is reported as this agent's configured node id rather than whatever
+	// the registry recorded. They are the same value in a configured agent;
+	// using one source here means a leader can never be named with an id that is
+	// missing from the broker list, which is what a client needs to connect.
+	selfOnly := len(brokers) == 0
+	if selfOnly {
+		brokers = []storage.Broker{{
+			NodeID: cfg.NodeID, Host: cfg.AdvertisedHost, Port: cfg.AdvertisedPort, Agent: "self",
+		}}
+	}
 
-	// The advertised address, not the bind address: this is what the client
-	// will dial. It has to be reachable from the client, which a loopback
-	// address is not.
-	enc.Int32(0) // NodeID
-	enc.String(cfg.AdvertisedHost)
-	enc.Int32(cfg.AdvertisedPort)
-
-	if version >= 1 {
-		enc.String("") // Rack
+	enc.Int32(int32(len(brokers)))
+	for _, b := range brokers {
+		// The advertised address, not the bind address: this is what the client
+		// will dial. It has to be reachable from the client, which a loopback
+		// address is not.
+		enc.Int32(b.NodeID)
+		enc.String(b.Host)
+		enc.Int32(b.Port)
+		if version >= 1 {
+			enc.String("") // Rack
+		}
 	}
 
 	// cluster_id arrived in Metadata v2 and is nullable from v2 onwards.
@@ -838,11 +975,19 @@ func handleMetadata(ctx context.Context, dec *Decoder, enc *Encoder, store *stor
 	}
 
 	if version >= 1 {
-		enc.Int32(0) // ControllerID
+		// The controller is this agent. There is no separate controller role
+		// here, but the id has to be one that appears in the broker list above,
+		// or a client will try to look up a broker nobody advertised.
+		enc.Int32(cfg.NodeID)
 	}
 
 	// 2. Topic Metadata
-	allTopics, _ := store.GetTopics()
+	//
+	// The topic and partition set is the cluster's, not this agent's: a topic
+	// whose partitions are split across agents has to be described in full by
+	// every agent, or a client that hashed a key onto a partition it cannot see
+	// has nowhere to send it.
+	allTopics := routing.Topics()
 	topicsToReturn := requestedTopics
 	if count <= 0 {
 		topicsToReturn = allTopics
@@ -852,7 +997,7 @@ func handleMetadata(ctx context.Context, dec *Decoder, enc *Encoder, store *stor
 		// known leader before it can write anything, and without this it
 		// fails with "unknown partition leader" rather than producing.
 		for _, tName := range requestedTopics {
-			if store.TopicExists(tName) {
+			if routing.TopicExists(tName) || store.TopicExists(tName) {
 				continue
 			}
 			partitions := cfg.AutoCreatePartitions
@@ -881,9 +1026,14 @@ func handleMetadata(ctx context.Context, dec *Decoder, enc *Encoder, store *stor
 			enc.Int8(0) // IsInternal
 		}
 
-		partitions, err := store.GetPartitions(tName)
-		if err != nil {
-			partitions = nil
+		partitions := routing.PartitionsOf(tName)
+		if len(partitions) == 0 {
+			// Fall back to this agent's own view for a topic it just created and
+			// has not published yet.
+			local, err := store.GetPartitions(tName)
+			if err == nil && len(local) > 0 {
+				partitions = local
+			}
 		}
 		if len(partitions) == 0 {
 			// An unknown topic has no partitions. Reporting a synthetic
@@ -895,16 +1045,58 @@ func handleMetadata(ctx context.Context, dec *Decoder, enc *Encoder, store *stor
 
 		enc.Int32(int32(len(partitions)))
 		for _, pid := range partitions {
-			enc.Int16(0)   // PartitionErrorCode
-			enc.Int32(pid) // PartitionID
-			enc.Int32(0)   // Leader (Node 0)
-			if version >= 7 {
-				enc.Int32(0) // LeaderEpoch
+			route, owned := routing.Owner(tName, pid)
+
+			// Kafka's MetadataResponseTopicPartition starts with ErrorCode and
+			// only then carries the partition number. Emitting them the other way
+			// round does not fail a decode of the *first* partition -- the values
+			// are simply read from the wrong offsets -- so it survives every
+			// single-partition test and only shows up when a topic has more than
+			// one partition and a client checks that the partition numbers are
+			// consecutive. Grafana Mimir does check, and reports the second
+			// partition as 65536.
+			if !owned {
+				// The partition exists but no live agent claims it: mid-failover,
+				// or its owner is wedged past the routing TTL. LEADER_NOT_AVAILABLE
+				// and Leader = -1 is the encoding Kafka uses for exactly this,
+				// and it is what makes a client refresh its metadata and retry
+				// instead of failing the produce permanently. Reporting a leader
+				// that cannot serve the partition would send the client to a
+				// broker that answers NOT_LEADER_OR_FOLLOWER for ever.
+				enc.Int16(ErrLeaderNotAvailable)
+				enc.Int32(pid) // Partition
+				enc.Int32(-1)  // Leader
+				if version >= 7 {
+					enc.Int32(0) // LeaderEpoch
+				}
+				enc.Int32(0) // Replica Count: an unowned partition has no replicas
+				enc.Int32(0) // Isr Count
+				if version >= 5 {
+					enc.Int32(0) // OfflineReplicas
+				}
+				continue
 			}
+
+			leader := route.NodeID
+			if selfOnly {
+				leader = cfg.NodeID
+			}
+
+			enc.Int16(0)      // ErrorCode
+			enc.Int32(pid)    // Partition
+			enc.Int32(leader) // Leader
+			if version >= 7 {
+				// The ownership epoch, which is how a client detects that the
+				// leader it has cached has been replaced and that its in-flight
+				// idempotent requests may need resending.
+				enc.Int32(int32(route.Epoch))
+			}
+			// One replica: this agent replicates nothing, so the leader is the
+			// only copy that exists as far as the protocol is concerned.
 			enc.Int32(1) // Replica Count
-			enc.Int32(0) // Node 0
+			enc.Int32(leader)
 			enc.Int32(1) // Isr Count
-			enc.Int32(0) // Node 0
+			enc.Int32(leader)
 			if version >= 5 {
 				enc.Int32(0) // OfflineReplicas
 			}

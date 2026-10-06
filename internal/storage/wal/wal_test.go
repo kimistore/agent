@@ -89,7 +89,7 @@ func TestPartitionWAL_Roll(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 
 	pDir := filepath.Join(tempDir, "topic", "0")
-	p, err := NewPartitionWAL(pDir, "topic", 0, 0, nil)
+	p, err := NewPartitionWAL(pDir, "topic", 0, 0, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

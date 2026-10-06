@@ -38,6 +38,11 @@ type Manager struct {
 	// opened, so the first write after a restart continues the log rather
 	// than starting it over.
 	seeds map[string]int64
+
+	// epochs holds the ownership epoch per partition, keyed the same way. It
+	// is stamped into every sealed segment name, which is what stops a
+	// superseded writer's upload from colliding with its successor's.
+	epochs map[string]int64
 }
 
 func NewManager(baseDir string, onRoll func(UploadTask)) (*Manager, error) {
@@ -49,6 +54,7 @@ func NewManager(baseDir string, onRoll func(UploadTask)) (*Manager, error) {
 		partitions: make(map[string]*PartitionWAL),
 		onRoll:     onRoll,
 		seeds:      make(map[string]int64),
+		epochs:     make(map[string]int64),
 	}, nil
 }
 
@@ -117,12 +123,43 @@ func (m *Manager) getPartitionWAL(topic string, partition int32) (*PartitionWAL,
 	}
 
 	dir := filepath.Join(m.baseDir, topic, fmt.Sprintf("%d", partition))
-	p, err := NewPartitionWAL(dir, topic, partition, m.seeds[key], m.onRoll)
+	p, err := NewPartitionWAL(dir, topic, partition, m.seeds[key], m.epochs[key], m.onRoll)
 	if err != nil {
 		return nil, err
 	}
 	m.partitions[key] = p
 	return p, nil
+}
+
+// SetEpoch records the ownership epoch for a partition, applying it to the
+// partition WAL whether or not it is open yet.
+//
+// A partition can be claimed after its WAL exists (a restart re-claims
+// everything it recovers, and a lazily created partition is claimed on first
+// write), so the epoch has to reach an already-open WAL and not only the next
+// one constructed.
+func (m *Manager) SetEpoch(topic string, partition int32, epoch int64) {
+	key := partitionKey(topic, partition)
+
+	m.mu.Lock()
+	if cur, ok := m.epochs[key]; !ok || epoch > cur {
+		m.epochs[key] = epoch
+	}
+	current := m.epochs[key]
+	p, open := m.partitions[key]
+	m.mu.Unlock()
+
+	if open {
+		p.SetEpoch(current)
+	}
+}
+
+// Epoch reports the ownership epoch recorded for a partition, or 0 when the
+// partition has no claim.
+func (m *Manager) Epoch(topic string, partition int32) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.epochs[partitionKey(topic, partition)]
 }
 
 // Append writes a batch to the partition's WAL. sync=true fsyncs before
@@ -249,6 +286,7 @@ func (m *Manager) DeleteTopic(topic string) error {
 			_ = p.Discard()
 			delete(m.partitions, k)
 			delete(m.seeds, k)
+			delete(m.epochs, k)
 		}
 	}
 

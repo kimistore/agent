@@ -398,17 +398,17 @@ func newestSegmentFile(dir string) string {
 		return ""
 	}
 	best := ""
-	bestOffset := int64(-1)
+	bestOffset, bestEpoch := int64(-1), int64(-1)
 	for _, e := range entries {
-		if e.IsDir() || e.Name() == "active.log" || !strings.HasSuffix(e.Name(), ".log") {
+		if e.IsDir() {
 			continue
 		}
-		off, err := strconv.ParseInt(strings.TrimSuffix(e.Name(), ".log"), 10, 64)
-		if err != nil {
-			continue
+		off, epoch, ok := wal.ParseSegmentName(e.Name())
+		if !ok {
+			continue // the active segment, or not a segment
 		}
-		if off > bestOffset {
-			bestOffset = off
+		if off > bestOffset || (off == bestOffset && epoch > bestEpoch) {
+			bestOffset, bestEpoch = off, epoch
 			best = filepath.Join(dir, e.Name())
 		}
 	}

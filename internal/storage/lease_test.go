@@ -40,12 +40,26 @@ type casStore struct {
 	mu      sync.Mutex
 	data    map[string][]byte
 	version map[string]int64
+	putKeys map[string]int // key -> how many times it has been written
 	failPut error
+	listErr error
 	blocks  chan struct{} // when non-nil, every Put waits on it
 }
 
 func newCASStore() *casStore {
-	return &casStore{data: map[string][]byte{}, version: map[string]int64{}}
+	return &casStore{
+		data:    map[string][]byte{},
+		version: map[string]int64{},
+		putKeys: map[string]int{},
+	}
+}
+
+// failList makes every List fail, so a test can check what a discovery outage
+// does to the routing view.
+func (s *casStore) failList(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listErr = err
 }
 
 func (s *casStore) Put(ctx context.Context, key string, r io.Reader) error {
@@ -63,6 +77,7 @@ func (s *casStore) Put(ctx context.Context, key string, r io.Reader) error {
 	defer s.mu.Unlock()
 	s.data[key] = body
 	s.version[key]++
+	s.putKeys[key]++
 	return nil
 }
 
@@ -79,6 +94,9 @@ func (s *casStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 func (s *casStore) List(ctx context.Context, prefix string) ([]ObjectMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
 	var out []ObjectMetadata
 	for k := range s.data {
 		if strings.HasPrefix(k, prefix) {
@@ -137,6 +155,7 @@ func (s *casStore) PutVersion(ctx context.Context, key string, data []byte, vers
 	}
 	s.data[key] = data
 	s.version[key]++
+	s.putKeys[key]++
 	return fmt.Sprintf("v%d", s.version[key]), nil
 }
 
@@ -154,6 +173,23 @@ func (s *casStore) lease(t *testing.T, key string) Lease {
 		t.Fatalf("lease object is not valid JSON: %v", err)
 	}
 	return l
+}
+
+// routingRecord reads an agent's published liveness record back out of the store.
+func (s *casStore) routingRecord(t *testing.T, agent string) RoutingRecord {
+	t.Helper()
+	key := agentsPrefix + agent + "/liveness"
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	raw, ok := s.data[key]
+	if !ok {
+		t.Fatalf("no liveness record at %s", key)
+	}
+	var r RoutingRecord
+	if err := json.Unmarshal(raw, &r); err != nil {
+		t.Fatalf("liveness record at %s is not valid JSON: %v", key, err)
+	}
+	return r
 }
 
 // plainStore is an ObjectStore with no conditional writes at all. It wraps

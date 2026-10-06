@@ -44,8 +44,13 @@ func groupSnapshot(c *Coordinator, groupID string) (GroupState, int32, string) {
 	return g.State, g.GenerationID, g.LeaderID
 }
 
+// consumerProtos is the protocol list a consumer joins with.
+func consumerProtos() []GroupProtocol {
+	return []GroupProtocol{{Name: "range", Metadata: []byte{}}}
+}
+
 func joinOne(c *Coordinator, group, member string, sessionMS, rebalanceMS int32) {
-	protos := []GroupProtocol{{Name: "range", Metadata: []byte{}}}
+	protos := consumerProtos()
 	if _, _, _, _, err := c.JoinGroup(group, member, "consumer", protos, sessionMS, rebalanceMS); err != nil {
 		panic(err)
 	}
@@ -335,27 +340,72 @@ func TestHeartbeat_EvictedMemberToldToRejoin(t *testing.T) {
 	}
 }
 
-// TestRestore_StaleMembersAreReaped checks a checkpoint restored after a
-// restart does not leave phantom members holding partitions.
-func TestRestore_StaleMembersAreReaped(t *testing.T) {
-	c := newTestCoordinator(t)
-	joinOne(c, "g", "old1", 30000, 30000)
-	joinOne(c, "g", "old2", 30000, 30000)
-
-	state := c.ToState()
-	if len(state.Groups) != 1 || len(state.Groups["g"].Members) != 2 {
-		t.Fatalf("unexpected snapshot: %+v", state)
+// Group state is not durable, so a coordinator that replaces one (an agent
+// restart, or a different agent taking the group over) starts empty and the
+// members rejoin. This is D-4's accepted full rebalance.
+//
+// The property it has to keep is that the new coordinator issues a *fresh*
+// generation rather than reusing the old one, so a member holding a stale
+// generation is told to rejoin instead of being handed an assignment computed
+// against a member set that no longer exists.
+func TestCoordinatorChange_StartsFromGenerationZero(t *testing.T) {
+	first := newTestCoordinator(t)
+	joinOne(first, "g", "m1", 30000, 30000)
+	_, gen, _, _, err := first.JoinGroup("g", "m2", "consumer", consumerProtos(), 30000, 30000)
+	if err != nil {
+		t.Fatalf("second join: %v", err)
+	}
+	if gen < 1 {
+		t.Fatalf("generation after a join = %d, want >= 1", gen)
 	}
 
-	// A fresh coordinator loads the snapshot, as happens after a restart.
-	c2 := newTestCoordinator(t)
-	c2.FromState(state)
-
-	if n := memberCount(c2, "g"); n != 2 {
-		t.Fatalf("restored %d member(s), want 2 before reaping", n)
+	// The replacement knows nothing about the previous coordinator's members.
+	second := newTestCoordinator(t)
+	if n := memberCount(second, "g"); n != 0 {
+		t.Fatalf("a new coordinator started with %d member(s); group state must not be restored", n)
 	}
-	c2.ReapExpired()
-	if n := memberCount(c2, "g"); n != 0 {
-		t.Errorf("restored members were not reaped: %d still present (their connections died with the process)", n)
+
+	// A member holding the old generation is refused, so it rejoins rather than
+	// sitting on a generation the new coordinator will never satisfy.
+	if err := second.Heartbeat("g", "m1", gen); err != ErrMemberNotFound {
+		t.Errorf("heartbeat from a member the new coordinator never saw = %v, want ErrMemberNotFound", err)
+	}
+
+	// Generations are per-coordinator counters, so the new one legitimately
+	// reaches the same number again. What makes that safe is that the member id
+	// is unknown to the new coordinator, which is what forces the rejoin rather
+	// than silently continuing against the old assignment.
+	newMember, newGen, _, _, err := second.JoinGroup("g", "m1", "consumer", consumerProtos(), 30000, 30000)
+	if err != nil {
+		t.Fatalf("rejoin on the new coordinator: %v", err)
+	}
+	if newMember != "m1" {
+		t.Errorf("member id = %q, want m1", newMember)
+	}
+	if newGen < 0 {
+		t.Errorf("generation after rejoin = %d, want >= 0", newGen)
+	}
+	if n := memberCount(second, "g"); n != 1 {
+		t.Errorf("member count after rejoin = %d, want 1", n)
+	}
+	if groups := second.ListGroups(); len(groups) != 1 {
+		t.Errorf("the new coordinator lists %d group(s) after the rejoin, want 1", len(groups))
+	}
+}
+
+// Two coordinators for one group is the failure the whole selection mechanism
+// exists to prevent, so it is worth asserting the shape that produces it is not
+// reachable: a group state built by one coordinator is invisible to another, and
+// neither can act on the other's members.
+func TestCoordinatorChange_NoSharedState(t *testing.T) {
+	first := newTestCoordinator(t)
+	joinOne(first, "g", "m1", 30000, 30000)
+
+	second := newTestCoordinator(t)
+	if err := second.Heartbeat("g", "m1", 1); err != ErrMemberNotFound {
+		t.Errorf("the second coordinator accepted a heartbeat for a member it never saw: %v", err)
+	}
+	if groups := second.ListGroups(); len(groups) != 0 {
+		t.Errorf("the second coordinator lists %d group(s); it must know of none", len(groups))
 	}
 }

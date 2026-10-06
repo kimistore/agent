@@ -9,6 +9,7 @@ import hashlib
 import os
 import re
 import sys
+import threading
 import shutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
@@ -26,6 +27,15 @@ BUCKET = "kimistore"
 def key_path(bucket, key):
     safe = key.replace("..", "_")
     return os.path.join(ROOT, bucket, safe)
+
+
+# The server is threaded and the agent writes from several goroutines at once
+# (segments, checkpoints, manifests, ownership claims, routing tables), so every
+# filesystem touch has to be serialised. Without it two problems appear that
+# look like agent bugs rather than harness bugs: a concurrent mkdir of the same
+# directory races, and -- far worse -- a reader can observe a file that a writer
+# has truncated but not yet filled, which reads as a corrupt segment.
+FS_LOCK = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -115,34 +125,50 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         bucket, key, _ = self._split()
         path = key_path(bucket, key)
-        have = self._etag_for(path) if os.path.isfile(path) else None
-        failed = self._check_preconditions(path)
         n = int(self.headers.get("Content-Length", 0))
-        if os.environ.get("SHIM_DEBUG"):
-            print("SHIM PUT %s inm=%r im=%r have=%r rejected=%s content=%r" % (
-                key, self.headers.get("If-None-Match"), self.headers.get("If-Match"),
-                have, failed, self._peek(path)), file=sys.stderr, flush=True)
+
+        with FS_LOCK:
+            have = self._etag_for(path) if os.path.isfile(path) else None
+            failed = self._check_preconditions(path)
+            if os.environ.get("SHIM_DEBUG"):
+                print("SHIM PUT %s inm=%r im=%r have=%r rejected=%s content=%r" % (
+                    key, self.headers.get("If-None-Match"), self.headers.get("If-Match"),
+                    have, failed, self._peek(path)), file=sys.stderr, flush=True)
+            if not failed:
+                # Write to a temporary file and rename it into place, so a
+                # concurrent reader sees either the old object or the new one and
+                # never a half-written one.
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                tmp = "%s.tmp.%d" % (path, threading.get_ident())
+                try:
+                    with open(tmp, "wb") as f:
+                        remaining = n
+                        while remaining > 0:
+                            chunk = self.rfile.read(min(65536, remaining))
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            remaining -= len(chunk)
+                    os.replace(tmp, path)
+                except BaseException:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                    raise
+            etag = self._etag_for(path)
+
         if failed:
             # Drain the body so the client's write completes cleanly before
             # the connection goes away.
             self.rfile.read(n)
             return
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "wb") as f:
-            remaining = n
-            while remaining > 0:
-                chunk = self.rfile.read(min(65536, remaining))
-                if not chunk:
-                    break
-                f.write(chunk)
-                remaining -= len(chunk)
-        self._ok(b"", "application/xml", {"ETag": self._etag_for(path)})
+        self._ok(b"", "application/xml", {"ETag": etag})
 
     def do_DELETE(self):
         bucket, key, _ = self._split()
         p = key_path(bucket, key)
-        if os.path.isfile(p):
-            os.remove(p)
+        with FS_LOCK:
+            if os.path.isfile(p):
+                os.remove(p)
         self._ok(b"")
 
     def do_HEAD(self):
@@ -153,13 +179,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if not os.path.isfile(p):
+        with FS_LOCK:
+            if not os.path.isfile(p):
+                size = None
+            else:
+                size = os.path.getsize(p)
+        if size is None:
             self.send_response(404)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
         self.send_response(200)
-        self.send_header("Content-Length", str(os.path.getsize(p)))
+        self.send_header("Content-Length", str(size))
         self.end_headers()
 
     def do_GET(self):
@@ -169,25 +200,39 @@ class Handler(BaseHTTPRequestHandler):
             return self._list(bucket, q)
 
         p = key_path(bucket, key)
-        if not os.path.isfile(p):
-            return self._error(404, "NoSuchKey", "The specified key does not exist.")
-
-        size = os.path.getsize(p)
         rng = self.headers.get("Range")
-        start, end = 0, size - 1
-        partial = False
-        if rng:
-            m = re.match(r"bytes=(\d*)-(\d*)", rng)
-            if m:
-                partial = True
-                if m.group(1):
-                    start = int(m.group(1))
-                    if m.group(2):
-                        end = int(m.group(2))
-                else:
-                    start = max(0, size - int(m.group(2)))
-                    end = size - 1
-        if start >= size:
+        # Hold the lock across the whole read so a concurrent writer cannot
+        # truncate the file between the size check and the read.
+        with FS_LOCK:
+            if not os.path.isfile(p):
+                return self._error(404, "NoSuchKey", "The specified key does not exist.")
+
+            size = os.path.getsize(p)
+            start, end = 0, size - 1
+            partial = False
+            if rng:
+                m = re.match(r"bytes=(\d*)-(\d*)", rng)
+                if m:
+                    partial = True
+                    if m.group(1):
+                        start = int(m.group(1))
+                        if m.group(2):
+                            end = int(m.group(2))
+                    else:
+                        start = max(0, size - int(m.group(2)))
+                        end = size - 1
+            if start >= size:
+                unavailable = True
+            else:
+                unavailable = False
+                end = min(end, size - 1)
+                length = end - start + 1
+                with open(p, "rb") as f:
+                    f.seek(start)
+                    data = f.read(length)
+                etag = self._etag_for(p)
+
+        if unavailable:
             self.send_response(416)
             self.send_header("Content-Range", f"bytes */{size}")
             self.send_header("Content-Length", "0")
@@ -195,17 +240,11 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.close_connection = True
             return
-        end = min(end, size - 1)
-        length = end - start + 1
-
-        with open(p, "rb") as f:
-            f.seek(start)
-            data = f.read(length)
 
         self.send_response(206 if partial else 200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("ETag", self._etag_for(p))
+        self.send_header("ETag", etag)
         if partial:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.send_header("Accept-Ranges", "bytes")
@@ -216,14 +255,18 @@ class Handler(BaseHTTPRequestHandler):
         prefix = (q.get("prefix") or [""])[0]
         base = os.path.join(ROOT, bucket)
         items = []
-        for dirpath, _dirs, files in os.walk(base):
-            for fn in files:
-                full = os.path.join(dirpath, fn)
-                rel = os.path.relpath(full, base).replace(os.sep, "/")
-                if rel.startswith(prefix):
-                    st = os.stat(full)
-                    items.append((rel, st.st_size, st.st_mtime))
-        items.sort()
+        with FS_LOCK:
+            for dirpath, _dirs, files in os.walk(base):
+                for fn in files:
+                    # A partially written temporary file is not an object.
+                    if ".tmp." in fn:
+                        continue
+                    full = os.path.join(dirpath, fn)
+                    rel = os.path.relpath(full, base).replace(os.sep, "/")
+                    if rel.startswith(prefix):
+                        st = os.stat(full)
+                        items.append((rel, st.st_size, st.st_mtime))
+            items.sort()
         max_keys = int((q.get("max-keys") or ["1000"])[0])
         truncated = len(items) > max_keys
         items = items[:max_keys]

@@ -1,7 +1,7 @@
 # Kimistore High Availability — Architecture Design
 
-Status: **partially implemented.** Phases 0, 1 and 6 are on `main`; phases 2–5
-are designed but not built. See §13 for the handoff.
+Status: **partially implemented.** Phases 0, 1, 2, 3, 5 and 6 are on `main`; phase 4
+is designed but not built. See §13 for the handoff.
 Scope: single-region HA for the `kimistore-agent`. Supersedes the ad-hoc
 roadmap discussed earlier.
 
@@ -73,7 +73,7 @@ gap-reporting machinery is deleted from the design.
 |---|---|---|
 | Global singleton manifest | `manifestKey = "_meta/manifest.json"`, `SaveManifestContext` in `internal/storage/engine.go` | Every agent rewrites the whole inventory. N agents clobber each other — the corruption the writer lease prevents at bucket level, reintroduced one layer up. |
 | Global singleton checkpoint | `"_meta/checkpoint.json"` (`engine.go` ~L1158/L1192) | Same, for offsets/groups/topic metadata. |
-| Bucket-global writer lease | `internal/storage/lease.go`, `DefaultLeaseKey` | Only one agent may exist. Ownership must become per-partition. |
+| Bucket-global writer lease | `internal/storage/lease.go`, `DefaultLeaseKey` | Only one agent may exist. **Resolved by phase 2**: the claim is now per partition. |
 | `Metadata` lies | `handleMetadata`, `internal/protocol/handler.go` | Returns one broker and `Leader = Node 0` for every partition. There is nowhere to express "this partition is on agent B", so clients can never route. |
 | Coordinator is a process global | `var GlobalCoordinator = coordinator.NewCoordinator()` | Each agent coordinates every group; two agents will produce conflicting assignments (split brain). `FindCoordinator` returns self. |
 | Long-poll is per-process | append latch / `signalData` | If producer and consumer are on different agents, the consumer's latch never fires and it degrades to per-fetch S3 reads. **This is why ownership is load-bearing for latency, not just safety.** |
@@ -107,7 +107,7 @@ and one global coordinator.
 | Segment data | `topic/partition/<baseOffset>-e<epoch>.log` | owner | Epoch in the key so a stale writer cannot collide with the new owner. |
 | Segment index | `topic/partition/<baseOffset>-e<epoch>.index` | owner | |
 | Partition manifest | `_topics/<topic>/_manifest/<partition>` | owner | Replaces global manifest. Incremental; kills whole-bucket `LIST`. |
-| Agent liveness | `_agents/<agent-id>` | self | `{agent, ts, expires, advertised_host, port}`. CAS-renewed, TTL/3 cadence. |
+| Agent liveness | `_agents/<agent-id>/liveness` | self | `{agent, ts, expires, advertised_host, port}`. CAS-renewed, TTL/3 cadence. |
 | Partition ownership | `_owners/<topic>/<partition>` | claimant | `{agent, epoch, expires}`. CAS claim; written rarely. |
 | Routing table | `_agents/<agent-id>/routing` | self | `{epoch, partitions:[{topic,partition}], updated}`. This is what `Metadata` reads (D-5). |
 | Group offsets | `_offsets/<group>/<topic>/<partition>` | coordinator | Keep the key shape; add a monotonic guard (§6.3). |
@@ -119,9 +119,12 @@ Notes:
   lease. Contention lands on *ownership changes*, never on the append path.
 - **Epoch is per-partition and monotonic.** It is carried in the segment key
   and in the routing table so clients and manifests agree on the generation.
-- The writer lease from the previous change is retained but reinterpreted:
-  it becomes the **agent identity/liveness lease** (`_agents/<id>`). Per-bucket
-  exclusivity is dropped.
+- The bucket-global writer lease is **the fallback fence**, not a second one. It
+  is only acquired when `KIMISTORE_PARTITION_OWNERSHIP=false`, in which case it is
+  the whole fence and per-bucket exclusivity is back. With ownership on (the
+  default) it is not acquired at all. Phase 3 adds the **agent identity/liveness
+  lease** (`_agents/<id>/liveness`), which is a different thing: it is what tells clients
+  the agent is alive, not what fences the log.
 
 ### 5.2 Routing and `Metadata` (D-5)
 
@@ -228,9 +231,9 @@ D-4 lets us delete durable group state. Design:
 - The serving agent **verifies before accepting**: it must currently own a
   valid, unexpired liveness lease and the live set it uses must be current.
   Otherwise it returns `NOT_COORDINATOR (16)`.
-- **Fencing:** an agent that cannot renew its `_agents/<id>` lease must
+- **Fencing:** an agent that cannot renew its `_agents/<id>/liveness` lease must
   immediately stop accepting group operations, including during the TTL grace
-  window. This is the same discipline as the writer lease.
+  window. This is the same discipline as partition ownership.
 - Group state (`Group`, `GenerationID`, members, assignment) stays in memory —
   i.e. do not persist `CoordinatorState` any more. On coordinator change the
   new agent starts at generation 0; members holding an old generation get
@@ -274,10 +277,11 @@ Ordered cheapest-risk-first. Each phase is independently shippable.
 |---|---|---|---|
 | **0** | Per-partition manifests (`_topics/<t>/_manifest/<p>`); per-agent checkpoints | Removes global-key clobber; kills whole-bucket `LIST` on startup; unblocks multi-agent | Low — no behaviour change |
 | **1** | D2 ack-behind-flush + adaptive flush; `acks=all`→D2 mapping | Satisfies D-1; no producer-side gap to convey | Medium — produce hot path, concurrency |
-| **2** | Partition ownership (`_owners/...`, per-partition epoch) + epoch in segment keys | One writer per partition, fenced; safe multi-agent | Medium |
-| **3** | Liveness + routing tables; rewrite `Metadata`; `NOT_LEADER_OR_FOLLOWER`; owner-scoped reads | Clients route to owners; long-poll preserved (G4) | Medium — touches every data handler |
-| **4** | Graceful drain/handover (seal → upload → manifest → release) vs crash takeover | Measured RTO; most failovers cost no tail | Low–Medium |
-| **5** | HRW group coordination + fencing + `NOT_COORDINATOR`; stop persisting group state | Group HA without durable state (D-4) | Medium |
+| **2** | Partition ownership (`_owners/...`, per-partition epoch) + epoch in segment keys | One writer per partition, fenced; safe multi-agent | ✅ done |
+| **3** | Liveness + routing tables; rewrite `Metadata`; owner-scoped reads | ✅ done |
+| **3b** | HRW group coordination | Groups survive an agent moving | Medium — touches the coordinator |
+| **4** | Graceful drain/handover (seal → upload → manifest → release) vs crash takeover | Measured RTO; most failovers cost no tail | ⬜ next |
+| **5** | HRW group coordination + fencing + `NOT_COORDINATOR`; stop persisting group state | ✅ done |
 | **6** | Idempotent producer + sequence dedup; offset monotonic guard | Makes D2 safe under retry; closes duplicate window | High |
 
 > **Phase 0 is implemented.** The durable position now lives in per-partition
@@ -309,13 +313,104 @@ Phase **6 was pulled forward** to land immediately with **1**: shipping D2
 without idempotence substitutes a worse failure mode for the one it removes,
 so the two are done together (commits `67bafd0` and `702b28a`).
 
+> **Phase 2 is implemented.** Each `(topic, partition)` is claimed separately at
+> `_owners/<topic>/<partition>` with the same expiring-record
+> compare-and-swap the writer lease used, so more than one agent can serve one
+> bucket. The per-partition epoch goes into the segment key
+> (`<baseOffset>-e<epoch>.log`) and into the partition manifest. A produce for a
+> partition this agent does not hold is refused with
+> `NOT_LEADER_OR_FOLLOWER`, and the manifest for an unowned partition is never
+> written. The bucket-global writer lease is now the *fallback* fence: it is only
+> acquired when `KIMISTORE_PARTITION_OWNERSHIP=false`. New settings:
+> `KIMISTORE_PARTITION_OWNERSHIP`, `KIMISTORE_OWNERSHIP_TTL_MS`.
+>
+> Two consequences worth naming, because they are deliberate and visible:
+> ownership replaced the lease rather than sitting on top of it (one fence at a
+> time, or there would be two epochs per write and only one of them would fence
+> anything), and a claim that cannot be renewed is **not** re-acquired in the same
+> process — the epoch would be newer but the agent's in-memory log position would
+> not, so writing would reissue offsets that are already taken. The partition
+> stays fenced until a restart recovers it.
+
+> **Phase 3 is implemented.** Each agent publishes two objects under its own
+> `_agents/<id>/` namespace: a CAS-renewed **liveness** record (`_agents/<id>/liveness`, carrying
+> the node id and advertised host/port) and a **routing table**
+> (`_agents/<id>/routing`, carrying the partitions it owns with their ownership
+> epochs). Every agent caches the union of all live agents' tables, and `Metadata`
+> answers from it: brokers are the live agents, each partition's `Leader` is the
+> node id of its owner and its `LeaderEpoch` the ownership epoch. A partition whose
+> owner is missing or whose table has gone stale is reported with
+> `LEADER_NOT_AVAILABLE` and `Leader = -1`, which is what makes a client refresh
+> and retry rather than give up. `Fetch` and `ListOffsets` refuse a partition this
+> agent does not own, and a fetch never parks on one. New setting:
+> `KIMISTORE_NODE_ID` (derived from the agent id when unset).
+>
+> Three decisions in here are worth naming, because each one was a real bug before
+> it was a decision:
+>
+> - **The topic/partition inventory comes from the `_topics/` manifest keys, not
+>   from routing tables.** A partition nobody owns appears in no routing table, and
+>   Metadata still has to report it — otherwise a client that is not told the
+>   partition exists will hash keys onto it and go nowhere. This is what makes the
+>   topic/partition set cluster-wide rather than "whatever I own", which is what a
+>   client needs to route at all.
+> - **A newly claimed partition is advertised immediately**, not on the next
+>   refresh tick. Waiting would mean a client asking Metadata seconds after a topic
+>   was created is told it has no leader, for up to a whole interval.
+> - **A failed refresh keeps the previous view and marks it stale.** Reporting an
+>   empty cluster because one LIST timed out would take every client's metadata away
+>   at once. A stale view costs one extra Metadata round trip; an empty one costs
+>   the cluster.
+>
+> **Phase 5 is implemented.** Coordinator selection is rendezvous (highest random
+> weight) hashing of the group id over the live agent set, so it is a pure
+> function two agents with the same view compute identically, and when an agent
+> leaves only the groups it coordinated move. `FindCoordinator` answers with that
+> agent's node id and address; the client treats it as a hint. **Every** group
+> request -- `JoinGroup`, `SyncGroup`, `Heartbeat` -- re-checks against this
+> agent's own live set and answers `NOT_COORDINATOR` (16) if this agent is not the
+> winner. That check at the point of use is the fence: it is what makes two
+> coordinators for one group unreachable while their views differ, and it is why
+> the selection being deterministic matters more than the selection being right.
+>
+> Two decisions are deliberate and worth stating:
+>
+> - **There is no grace window on the liveness fence.** An agent that fails to
+>   renew its liveness record stops coordinating *immediately*, where partition
+>   ownership waits out the TTL. A partition owner that loses its claim is still
+>   fenced by the epoch in every segment name and manifest; a coordinator has no
+>   such token, so it may already have been replaced. The cost is a rebalance on a
+>   transient object-store blip, which is the cheaper of the two failures.
+> - **`LeaveGroup` is not fenced.** A member must be able to tell *someone* it is
+>   leaving, and the agent it thought it was talking to is the one most likely to
+>   have changed. The reaper converges the group regardless, so dropping a leave
+>   that arrived at the wrong agent costs nothing beyond the member's own session
+>   timeout.
+>
+> Group state is no longer persisted. It used to be replayed from the checkpoint,
+> which produced a group that looked alive but whose restored members had
+> connections belonging to a process that had exited; the reaper eventually
+> evicted them, so the only effect was a window of wrong assignments. A
+> coordinator now starts empty and members rejoin, which is the same full rebalance
+> D-4 accepts. Consumer offsets are unaffected: they were always durable in object
+> storage, and that is what makes the rejoin cheap.
+
+> **`Metadata` is now advertised up to v7**, which settles open risk 4: v7 is the
+> newest non-flexible version and the only field it adds is `LeaderEpoch`. v8 adds
+> topic authorization, which is not implemented, so v7 is the ceiling.
+
 ### Sequencing dependency
 
-Phase 3 is the hinge. Phases 0–2 are safe to ship one at a time because a
-single agent can still own the whole bucket under the existing lease. Phase 3
-is the first phase that only makes sense with more than one live agent; from
-there, roll it out behind a flag and validate routing before enabling
-multi-owner.
+Phases 0–2 were safe to ship one at a time because a single agent could still own
+the whole bucket. Phase 3 is the first that only makes sense with more than one
+live agent, so it should be rolled out by starting one agent, watching its
+advertised broker entry and its routing table in object storage, and only then
+adding a second.
+
+The routing TTL is the knob that decides how quickly a dead agent stops being
+advertised, and it is deliberately the same value as the ownership TTL: a client
+should never be sent to an agent that has lost the right to serve the partition,
+and the two must not disagree about when that happened.
 
 ---
 
@@ -323,34 +418,68 @@ multi-owner.
 
 - **TLS / mTLS between agents.** Required once agents talk about shared state
   and before routing is exposed. Client SASL PLAIN already exists; inter-agent
-  auth does not.
+  auth does not. Note that with phase 3 the advertised address is now load-bearing
+  in a way it was not before: a client will be *redirected* to it, so a wrong
+  `KIMISTORE_ADVERTISED_HOST` moves clients off a working broker onto a broken
+  one.
 - **Liveness false positives.** TTLs must tolerate GC pauses and brief S3
   slowness. Renew at TTL/3; treat renewal failure as *step down*, not *retry
-  forever*.
+  forever*. This now has a second consequence worth stating plainly: a live agent
+  whose routing table has gone stale is reported as owning nothing, so a
+  `kimistore_routing_age_seconds` that stops climbing while an agent is up means
+  clients are being sent nowhere.
 - **S3 request budget.** More GETs (routing tables, manifests) and PUTs
   (segment flushes). Track object-store ops per request kind; the D2 flush rate
   is the dominant new cost.
-- **Metrics.** Reuse the lease metrics; add `kimistore_writer_epoch{partition}`,
-  `kimistore_durable_offset_lag{partition}`, `kimistore_flush_wait_seconds`,
-  `kimistore_routing_age_seconds`, `kimistore_coordinator_owner`.
+- **Metrics.** Phase 2 shipped `kimistore_partitions_owned`,
+  `kimistore_writer_epoch{partition}`, `kimistore_ownership_claim_failures_total`,
+  `kimistore_ownership_renewal_failures_total` and
+  `kimistore_ownership_refused_writes_total`. Phase 3 added
+  `kimistore_agents_live`, `kimistore_routing_brokers`,
+  `kimistore_routing_age_seconds`, `kimistore_routing_publish_conflicts_total`,
+  `kimistore_routing_inconsistent_tables_total`,
+  `kimistore_routing_duplicate_node_ids_total` and
+  `kimistore_routing_inventory_failures_total`. Still to come:
+  `kimistore_durable_offset_lag{partition}`, `kimistore_coordinator_owner`.
+- **Ownership claim fan-out.** A claim is renewed every `TTL/3`, so an agent
+  holding N partitions issues N PUTs per interval against `_owners/`. At 60s TTL
+  and, say, 500 partitions that is ~8 PUTs/second of pure overhead. If that
+  matters, the fix is to renew claims only for partitions that have seen a write
+  recently, and to let a quiet partition's claim lapse — which is safe precisely
+  because a lapsed claim only means somebody else *may* take it, and nothing is
+  being written. Measure before adding the complexity.
 
 ---
 
 ## 12. Open risks / to validate with a prototype
 
-1. **Rendezvous coordinator agreement.** The stale-view split-brain window
-   (§8) is closed only by the step-down-on-renewal-failure rule. Prove with a
-   chaos test: pause agent B's renewal past TTL while B keeps serving; assert B
-   returns `NOT_COORDINATOR` and no second generation is ever issued.
+1. ~~**Rendezvous coordinator agreement.**~~ **Partly closed in phase 5.** The
+   step-down-on-renewal-failure rule is implemented with no grace window, and the
+   point-of-use fence is covered by tests that run two agents against one bucket.
+   The window that remains is the refresh interval: two agents can hold different
+   live sets for up to TTL/3 and both believe they are the coordinator. The fence
+   bounds the damage to one rebalance rather than a split brain, but proving it
+   wants a chaos test: pause agent B's renewal past TTL while B keeps serving, and
+   assert that every group B held is refused and that no second generation is
+   issued while B is still up.
 2. **Flush-on-wait under load.** Confirm the adaptive flush actually bounds
    tail latency when S3 is slow and many producers wait on one partition.
-3. **Epoch-in-key garbage.** Stale-epoch segments become unreferenced. Decide
-   whether the manifest-driven retention sweep owns their cleanup or a separate
-   reaper does.
-4. **`Metadata` ceiling.** Whether to raise the ceiling to v7+ for
-   `LeaderEpoch`, or route on `Leader` alone until the protocol work lands.
+3. ~~**Epoch-in-key garbage.**~~ **Settled in phase 2:** the retention sweep
+   owns the cleanup. Superseded-epoch segments are unreachable, so it deletes
+   them unconditionally rather than waiting for a consumer to advance past them,
+   and runs its own policies over the live segments only.
+4. ~~**`Metadata` ceiling.**~~ **Settled in phase 3:** the ceiling is v7, the
+   newest non-flexible version and the only field past v6 being `LeaderEpoch`.
+   v8's topic authorization is not implemented, so v7 is where it stops.
 5. **Routing table TTL vs. failover time.** Tune against the measured
-   crash-takeover RTO from Phase 4.
+   crash-takeover RTO from Phase 4. Note the TTL has two jobs — how long a dead
+   agent stays advertised, and how long a wedged one does — and it is currently
+   the same knob for both.
+6. **Discovery cost.** A refresh is one `LIST _agents/` plus one `LIST _topics/`
+   plus a `GET` per agent. At the 60s default with a handful of agents that is
+   negligible; at a thousand agents it is not, and the obvious fix (cache each
+   peer's table and poll them round-robin rather than re-listing every time) is
+   not built. Measure before adding it.
 
 ---
 
@@ -365,16 +494,26 @@ Written so the next session can start without re-deriving any of this.
 | 0 — per-partition manifests, per-agent checkpoints | ✅ on `main` | `a9127c8` | `_topics/<t>/_manifest/<p>`, `_agents/<id>/checkpoint.json`, `KIMISTORE_AGENT_ID` |
 | 1 — `acks=all` waits for object storage (D2) | ✅ on `main` | `67bafd0` | `KIMISTORE_FLUSH_INTERVAL_MS`, durable watermark, `REQUEST_TIMED_OUT` |
 | 6 — idempotent producer + sequence dedup | ✅ on `main` | `702b28a` | `InitProducerId` (22), producer state, `_producers/_seq` |
-| 2 — per-partition ownership + epoch in segment keys | ⬜ next | — | `_owners/<t>/<p>` |
-| 3 — liveness + routing tables, leader-aware `Metadata` | ⬜ | — | `_agents/<id>/routing` |
-| 4 — graceful drain/handover vs crash takeover | ⬜ | — | — |
-| 5 — HRW group coordination | ⬜ | — | — |
+| 2 — per-partition ownership + epoch in segment keys | ✅ on `main` | — | `_owners/<t>/<p>`, `KIMISTORE_PARTITION_OWNERSHIP`, `NOT_LEADER_OR_FOLLOWER` |
+| 3 — liveness + routing tables, leader-aware `Metadata` | ✅ on `main` | — | `_agents/<id>/liveness`, `_agents/<id>/routing`, `KIMISTORE_NODE_ID`, Metadata v7 |
+| 5 — HRW group coordination | ✅ on `main` | — | `NOT_COORDINATOR`, in-memory-only group state |
+| 4 — graceful drain/handover vs crash takeover | ✅ on `main` | — | `DrainPartition`, recovery reconciliation, handover metrics |
 
-Phases 0/1/6 are the ones that make the **current single-writer agent** correct
-under failure; they are done. Phases 2–5 are the multi-agent work and are not
-started. Until phase 3 ships, the agent is still **one writer per bucket** (the
-writer lease), and `Metadata` still reports a single broker with leader `Node 0`
-for every partition.
+Phases 0/1/6 make a single-writer agent correct under failure, phase 2 makes
+several agents safe on one bucket, and phase 3 makes them *usable*: `Metadata` now
+reports every live agent and names the owner of each partition, so a client routes
+itself to whoever holds what it wants to read and write.
+
+Phase 5 made groups HA as well: `FindCoordinator` answers by rendezvous hashing
+over the live set, and every group request is fenced, so an agent that is not the
+coordinator answers `NOT_COORDINATOR` instead of acting. Group state is in-memory
+only, so a coordinator change is a full rebalance — which is what D-4 accepted.
+
+Phase 4 closed the loop: a partition can now be handed to another agent while this
+one keeps serving, and — more importantly — recovery no longer trusts a manifest
+that a crash may have left behind the objects it describes, which was silently
+overwriting acknowledged records on takeover. All six phases are now implemented;
+§13.8 is what remains.
 
 ### 13.2 Key files
 
@@ -382,9 +521,13 @@ for every partition.
 |---|---|
 | Durable position, checkpoint, write path, upload | `internal/storage/engine.go` |
 | Per-partition manifests + legacy migration | `internal/storage/partition_manifest.go` |
+| **Per-partition ownership claims, renewal, release** | `internal/storage/ownership.go` |
+| **Segment names carrying the ownership epoch** | `internal/storage/wal/segment_name.go` |
+| **Liveness, routing tables, cached cluster view** | `internal/storage/registry.go` |
+| **Rendezvous coordinator selection** | `internal/coordinator/rendezvous.go` |
+| Bucket-global writer lease (fallback fence) | `internal/storage/lease.go` |
 | D2 durable watermark + flush loop | `internal/storage/durable.go` |
 | Idempotent producer state + allocator + WAL-tail recovery | `internal/storage/producer.go` |
-| Writer lease / fencing token | `internal/storage/lease.go` |
 | RecordBatch parsing (incl. producer header) | `internal/storage/wal/record.go` |
 | Segment roll, explicit flush, upload task | `internal/storage/wal/partition.go`, `manager.go` |
 | Protocol dispatch, API versions, error codes | `internal/protocol/handler.go` |
@@ -392,49 +535,165 @@ for every partition.
 | Config | `internal/config/config.go` |
 | Metrics | `internal/metrics/metrics.go` |
 
-### 13.3 Phase 2 — where to start
+### 13.3 Phase 2 — what landed
 
-The goal: one writer per **(topic, partition)**, fenced, so more than one agent
-can serve one bucket. It reuses the existing lease primitive at a narrower
-scope.
+Shipped. One writer per **(topic, partition)**, fenced, so more than one agent
+can serve one bucket. `internal/storage/ownership.go`:
 
-1. Replace the bucket-global writer lease as the *only* fence with a per-partition
-   claim at `_owners/<topic>/<partition>` = `{agent, epoch, expires}`, acquired
-   with the same CAS helper the lease uses (`ConditionalObjectStore.PutVersion`).
-   Keep the bucket-global lease for now as a coarse guard; phase 3 removes the
-   need for it.
-2. Put the ownership **epoch in the segment key**:
-   `topic/partition/<baseOffset>-e<epoch>.log`. A stale owner's upload then
-   cannot collide with, or overwrite, the new owner's. `_owners` is written
-   rarely, so the CAS is off the append hot path.
-3. Epoch must be **monotonic per partition** and never reset, for the same
-   reason the lease epoch is not reset across restarts (see `lease.go` release
-   tombstone) — it is stamped into the manifest and compared on recovery.
-4. `recoverManifest` / `loadPartitionManifests` already compare `WriterEpoch`
-   against the local epoch and return `errSuperseded`; extend the same check to
-   the per-partition ownership epoch.
+1. A per-partition claim at `_owners/<topic>/<partition>` =
+   `{agent, epoch, expires}`, acquired with the same CAS helper the lease uses
+   (`ConditionalObjectStore.PutVersion`). Claims are taken lazily, once per
+   partition per process, so the CAS is off the append hot path.
+2. The ownership epoch is in the segment key, via `wal.SegmentName`
+   (`internal/storage/wal/segment_name.go`). Both the local sealed file name and
+   the object key carry it, so a stale owner's upload lands beside its
+   successor's rather than over it, and a reconciliation re-upload reproduces the
+   key it already had.
+3. The epoch is **monotonic per partition** and never reset, for the same reason
+   the lease epoch is not (see the `release` tombstone in `lease.go`): it is
+   stamped into the manifest and the segment names, and a reset would make the
+   next agent conclude it had been superseded by a writer that does not exist.
+4. `loadPartitionManifests` claims a partition before reading its manifest (the
+   LIST may name partitions the checkpoint did not know), and compares the
+   manifest's epoch against the claim, returning `errSuperseded` on a mismatch.
+5. `produceError` maps `ErrPartitionHeld` / `ErrPartitionNotOwned` /
+   `ErrPartitionLost` to `NOT_LEADER_OR_FOLLOWER`, which is what sends a producer
+   to the right agent.
 
-Do not start phase 3 until a single agent can still own everything under the
-new scheme (phase 2 is shippable alone).
+### 13.4 Phase 3 — shipped, and what it left
 
-### 13.4 Phase 3 — the hinge
+`internal/storage/registry.go`. Liveness and routing records, the cached union
+view, and the discovery loop that keeps them current. `handleMetadata` is
+rewritten around that view.
 
-- Publish `_agents/<id>/routing` (owned partitions + epochs) and discover the
-  union into a cached routing view.
-- Rewrite `handleMetadata`: brokers = live agents; per partition, `Leader` =
-  owner node id and `LeaderEpoch` = ownership epoch (`Metadata` v7+ for the
-  epoch; today's ceiling is v6, see open risk 4). Unowned partition →
-  `LEADER_NOT_AVAILABLE (5)`.
-- Owner-scoped reads: serve the local (hot) WAL only for owned partitions; a
-  non-owned partition may be read cold from S3 but must never answer from a
-  stale local WAL.
-- `NOT_LEADER_OR_FOLLOWER` for a produce/fetch to a partition this agent does
-  not own. `produceError` in `handlers_ops.go` already has a slot for the lease
-  case; narrow it to the partition check.
-- Long-poll keeps working only if clients reach the owner, which is exactly why
-  routing is load-bearing for latency and not just for safety (§5.3).
+One design decision deserves its own note, because the obvious alternative is
+wrong: **a fetch for a partition this agent does not own is refused, not served
+cold from object storage.** §5.3 assumed the non-owner read path was "cold S3
+reads". That turns out not to be available: a non-owner does not know the
+partition's log end offset, because its durable position was dropped when the
+claim moved. Every high watermark it could report would be a guess, and a
+low guess makes a consumer believe it is caught up and stop reading, while a high
+guess makes it skip records it never read. `LEADER_NOT_AVAILABLE` costs one
+Metadata round trip and gets the consumer to the agent that knows the answer. The
+same reasoning applies to `ListOffsets`, where reporting offset 0 as "earliest"
+for a log that starts at 90000 is an infinite `OffsetOutOfRange` loop for the
+client that trusts it.
 
-### 13.5 Decisions made during implementation (refinements to this doc)
+What phase 3 leaves, and where phase 5 picked it up:
+
+1. **Phase 5 — group coordination.** Shipped; see the phase 5 note above and §8
+   for the design. `FindCoordinator` no longer returns self unconditionally.
+2. **Phase 4 — handover.** Shipped; see §13.7.
+
+### 13.5 Phase 4 — handover
+
+Phase 4 has two halves: a correctness fix that recovery needed before any handover
+could be safe, and the handover itself.
+
+#### The recovery fix that handover depends on
+
+An owner appends to offset 20, uploads the segment, and dies before the next
+checkpoint. Its manifest still says 10. The next owner trusts it and starts
+writing at 10 — over records the previous owner had already acknowledged, because
+D2 releases an `acks=all` producer the moment the segment lands, not when a
+manifest catches up. Nothing in the manifest hints the objects are further ahead.
+
+No ordering removes that window: the segment has to become visible before the
+manifest that describes it can be written, so a crash in between always leaves a
+manifest behind its own data. **Object storage is the system of record, so
+recovery derives the position from it and takes the maximum of the two.** Every
+partition with segments is reconciled at startup, not just the ones whose manifest
+looks incomplete; `kimistore_objects_reconciled_total` counts the corrections, and
+recovery logs each one loudly, because a non-zero rate means the tail of the system
+is failing more often than the dashboards suggest.
+
+This is a deliberate trade against startup cost, which the standing rule says loses
+to data loss. The cost is contained by batching: one LIST per topic rather than one
+per partition, plus one bounded tail read per partition (the index sidecar, then
+the last indexed record — about 4KB plus one record, never the whole segment).
+
+It also closes a second door. A manifest from a *superseded* epoch is normally
+rejected, but that check only catches a manifest from a **newer** owner; a stale
+writer pushing the log end backwards was unguarded. `TestRecovery_StaleEpochManifestCannotRewindTheLog`
+pins that the reconciliation is what makes it safe.
+
+#### The handover
+
+`DrainPartition` moves one partition while the agent keeps serving everything else.
+The order is load-bearing:
+
+1. seal the active segment and wait for the upload to land,
+2. wait until the durable frontier covers the log end,
+3. re-verify the claim against object storage,
+4. write the partition manifest,
+5. release the ownership claim, and only then stop serving the partition.
+
+**The release is last on purpose.** The claim is gone the instant it is released,
+so another agent may take the partition immediately; a handover that released first
+and flushed after would let a peer take a partition this agent was still appending
+to. Steps 3 and the re-check after step 2 exist because the local view of ownership
+goes stale — a claim can be taken the moment it ages out, and this agent learns
+only at its next renewal, up to a third of a TTL later.
+
+**A handover that cannot make the tail durable keeps the partition** rather than
+releasing anyway, and reports why. Releasing anyway is what turns a slow object
+store into silent data loss. A slow handover is a slower recovery; a wrong one is
+not a recovery at all. `kimistore_handover_kept_total` makes the refused case
+visible rather than merely logged.
+
+Reads are deliberately *not* fenced on ownership. A non-owner reads from object
+storage, which is authoritative, and refusing reads would break consumers during
+every handover for no safety gain. What must never happen is the old owner serving
+its own pre-handover WAL, and that is the read-side fence from phase 2.
+
+#### RTO is now measured, not assumed
+
+That was the phase's actual deliverable. Every handover records
+`kimistore_handover_seconds` (seal to released claim) and
+`kimistore_handover_completed_total`. A clean handover costs one seal plus one
+manifest PUT, so the interesting number is the crash path: a takeover waits out the
+claim TTL (default 15s), and the RTO that matters to a producer is the TTL, not the
+drain. A healthy cluster should show `handover_kept_total` at zero — a non-zero
+value means object storage is too slow to hand anything over safely, which is a
+capacity problem worth seeing before it is a data-loss problem.
+
+#### Two bugs this found, both silent
+
+The volume test exists to check integrity, and it found two things that nothing
+else had:
+
+**`ListOffsets("earliest") pointed past data that was still present.** Recovery
+took the log start from the newest segment instead of the oldest — the entry walk
+it already does only sees the newest segment — so once a partition had more than
+one uploaded segment, every consumer that reset to the start of the log was sent
+past everything older. Mimir's group offsets are in-memory only, so *every Mimir
+restart* re-seeks to the start of the log, which is exactly why a restarted Mimir
+silently lost the head of the log. Nothing errored: the records were still in
+object storage and readable, and the broker reported a start offset past them.
+Recovery now derives both ends from the objects, taking the maximum for the log end
+and the minimum for the log start.
+
+**The Metadata response emitted `Partition` before `ErrorCode`.** Kafka's
+`MetadataResponseTopicPartition` is error code first. The swap does not break a
+decode of the *first* partition, so every single-partition test passed and every
+existing decoder here read the fields in the wrong order without checking their
+values. It only surfaced with more than one partition, where a client checking
+that partition numbers are consecutive reads the second one as 65536 — which is
+what Grafana Mimir reported. `TestMetadataDecodesWithARealKafkaClient` now parses
+the response with franz-go's decoder, the one Mimir actually uses, and asserts the
+partition numbers; a decoder that shares the mistake cannot catch it.
+
+#### What phase 4 does not do
+
+There is no runtime trigger. `DrainPartition` is an engine API with tests but no
+caller: exposing it needs an authenticated mutating endpoint or an operator
+protocol, and inventing either is a decision about the trust boundary rather than
+about the storage engine. Note in particular that **deleting the claim out of band
+is not a substitute** — it releases the partition immediately while the old owner
+keeps serving until its next renewal, which is precisely the split-brain window
+the epoch in the segment key mitigates but does not close.
+
+### 13.6 Decisions made during implementation (refinements to this doc)
 
 - **`KIMISTORE_AGENT_ID` defaults to the hostname, not the lease holder.** The
   checkpoint key must be stable across a restart; the lease holder is
@@ -452,15 +711,77 @@ new scheme (phase 2 is shippable alone).
   `MetadataCache.AdvancePartition` only ever moves the log end forward. If a
   stronger guarantee is wanted (reject a *lower* consumer commit), that is not
   implemented — Kafka permits lowering commits, so it was left conformant.
+- **Ownership replaced the bucket-global lease rather than joining it.** There is
+  one fence at a time. Two overlapping claims would mean two epochs per write and
+  only one of them fencing anything, and the coarse one would refuse every second
+  agent — the exact behaviour per-partition ownership exists to remove. The lease
+  is now what you get from `KIMISTORE_PARTITION_OWNERSHIP=false`.
+- **A partition another agent holds is skipped, not fatal.** The alternative was
+  refusing to start, which leaves the partition with nobody to serve it while
+  every other partition on the topic stays uncreated. An agent serves what it
+  claimed and refuses the rest.
+- **A lost claim is never re-acquired in the same process.** The new epoch would
+  be higher, but the agent's in-memory log position would not be: whoever took
+  the partition over has been assigning offsets from a position this agent cannot
+  see, so writing would reissue offsets that are already taken. The partition stays
+  fenced until a restart recovers it. (`Claim` returns `ErrPartitionLost`.)
+- **`CreateTopic` claims every partition but tolerates refusals**, so one held
+  partition cannot make a whole topic uncreatable by every agent.
+- **Superseded-epoch segments are reclaimed by the retention sweep**, not left for
+  a separate reaper (this settles open risk 3). They are unreachable, so they are
+  deleted unconditionally rather than held until a consumer advances past offsets
+  nobody will ask for. Retention's own policies then run over the live segments
+  only, where the offset arithmetic is sound.
+- **A claim record stores its expiry in whole seconds**, so a TTL under a second
+  can be rounded down to nothing and read as already expired. Fine at the 60s
+  default; the ownership tests use a TTL comfortably over a second for this reason.
+- **`dropUnownedPartitions` runs after the checkpoint load.** The checkpoint is
+  agent-private but bucket-wide, so it lists partitions another agent owns;
+  keeping them would let this agent serve a log end offset it cannot append to.
+- **Deleting a topic also deletes its `_owners/<topic>/` claims.** The epoch is
+  not reusable afterwards, deliberately: durable records written under the deleted
+  topic's epoch must not be mistaken for current data if the name is reused.
 - **Mimir's e2e does not enable idempotence.** Its distributor never sends
   `InitProducerId`, so `test/mimir-e2e.sh` cannot exercise phase 6. That is why
   `github.com/twmb/franz-go` is now a test dependency; see
   `internal/server/franz_idempotence_test.go`, including the forced
   timeout-and-retry that asserts the retry is deduplicated.
-- **Deleting a topic also deletes its `_topics/<t>/…` manifests**, which live
-  outside the topic's data prefix (`engine.go`, `asyncDeleteTopicFromS3`).
+- **Liveness and routing are two different objects in one flat prefix**, so
+  discovery tells them apart by key shape and skips `_agents/<ns>/checkpoint.json`
+  — a private durable object that is not addressed to anyone. Parsing that lives in
+  `parseAgentKey`, and a test pins all four cases.
+- **An agent that owns nothing still publishes a routing table.** Discovery finds
+  agents *by* their table, so a table written only when the owned set is non-empty
+  would make a freshly started, idle agent invisible — which is exactly the moment
+  another agent needs to know it exists.
+- **Two processes sharing an agent id are refused, not merged.** A live record with
+  the same agent id and a different node id means two brokers claiming one
+  identity; overwriting it would make clients flap between two addresses for one
+  broker. The takeover happens when the old record expires, which is the crash
+  case.
+- **A routing table older than the TTL is ignored while the agent is still live.**
+  That combination means the writer is wedged between renewing its liveness and
+  republishing its table, and its partitions should be treated as unowned rather
+  than routed to a broker that is not making progress.
+- **The registry borrows the engine's object-store helpers.** With its own
+  timeout it was able to hold engine construction open for the full TTL against a
+  store that never answers — a regression the engine's operation timeout exists to
+  prevent.
+- **`Routing()` deep-copies before overlaying local state.** The snapshot's maps
+  are the registry's live maps, shared with the goroutine that refreshes them;
+  writing to them was a concurrent map write that the race detector caught.
+- **All three `_agents/` objects live under the agent's prefix**, not at it. The
+  liveness record at `_agents/<id>` would make that key both an object and a
+  directory prefix: object storage does not care, and a filesystem-backed store
+  cannot represent it at all. The end-to-end test's local S3 shim is exactly such
+  a store, and it failed in a way that looked like an agent bug.
+- **Segment names are now the one place a record-shape assumption lives.** A name
+  is no longer a bare integer, so every reader parses it through
+  `wal.ParseSegmentName` rather than `ParseInt`. A name with no `-e<epoch>` suffix
+  parses as epoch 0, which is what keeps a bucket written before phase 2 readable
+  and its keys unchanged.
 
-### 13.6 Verification commands
+### 13.7 Verification commands
 
 ```bash
 go build ./...
@@ -470,7 +791,27 @@ golangci-lint run ./...
 go build -o agent ./cmd/agent && ./test/mimir-e2e.sh   # needs Docker
 ```
 
-### 13.7 Outstanding operational item
+`mimir-e2e.sh` checks that the data is *there*. `mimir-integrity-e2e.sh` checks
+that it is *intact*: it pushes a volume whose every sample value is known in
+advance, then verifies per-series sample counts and value sums, per-slice counts,
+and all of it again after a broker crash, a broker restart, and a full Mimir
+restart. `test/logprobe` walks the log with an independent client, so a slow or
+buggy consumer is not mistaken for a broker that lost data.
+
+```bash
+go build -o agent ./cmd/agent
+VOL1_SERIES=60 VOL1_POINTS=400 ./test/mimir-integrity-e2e.sh   # needs Docker
+GOOS=linux GOARCH=arm64 go build -o /tmp/kimi-logprobe ./test/logprobe
+```
+
+The e2e harness leaves state behind; clean it before a rerun:
+
+```bash
+pkill -f s3shim.py
+rm -rf /tmp/kimi-mimir-e2e
+```
+
+### 13.8 Outstanding operational item
 
 The GitHub Actions workflow (`.github/workflows/ci.yml`) has **never run
 remotely**. Watch the first push-triggered run and the nightly/manual Mimir job;

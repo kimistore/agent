@@ -12,7 +12,7 @@ This server implements a subset of the Kafka Protocol (primarily V0-V2). It is d
     | Produce | 0-3 |
     | Fetch | 0-5 |
     | ListOffsets | 0-2 |
-    | Metadata | 0-6 |
+    | Metadata | 0-7 |
     | OffsetCommit | 0 |
     | OffsetFetch | 0-1 |
     | FindCoordinator | 0 |
@@ -83,10 +83,13 @@ with `ErrorCode` before `ThrottleTimeMs`, the reverse of the schema, so
 offering v1+ would hand it a misaligned response. v0 has no throttle field, so
 the two readings coincide.
 
-**Metadata goes to v6**, the newest non-flexible version. Note that
-`cluster_id` is a **v2** field, not v1: a v1 client reads whatever sits where
-the controller id belongs, so emitting it early desynchronises every field
-after it.
+**Metadata goes to v7.** v7 is the newest non-flexible version, and the only
+field it adds over v6 is `LeaderEpoch` -- the ownership epoch of the agent that
+leads the partition, which is how a client detects that the leader it cached has
+been replaced. v8 adds topic authorization, which is not implemented, so v7 is
+where the ceiling stops. Note that `cluster_id` is a **v2** field, not v1: a v1
+client reads whatever sits where the controller id belongs, so emitting it early
+desynchronises every field after it.
 
 **Fetch goes to v5**, which adds `log_start_offset` so a client can find the
 log start without a separate ListOffsets round trip.
@@ -188,23 +191,54 @@ kcat -b localhost:19092 -G my-group my-topic
 
 ### Operational guarantees that affect the protocol
 
-* **One writer per log.** The agent claims its log in object storage with a
-  compare-and-swap lease before it serves anything, and refuses to start when
-  another live agent holds it. Two agents on one bucket do not interleave: they
-  assign the same offsets and overwrite each other's segments, so the second one
-  must not run rather than run "a bit behind". If the store cannot enforce
-  conditional writes, `KIMISTORE_REQUIRE_LEASE=false` downgrades the fence to a
-  startup warning.
-* **Durable state carries a writer epoch.** The checkpoint and the manifest
-  record the epoch that wrote them. An agent whose epoch is behind the one it
-  finds on startup refuses to serve that log, which closes the window between
-  one agent stopping and its replacement starting.
+* **One writer per partition.** The agent claims each `(topic, partition)` in
+  object storage with a compare-and-swap before writing to it, and answers a
+  produce for a partition it does not hold with `NOT_LEADER_OR_FOLLOWER`. Two
+  agents must never interleave on one partition: they would assign the same
+  offsets and overwrite each other's segments. A partition that is already held
+  by a live agent is skipped rather than fatal, so the partitions an agent *can*
+  have stay servable. If the store cannot enforce conditional writes,
+  `KIMISTORE_REQUIRE_LEASE=false` downgrades the fence to a startup warning.
+  `KIMISTORE_PARTITION_OWNERSHIP=false` reverts to one bucket-wide claim that
+  refuses a second agent outright.
+* **Clients are routed to the agent that owns a partition.** `Metadata` reports
+  every live agent and names each partition's leader, so a client writes to and
+  reads from the agent holding it. A partition whose owner is gone is reported as
+  `LEADER_NOT_AVAILABLE`, and a `Fetch` or `ListOffsets` for a partition this
+  broker does not own is refused -- an agent that does not own a partition cannot
+  know its log end offset, so any answer it gave would be a guess. `Metadata` is
+  advertised up to v7, which is the only version past v6 that is not flexible; it
+  adds `LeaderEpoch`, so a client can detect a leader change.
+* **Groups are coordinated by one agent, and it is checked.** `FindCoordinator`
+  picks the agent by rendezvous hashing of the group id over the live set, and
+  `JoinGroup`, `SyncGroup` and `Heartbeat` answer `NOT_COORDINATOR` on any agent
+  that is not the winner. Group state is in memory, so a coordinator change is a
+  full rebalance; consumer offsets are durable in object storage, so the rebalance
+  does not cost a replay. `LeaveGroup` is deliberately not fenced.
+* **Durable state carries an ownership epoch.** The per-partition manifest, the
+  checkpoint and the segment key (`<baseOffset>-e<epoch>.log`) all record the
+  epoch that wrote them. An agent whose epoch is behind the one it finds on
+  startup refuses to serve that partition, which closes the window between one
+  owner stopping and its replacement starting. Putting the epoch in the segment
+  key is what keeps a superseded writer's late upload from overwriting its
+  successor's segment at the same base offset.
 * **Every storage call is bounded.** Object-store operations are limited by
   `KIMISTORE_S3_TIMEOUT_MS`, and a client that disconnects cancels the read it
   started. A client therefore sees a retriable error rather than a stalled
   connection, which matters because a stalled connection stops heartbeats and
   commits and shows up as a rebalance storm.
 
-New metrics for these: `kimistore_lease_owned`, `kimistore_lease_epoch`,
-`kimistore_lease_renewal_failures_total`, `kimistore_lease_refused_writes_total`,
-`kimistore_object_store_timeouts_total`.
+New metrics for these: `kimistore_partitions_owned`,
+`kimistore_writer_epoch`, `kimistore_ownership_claim_failures_total`,
+`kimistore_ownership_renewal_failures_total`,
+`kimistore_ownership_refused_writes_total`, `kimistore_agents_live`,
+`kimistore_routing_brokers`, `kimistore_routing_age_seconds`,
+`kimistore_routing_publish_conflicts_total`,
+`kimistore_routing_inconsistent_tables_total`,
+`kimistore_routing_duplicate_node_ids_total`,
+`kimistore_routing_inventory_failures_total`, `kimistore_agent_live`,
+`kimistore_coordinator_groups_total`, `kimistore_coordinator_refused_total`,
+`kimistore_object_store_timeouts_total`. The bucket-global lease gauges
+(`kimistore_lease_owned`, `kimistore_lease_epoch`,
+`kimistore_lease_renewal_failures_total`, `kimistore_lease_refused_writes_total`)
+remain for deployments that turn ownership off.

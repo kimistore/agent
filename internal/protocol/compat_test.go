@@ -21,6 +21,7 @@ package protocol
 import (
 	"context"
 	"fmt"
+	"github.com/twmb/franz-go/pkg/kmsg"
 	"testing"
 
 	"kimistore/internal/storage"
@@ -89,6 +90,30 @@ func metadataRequest(topics ...string) []byte {
 		enc.String(tp)
 	}
 	return enc.Bytes()
+}
+
+// dispatchRaw is dispatch without the Decoder wrapper: it returns the response
+// payload as bytes so a test can hand it to a different implementation.
+func dispatchRaw(t *testing.T, store *storage.StorageEngine, cfg ServerConfig, apiKey, apiVersion int16, body []byte) []byte {
+	t.Helper()
+
+	enc := NewEncoder()
+	enc.Int16(apiKey)
+	enc.Int16(apiVersion)
+	enc.Int32(7) // correlation id
+	enc.String("test-client")
+	frame := append(enc.Bytes(), body...)
+
+	resp, err := HandleRequest(context.Background(), frame, store, &Session{Authenticated: true}, cfg)
+	if err != nil {
+		t.Fatalf("api %d v%d: HandleRequest: %v", apiKey, apiVersion, err)
+	}
+	// Skip the correlation id echoed at the head of every response.
+	dec := NewDecoder(resp)
+	if _, err := dec.Int32(); err != nil {
+		t.Fatalf("api %d v%d: missing correlation id: %v", apiKey, apiVersion, err)
+	}
+	return resp[4:]
 }
 
 // TestMetadataAdvertisesConfiguredAddress pins the fix for the failure that
@@ -244,6 +269,72 @@ func TestMetadataReportsRealPartitions(t *testing.T) {
 	partCount, _ := dec.Int32()
 	if partCount != 4 {
 		t.Errorf("partition count = %d, want 4; a collapsed partition set starves consumers", partCount)
+	}
+}
+
+// TestMetadataDecodesWithARealKafkaClient parses kimistore's Metadata response
+// with franz-go's decoder -- the one Grafana Mimir actually uses.
+//
+// The other tests in this file decode with kimistore's own Decoder, so a response
+// whose field order is consistently wrong passes all of them: a decoder that
+// shares the mistake cannot catch it. That is how a Metadata response with
+// ErrorCode and Partition swapped survived, because the first partition still
+// "decodes" and only a second partition reveals the shift.
+//
+// This is the test that would have caught it.
+func TestMetadataDecodesWithARealKafkaClient(t *testing.T) {
+	const partitions = 4
+
+	for _, version := range []int16{0, 1, 2, 3, 4, 5, 6, 7} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			se := testStore(t)
+			if err := se.CreateTopic("orders", partitions); err != nil {
+				t.Fatalf("create topic: %v", err)
+			}
+
+			body := metadataRequest("orders")
+			if version >= 6 {
+				// v6 adds allow_auto_topic_creation to the request.
+				body = append(append([]byte{}, body...), 0)
+			}
+			// Hand the client the raw payload, not kimistore's decoder: the point
+			// is that an independent implementation reads it correctly.
+			raw := dispatchRaw(t, se, testConfig(), ApiKeyMetadata, version, body)
+
+			var md kmsg.MetadataResponse
+			md.Version = version
+			if err := md.ReadFrom(raw); err != nil {
+				t.Fatalf("v%d: a real Kafka client cannot parse the response: %v", version, err)
+			}
+
+			var topic *kmsg.MetadataResponseTopic
+			for i := range md.Topics {
+				name := ""
+				if md.Topics[i].Topic != nil {
+					name = *md.Topics[i].Topic
+				}
+				if name == "orders" {
+					topic = &md.Topics[i]
+				}
+			}
+			if topic == nil {
+				t.Fatalf("v%d: response does not mention orders", version)
+			}
+			if len(topic.Partitions) != partitions {
+				t.Fatalf("v%d: %d partition(s), want %d", version, len(topic.Partitions), partitions)
+			}
+			// Consecutive partition numbers in order: the check franz-go makes,
+			// and the one that fails when the fields are emitted swapped.
+			for i, p := range topic.Partitions {
+				if p.Partition != int32(i) {
+					t.Errorf("v%d: partition[%d].Partition = %d, want %d",
+						version, i, p.Partition, i)
+				}
+				if p.ErrorCode != 0 {
+					t.Errorf("v%d: partition[%d].ErrorCode = %d, want 0", version, i, p.ErrorCode)
+				}
+			}
+		})
 	}
 }
 

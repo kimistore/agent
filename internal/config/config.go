@@ -72,7 +72,17 @@ type Config struct {
 	// another live writer holds it, because two writers on one bucket do not
 	// queue behind each other: they assign the same offsets and overwrite
 	// each other's segments.
+	//
+	// Only used when Ownership is disabled. The two are alternative fences, not
+	// complementary ones: the bucket-global claim refuses every agent but the
+	// first, which is what per-partition ownership exists to stop doing.
 	Lease LeaseConfig
+
+	// Ownership configures the per-partition fence, which is on by default.
+	// Each (topic, partition) is claimed separately, so a second agent can
+	// serve the partitions this one does not hold, and a stale owner cannot
+	// corrupt the ones it does.
+	Ownership OwnershipConfig
 
 	// AgentID is this agent's stable durable identity. It namespaces the
 	// checkpoint object (see storage.WithAgentID) so two agents sharing a
@@ -80,9 +90,17 @@ type Config struct {
 	// is stable across a restart of the same agent.
 	AgentID string
 
-	// RequireLease makes an object store that cannot enforce conditional
-	// writes a startup failure instead of a warning.
+	// RequireLease makes an object store that cannot enforce conditional writes a
+	// startup failure instead of a warning. The name predates partition ownership;
+	// it applies to whichever fence is in force.
 	RequireLease bool
+
+	// NodeID is the broker id clients see in Metadata and FindCoordinator. It
+	// must be stable across restarts and unique across agents, because that is
+	// what a client uses to remember where a partition's leader is. Empty
+	// derives one from AgentID, which is stable but not guaranteed unique across
+	// agents -- set it explicitly when two agents could share an id.
+	NodeID int32
 
 	// AutoCreateTopics mirrors Kafka's auto.create.topics.enable. A client
 	// that asks about a topic that does not exist gets one created for it,
@@ -97,8 +115,21 @@ type Config struct {
 
 // LeaseConfig is the runtime shape of the writer lease. A zero value means
 // "let the storage layer choose the defaults".
+// OwnershipConfig is the runtime shape of per-partition ownership.
+type OwnershipConfig struct {
+	// Enabled turns per-partition claims on. It is on by default, and turns the
+	// bucket-global writer lease off.
+	Enabled bool
+	// Agent identifies this agent in its claims. Empty selects the agent id
+	// (hostname, or KIMISTORE_AGENT_ID), which must be stable across restarts.
+	Agent string
+	// TTL is how long a claim survives without renewal, and therefore how long
+	// a crashed agent blocks its replacement for that one partition.
+	TTL time.Duration
+}
+
 type LeaseConfig struct {
-	// Enabled turns the fence on. It is on by default.
+	// Enabled turns the fence on. It is on by default when ownership is off.
 	Enabled bool
 	// Key is the object the claim lives at, inside the log's bucket. Empty
 	// selects the storage layer's default.
@@ -138,14 +169,27 @@ func FromEnv() Config {
 		FlushInterval: time.Duration(envInt64("KIMISTORE_FLUSH_INTERVAL_MS", 1_000)) * time.Millisecond,
 
 		Lease: LeaseConfig{
-			Enabled: envBool("KIMISTORE_WRITER_LEASE", true),
-			Key:     os.Getenv("KIMISTORE_LEASE_KEY"),
-			Holder:  os.Getenv("KIMISTORE_WRITER_ID"),
+			// Only consulted when ownership is off, so this defaults to the
+			// inverse of it rather than to a separate switch: turning ownership
+			// on is what turns the bucket-global claim off.
+			Enabled: !envBool("KIMISTORE_PARTITION_OWNERSHIP", true) &&
+				envBool("KIMISTORE_WRITER_LEASE", true),
+			Key:    os.Getenv("KIMISTORE_LEASE_KEY"),
+			Holder: os.Getenv("KIMISTORE_WRITER_ID"),
 			// Twice the object-store timeout by default: a renewal that is
 			// merely slow must not look like a lost claim, and a crashed
 			// agent should not block its replacement for much longer than a
 			// healthy one takes to renew.
 			TTL: time.Duration(envInt64("KIMISTORE_LEASE_TTL_MS", 60_000)) * time.Millisecond,
+		},
+
+		Ownership: OwnershipConfig{
+			Enabled: envBool("KIMISTORE_PARTITION_OWNERSHIP", true),
+			Agent:   os.Getenv("KIMISTORE_AGENT_ID"),
+			// Same reasoning as the lease TTL: a slow renewal must not read as
+			// a lost partition, and a crashed agent should hand its partitions
+			// over promptly.
+			TTL: time.Duration(envInt64("KIMISTORE_OWNERSHIP_TTL_MS", 60_000)) * time.Millisecond,
 		},
 
 		Retention: RetentionConfig{
@@ -161,14 +205,72 @@ func FromEnv() Config {
 	}
 	c.AdvertisedPort = int32(envInt64("KIMISTORE_ADVERTISED_PORT", int64(defaultPort(c.ListenAddr))))
 
+	c.NodeID = c.resolveNodeID()
+
 	return c
+}
+
+// resolveNodeID picks the broker id clients will use.
+//
+// It must be stable, because a client remembers a partition's leader by node id
+// across Metadata refreshes: an id that changes on restart makes every client
+// treat the agent as a new broker, and an id shared by two agents makes them
+// indistinguishable. Derived from the agent id it is stable and practically
+// collision-free for the handful of agents a landing zone runs, which is why it
+// is the default; KIMISTORE_NODE_ID exists for the case where that is not good
+// enough.
+func (c *Config) resolveNodeID() int32 {
+	if raw := os.Getenv("KIMISTORE_NODE_ID"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil || v < 0 {
+			log.Printf("Invalid KIMISTORE_NODE_ID=%q, deriving one from the agent id instead", raw)
+		} else {
+			return int32(v)
+		}
+	}
+	return DeriveNodeID(agentIdentity(c.AgentID))
+}
+
+// agentIdentity is the id claims and routing records are namespaced by. It must
+// match what the storage layer uses, so it is derived the same way.
+func agentIdentity(agentID string) string {
+	if strings.TrimSpace(agentID) == "" {
+		return defaultHostname()
+	}
+	return agentID
+}
+
+func defaultHostname() string {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
+	}
+	return "unknown-agent"
+}
+
+// DeriveNodeID maps an agent identity onto a broker id.
+//
+// FNV-1a keeps it stable across restarts and dependency-free. The result is
+// masked to 31 bits so it can never be negative: Kafka uses -1 to mean "no
+// leader", and a broker id that could collide with that sentinel would make a
+// perfectly good broker look dead in the partitions it owns.
+func DeriveNodeID(agentID string) int32 {
+	const (
+		offset32 = 2166136261
+		prime32  = 16777619
+	)
+	h := uint32(offset32)
+	for i := 0; i < len(agentID); i++ {
+		h ^= uint32(agentID[i])
+		h *= prime32
+	}
+	return int32(h & 0x7FFFFFFF)
 }
 
 // defaultAdvertisedHost prefers the hostname the pod actually has, which is
 // what a co-located client will resolve. Falling back to the listen address's
 // own host keeps a loopback setup working out of the box.
 func defaultAdvertisedHost() string {
-	if h, err := os.Hostname(); err == nil && h != "" {
+	if h := defaultHostname(); h != "" && h != "unknown-agent" {
 		return h
 	}
 	if h, _, err := net.SplitHostPort(env("KIMISTORE_LISTEN_ADDR", ":19092")); err == nil && h != "" {
@@ -204,12 +306,17 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.AdvertisedHost) == "" {
 		return fmt.Errorf("advertised host is empty; set KIMISTORE_ADVERTISED_HOST")
 	}
-	// A lease TTL at or below the object-store timeout would let a slow
+	// A claim TTL at or below the object-store timeout would let a slow
 	// renewal look like a lost claim, and would let a replacement start while
-	// the previous agent is merely slow rather than gone.
-	if c.Lease.Enabled && c.Lease.TTL <= c.S3Timeout {
-		return fmt.Errorf("lease TTL %s must exceed the S3 timeout %s, or a slow renewal will look like a lost lease",
-			c.Lease.TTL, c.S3Timeout)
+	// the previous agent is merely slow rather than gone. This holds for both
+	// fences, so it is checked against whichever is in force.
+	ttl, label := c.Lease.TTL, "lease"
+	if c.Ownership.Enabled {
+		ttl, label = c.Ownership.TTL, "partition ownership"
+	}
+	if ttl <= c.S3Timeout {
+		return fmt.Errorf("%s TTL %s must exceed the S3 timeout %s, or a slow renewal will look like a lost claim",
+			label, ttl, c.S3Timeout)
 	}
 	return nil
 }
@@ -218,9 +325,15 @@ func (c *Config) Validate() error {
 func (c Config) Log() {
 	log.Printf("Config: listen=%s advertised=%s:%d metrics=%s wal=%s bucket=%s s3Timeout=%s flushInterval=%s",
 		c.ListenAddr, c.AdvertisedHost, c.AdvertisedPort, c.MetricsAddr, c.WALDir, c.S3Bucket, c.S3Timeout, c.FlushInterval)
-	log.Printf("Lease: enabled=%v key=%q holder=%s ttl=%s requireConditionalWrites=%v",
-		c.Lease.Enabled, orDefault(c.Lease.Key, "(default)"), orDefault(c.Lease.Holder, "hostname/pid"), c.Lease.TTL, c.RequireLease)
-	log.Printf("Agent: id=%s (namespaces the checkpoint object)", orDefault(c.AgentID, "hostname"))
+	if c.Ownership.Enabled {
+		log.Printf("Ownership: enabled agent=%s ttl=%s (per-partition claims; the bucket-global writer lease is not acquired)",
+			orDefault(c.Ownership.Agent, orDefault(c.AgentID, "hostname")), c.Ownership.TTL)
+	} else {
+		log.Printf("Lease: enabled=%v key=%q holder=%s ttl=%s requireConditionalWrites=%v",
+			c.Lease.Enabled, orDefault(c.Lease.Key, "(default)"), orDefault(c.Lease.Holder, "hostname/pid"), c.Lease.TTL, c.RequireLease)
+	}
+	log.Printf("Agent: id=%s nodeId=%d (namespaces the checkpoint object; the id clients see) advertised=%s:%d",
+		orDefault(c.AgentID, "hostname"), c.NodeID, c.AdvertisedHost, c.AdvertisedPort)
 }
 
 func orDefault(v, def string) string {

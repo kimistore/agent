@@ -122,3 +122,35 @@ func (s *StorageEngine) objDelete(ctx context.Context, key string) error {
 	defer cancel()
 	return s.objStore.Delete(c, key)
 }
+
+// objGetVersion reads one object's bytes and the version token its next
+// conditional write must name, under the engine's operation bound.
+//
+// It exists for the same reason objGet does: the lease, partition ownership and
+// the agent registry all renew claims by read-modify-write, and a store that
+// never answers must not be able to pin whatever goroutine is renewing -- which
+// for a renewal loop is the process's ability to shut down at all.
+func (s *StorageEngine) objGetVersion(ctx context.Context, key string) (data []byte, version string, found bool, err error) {
+	c, cancel := s.objCtx(ctx)
+	defer cancel()
+
+	cond, ok := s.objStore.(ConditionalObjectStore)
+	if !ok {
+		return nil, "", false, ErrUnsupported
+	}
+	return cond.GetVersion(c, key)
+}
+
+// objPutVersion conditionally writes one object under the engine's operation
+// bound. An empty version means "only if absent".
+func (s *StorageEngine) objPutVersion(ctx context.Context, key string, data []byte, version string) error {
+	c, cancel := s.objCtx(ctx)
+	defer cancel()
+
+	cond, ok := s.objStore.(ConditionalObjectStore)
+	if !ok {
+		return ErrUnsupported
+	}
+	_, err := cond.PutVersion(c, key, data, version)
+	return err
+}

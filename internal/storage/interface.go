@@ -40,6 +40,21 @@ var (
 	// not be renewed, so it no longer knows it is the only writer.
 	ErrLeaseLost = errors.New("object store lease lost")
 
+	// ErrPartitionHeld is returned when another live agent holds a partition's
+	// ownership claim. The partition is not writable by this agent; another one
+	// is already responsible for it.
+	ErrPartitionHeld = errors.New("partition ownership is held by another agent")
+
+	// ErrPartitionNotOwned is returned by the write path when the partition has
+	// no claim held by this agent, so appending would assign offsets that
+	// collide with whoever does own it.
+	ErrPartitionNotOwned = errors.New("this agent does not own the partition")
+
+	// ErrPartitionLost is returned by the write path when a claim this agent
+	// held could no longer be renewed, so another writer may already have taken
+	// the partition over.
+	ErrPartitionLost = errors.New("partition ownership lost")
+
 	// ErrUnsupported is returned by an object store that cannot make writes
 	// conditional on the current object version.
 	ErrUnsupported = errors.New("operation not supported by this object store")

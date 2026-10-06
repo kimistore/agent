@@ -140,6 +140,90 @@ var (
 		Help: "1 when this agent holds the object-store writer lease, 0 otherwise",
 	})
 
+	// Per-partition ownership. These replace the lease gauges once ownership is
+	// on: an operator asks how much of the log this agent is responsible for,
+	// and whether it can still prove it.
+	PartitionsOwned = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kimistore_partitions_owned",
+		Help: "Partitions this agent currently holds an ownership claim on",
+	})
+
+	OwnershipClaimFailures = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_ownership_claim_failures_total",
+		Help: "Failed attempts to acquire or renew a partition ownership claim",
+	})
+
+	OwnershipRenewalFailures = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_ownership_renewal_failures_total",
+		Help: "Failed attempts to renew a partition ownership claim",
+	})
+
+	PartitionWriteRefusals = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_ownership_refused_writes_total",
+		Help: "Produce requests refused because this agent does not own the partition",
+	})
+
+	WriterEpoch = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "kimistore_writer_epoch",
+		Help: "Ownership epoch this agent writes a partition under",
+	}, []string{"partition"})
+
+	// Routing. These answer the question phase 3 exists to make answerable:
+	// which agents does this one believe are alive, and who owns what.
+	AgentsLive = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kimistore_agents_live",
+		Help: "Agents in this agent's view of the cluster, including itself",
+	})
+
+	RoutingBrokers = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kimistore_routing_brokers",
+		Help: "Brokers this agent reports in Metadata",
+	})
+
+	RoutingAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kimistore_routing_age_seconds",
+		Help: "Age of the routing view Metadata is answered from; a rising value means the refresh is failing",
+	})
+
+	RoutingPublishConflicts = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_routing_publish_conflicts_total",
+		Help: "Liveness renewals refused because another process publishes the same agent id",
+	})
+
+	RoutingInconsistentTables = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_routing_inconsistent_tables_total",
+		Help: "Routing tables ignored because they disagreed with the agent's liveness record",
+	})
+
+	RoutingDuplicateNodeIDs = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_routing_duplicate_node_ids_total",
+		Help: "Brokers dropped from the routing view because another broker claimed the same node id",
+	})
+
+	RoutingInventoryFailures = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_routing_inventory_failures_total",
+		Help: "Refreshes where the cluster topic/partition inventory could not be listed",
+	})
+
+	// Coordinator fencing. CoordinatorRequestsRefused is the number to watch: it
+	// rising means clients are being sent to an agent that is not the
+	// coordinator, which is either a normal reshuffle or a cluster whose views
+	// disagree.
+	AgentNotLive = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kimistore_agent_live",
+		Help: "1 when this agent can prove it is alive and may coordinate groups, 0 after a failed renewal",
+	})
+
+	CoordinatorOwner = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_coordinator_groups_total",
+		Help: "Group requests accepted as coordinator",
+	})
+
+	CoordinatorRequestsRefused = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_coordinator_refused_total",
+		Help: "Group requests refused with NOT_COORDINATOR because another agent holds the group",
+	})
+
 	LeaseEpoch = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "kimistore_lease_epoch",
 		Help: "Fencing epoch of the writer lease this agent holds",
@@ -181,6 +265,37 @@ var (
 	DurableFlushes = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "kimistore_durable_flushes_total",
 		Help: "Active segments sealed to satisfy a pending acks=all durability wait",
+	})
+
+	// Handover. Phase 4's whole claim is that a failover does not have to cost a
+	// tail of in-flight writes, and that is only worth anything if it is measured:
+	// HandoverSeconds is how long a partition actually took to move, and
+	// HandoverKept counts the handovers that refused to release rather than hand
+	// over a partition whose tail was not safe.
+	HandoverCompleted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_handover_completed_total",
+		Help: "Partitions handed to another agent with their tail durable and a manifest written",
+	})
+
+	HandoverKept = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_handover_kept_total",
+		Help: "Handovers that kept their claim because the partition's tail was not safe to release",
+	})
+
+	HandoverSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "kimistore_handover_seconds",
+		Help:    "Wall time to hand a partition over, from seal to released claim",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+	})
+
+	// Recovery. ObjectsReconciled counts partitions whose recovered log end had to
+	// be corrected upwards from object storage, which is the signature of a crash
+	// that left a manifest behind the segments it describes. It should be rare; if
+	// it is not, the tail of the system is failing more often than the dashboards
+	// suggest.
+	ObjectsReconciled = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_objects_reconciled_total",
+		Help: "Partitions whose recovered log end was raised to match object storage after a crash",
 	})
 
 	// Idempotent producers. ProducerDuplicates is the number of retried

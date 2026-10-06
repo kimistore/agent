@@ -4,7 +4,7 @@
 
 This project is a Apache Kafka® - compatible data streaming agent. The goal is to separate compute from storage, allowing for stateless agents that can scale instantly while durable data resides cheaply and safely in object storage.
 
-Each agent owns one log in one bucket and holds a **writer lease** there, so scaling means giving an agent its own bucket rather than pointing several at the same one. See [Single-Writer Fence](#2b-single-writer-fence-writer-lease).
+Each agent claims each partition it writes and publishes where it can be reached, so several agents can share one bucket and clients are routed to the one that owns each partition. See [Single-Writer Fence](#2b-single-writer-fence) and [Routing](#2f-routing).
 
 ## 🧪 Tests
 
@@ -69,18 +69,42 @@ A built-in "Lite" Group Coordinator allows multiple consumers to work together t
 *   **Partition Awareness**: Correctly distributes partitions (e.g., 2 partitions -> 2 consumers) across the group.
 *   **Durable Commits**: `OffsetCommit` is acknowledged immediately and flushed to Object Store on a background loop. Failed flushes are retried rather than dropped, and a bounded retry runs during shutdown, so a transient object-store error cannot silently discard a commit.
 
-### 2b. Single-Writer Fence (Writer Lease)
-Two agents pointed at one bucket do not queue behind each other. They each assign offsets from their own recovered state and write segments to keys derived from those offsets, so they overwrite each other and the failure is **silent data loss** — no error, no crash, just a log that is missing records.
+### 2b. Single-Writer Fence
+Two agents writing one partition do not queue behind each other. They each assign offsets from their own recovered state and write segments to keys derived from those offsets, so they overwrite each other and the failure is **silent data loss** — no error, no crash, just a log that is missing records.
 
-The agent therefore claims the log before it serves anything:
+The agent therefore claims each partition before it writes to it:
 
-* **Claim**: A lease object (`_meta/lease.json`) inside the same bucket, acquired with a compare-and-swap (`If-None-Match: *` to create, `If-Match: <etag>` to renew). Object storage enforces both preconditions server-side, so two agents racing to start cannot both win.
-* **Epoch**: The lease carries a monotonically increasing epoch, which is also stamped into the checkpoint and the manifest. A restart that finds durable state from a **newer** epoch knows it has been superseded and refuses to start, even though the lease itself was free when it looked.
-* **Renewal**: A background loop renews every `TTL/3`. A renewal that fails is not immediately fatal — object stores have bad minutes — but once failures have aged past the TTL the agent stops writing, because at that point another agent may legitimately have taken the log.
-* **Handover**: A graceful shutdown releases the claim, so a replacement starts immediately instead of waiting out the TTL. A crashed one blocks its replacement for at most the TTL.
-* **Refusal**: Losing the lease turns into refused writes (`ErrLeaseLost`), not into a best-effort write over someone else's log.
+* **Claim**: An ownership object (`_owners/<topic>/<partition>`) inside the same bucket, acquired with a compare-and-swap (`If-None-Match: *` to create, `If-Match: <etag>` to renew). Object storage enforces both preconditions server-side, so two agents racing for a partition cannot both win.
+* **Epoch**: The claim carries a monotonically increasing epoch, per partition. It goes into the segment key (`<baseOffset>-e<epoch>.log`) and into the partition manifest.
+* **Segment keys**: the epoch is in the key because a superseded writer's upload can arrive *after* its successor has written at the same base offset — seal a segment, lose the claim while the upload is in flight, and the two collide. With the epoch in the key they land side by side instead, and the stale copy is unreachable, so retention reclaims it. A read at a given offset always resolves to the highest epoch there.
+* **Renewal**: A background loop renews every `TTL/3`. A renewal that fails is not immediately fatal — object stores have bad minutes — but once failures have aged past the TTL the agent stops writing to that partition, because at that point another agent may legitimately have taken it. Losing one partition does not affect the others.
+* **Handover**: A graceful shutdown releases every claim, so replacements start immediately instead of waiting out the TTL. A crashed agent blocks only its own partitions, for at most the TTL.
+* **Refusal**: An unowned partition turns into refused writes and a `NOT_LEADER_OR_FOLLOWER` error, which is what tells a producer to refresh its metadata and retry against the agent that owns it.
+* **Fail closed**: a claim this agent cannot renew is never re-acquired in the same process. The epoch would be newer, but the agent's in-memory log position is not, so writing would reissue offsets that are already taken. The partition stays fenced until a restart recovers it.
 
-Requires conditional-write support (all current S3-compatible stores). `KIMISTORE_REQUIRE_LEASE=false` downgrades a store without it to a loud warning; `KIMISTORE_WRITER_LEASE=false` disables the fence entirely.
+Requires conditional-write support (all current S3-compatible stores). `KIMISTORE_REQUIRE_LEASE=false` downgrades a store without it to a loud warning.
+
+Setting `KIMISTORE_PARTITION_OWNERSHIP=false` restores the previous behaviour exactly: one bucket-global claim at `_meta/lease.json`, taken with `KIMISTORE_WRITER_LEASE`, refusing a second agent outright. The two are alternatives — there is one fence at a time, because two overlapping claims would mean two epochs per write and only one of them would fence anything.
+
+### 2f. Routing
+Partition ownership makes it *safe* for several agents to share a bucket. Without routing they would be unreachable, so each agent also announces itself and what it owns:
+
+* **Liveness**: `_agents/<agent-id>/liveness` carries the agent's broker id and advertised address, renewed with a compare-and-swap. Two brokers claiming one identity is refused and logged rather than merged -- last-writer-wins would make clients flip between two addresses for one broker.
+* **Routing table**: `_agents/<agent-id>/routing` lists the partitions that agent owns with their ownership epochs. Written when the owned set changes, not on a timer, so a topic created a moment ago is advertised immediately rather than after a refresh interval.
+* **`Metadata`**: brokers are the live agents, and each partition's `Leader` is the node id of the agent that owns it. A partition whose owner is missing, or whose table has gone stale, is reported as `LEADER_NOT_AVAILABLE` with `Leader = -1` -- which is what makes a client refresh its metadata and retry, instead of giving up on the topic. `Metadata` v7 also carries `LeaderEpoch`, so a client can tell that the leader it cached has been replaced.
+* **Owner-scoped reads**: a `Fetch` or `ListOffsets` for a partition this agent does not own is refused rather than answered. This is not strictness for its own sake: an agent that does not own a partition does not know its log end offset, so any high watermark it reported would be a guess, and a guess makes a consumer either stop early or skip records.
+* **Long-poll only works on the owner**, because the wake-up latch fires on this process's own appends. A fetch on a partition this agent does not serve returns immediately rather than parking for an append that will never come.
+
+### 2g. Group Coordination
+Consumer groups are HA the same way partitions are: assigned by hashing, then fenced at the point of use.
+
+* **Selection**: `FindCoordinator` picks the agent by rendezvous hashing of the group id over the live set. Two agents with the same view compute the same answer, and when an agent leaves only the groups it coordinated move -- not every group in the cluster.
+* **The fence**: `JoinGroup`, `SyncGroup` and `Heartbeat` re-check that this agent is the group's coordinator and answer `NOT_COORDINATOR` if it is not. A client treats the `FindCoordinator` answer as a hint and re-resolves, which is what makes two coordinators for one group unreachable even while two agents' views briefly differ.
+* **No grace window**: an agent that cannot renew its liveness record stops coordinating *immediately*, unlike a partition owner which waits out the TTL. A partition owner that loses its claim is still fenced by the epoch in every segment name and manifest; a coordinator has no such token, so it may already have been replaced.
+* **Group state is in memory.** It is not written to the checkpoint any more, so a coordinator change is a full rebalance -- the cost D-4 accepts. **Consumer offsets are not affected**: they are durable in object storage, so a consumer rejoining after a coordinator change resumes where it left off rather than replaying the topic.
+* `LeaveGroup` is deliberately not fenced, so a member can always tell someone it is going away even if the agent it was talking to has changed.
+
+Each agent still needs a **distinct advertised address** -- clients are redirected to it, so a wrong `KIMISTORE_ADVERTISED_HOST` moves them off a working broker onto a broken one.
 
 ### 2c. Bounded Storage Calls
 Every object-store call is bounded by `KIMISTORE_S3_TIMEOUT_MS`, and the request context is threaded from the connection through the protocol handlers into the storage layer. A slow object store therefore produces a failed request the client can retry, instead of a handler goroutine that never returns. That matters more than it sounds: a hung read occupies one of the connection's in-flight slots, and once those fill, the client stops sending heartbeats and commits and the group rebalances around what is really a storage stall.
@@ -90,7 +114,7 @@ On shutdown, in-flight calls are cancelled once the final offset flush and check
 ### 2d. Durable Metadata Layout
 The log position and the checkpoint are not bucket-global singletons, so a second agent cannot overwrite them:
 
-* **Per-partition manifests**: `_topics/<topic>/_manifest/<partition>` holds one partition's log end offset, log start offset and segment inventory, stamped with the writer epoch. An agent rewrites only the partitions whose position moved -- one PUT per changed partition -- so a checkpoint no longer republishes the whole log, and recovery discovers the partitions with one bounded `LIST` under `_topics/`.
+* **Per-partition manifests**: `_topics/<topic>/_manifest/<partition>` holds one partition's log end offset, log start offset and segment inventory, stamped with the ownership epoch. An agent rewrites only the partitions whose position moved -- one PUT per changed partition -- so a checkpoint no longer republishes the whole log, and recovery discovers the partitions with one bounded `LIST` under `_topics/`. A partition the agent does not own is never written, so it cannot replace another agent's position with its own.
 * **Per-agent checkpoint**: `_agents/<agent-id>/checkpoint.json` carries committed offsets and coordinator state. Namespacing it by `KIMISTORE_AGENT_ID` (default: hostname) is what keeps a second agent sharing the bucket from replacing the first one's checkpoint. A bucket written by an older agent keeps its single `_meta/checkpoint.json` and `_meta/manifest.json`; they are read once on upgrade and re-persisted in the new shape.
 
 ### 2e. Durability of acks\=all (posture D2)
@@ -160,12 +184,15 @@ protocol bugs were found.
 | `KIMISTORE_RETENTION_BYTES` | `-1` (unlimited) | Max bytes per partition |
 | `KIMISTORE_RETENTION_CHECK_MS` | `300000` | Sweep interval |
 | `KIMISTORE_S3_TIMEOUT_MS` | `30000` | Deadline for a single object-store request |
-| `KIMISTORE_WRITER_LEASE` | `true` | Claim the log exclusively before serving |
-| `KIMISTORE_LEASE_KEY` | `_meta/lease.json` | Object the claim lives at |
-| `KIMISTORE_WRITER_ID` | hostname/pid | Identifies this writer in the claim |
-| `KIMISTORE_LEASE_TTL_MS` | `60000` | How long a claim survives without renewal |
+| `KIMISTORE_PARTITION_OWNERSHIP` | `true` | Claim each partition separately, so several agents can share a bucket |
+| `KIMISTORE_OWNERSHIP_TTL_MS` | `60000` | How long a partition claim survives without renewal |
+| `KIMISTORE_WRITER_LEASE` | `true` | Claim the whole bucket exclusively; only used when ownership is off |
+| `KIMISTORE_LEASE_KEY` | `_meta/lease.json` | Object the bucket-wide claim lives at |
+| `KIMISTORE_WRITER_ID` | hostname/pid | Identifies this writer in the bucket-wide claim |
+| `KIMISTORE_LEASE_TTL_MS` | `60000` | How long the bucket-wide claim survives without renewal |
 | `KIMISTORE_REQUIRE_LEASE` | `true` | Refuse to start if the store cannot fence writers |
-| `KIMISTORE_AGENT_ID` | hostname | Stable identity that namespaces this agent's checkpoint object |
+| `KIMISTORE_AGENT_ID` | hostname | Stable identity that namespaces this agent's checkpoint, liveness and routing records |
+| `KIMISTORE_NODE_ID` | derived from the agent id | Broker id clients see in Metadata. Stable across restarts and unique per agent; set it explicitly if a derived id could collide |
 | `KIMISTORE_FLUSH_INTERVAL_MS` | `1000` | How long an `acks=all` write may wait for its segment to reach object storage; the coalescing window for PUTs and the extra ack latency |
 
 The default configuration needs no flags to work with Grafana Mimir 3.0, and
@@ -187,7 +214,7 @@ In a container, set `KIMISTORE_ADVERTISED_HOST` to something clients can
 resolve. Leaving it unset makes the agent advertise its own hostname, which is
 usually right in Kubernetes and wrong everywhere else.
 
-**One agent per bucket.** The agent holds a writer lease in object storage and refuses to start when another live agent already holds it. Scale by giving each agent its own bucket, not by pointing several at one.
+**Several agents per bucket are supported, one writer per partition.** Each agent claims the partitions it writes, publishes what it owns, and `Metadata` routes clients to the agent holding each partition. Consumer groups are assigned by rendezvous hashing over the same live set, and fenced so only the elected agent acts on them. Every agent needs its own advertised address. See [High availability](#high-availability).
 
 ### Testing with kcat
 
@@ -209,17 +236,28 @@ kcat -b localhost:19092 -G my-group test-topic
 
 ## High availability
 
-The agent is currently **one writer per bucket**: it holds a writer lease in
-object storage and refuses to start when another live agent already holds it.
+Partitions are the unit of ownership *and* of routing: each agent claims the
+partitions it writes, publishes them, and `Metadata` sends clients to the agent
+holding each partition. A partition moves on crash or clean shutdown, and the
+routing view drops a dead or wedged agent within the TTL.
 
-The design for making a set of agents share one bucket is in
-[`docs/ha-architecture.md`](docs/ha-architecture.md). Its §13 is a handoff
-with the current status, key files and where to start. As of today:
+Consumer groups are HA in the same shape. A group is coordinated by the rendezvous
+winner over the live set, and every group request is fenced, so a coordinator
+change is a full rebalance rather than a split brain. Consumer offsets are durable,
+so a rebalance does not cost replay.
+
+**Handover is not implemented.** A partition still only moves by crashing or by a
+clean shutdown; a handover that flushes the unflushed tail before releasing is the
+one remaining item.
+
+The full design is in [`docs/ha-architecture.md`](docs/ha-architecture.md); its
+§13 is a handoff with the current status, key files and where to start. As of
+today:
 
 - **Shipped:** per-partition manifests and per-agent checkpoints (phase 0);
-  `acks=all` waits until its segment is in object storage (phase 1); idempotent
-  producers with duplicate-retry deduplication (phase 6).
-- **Not started:** per-partition ownership (phase 2), routing and leader-aware
-  `Metadata` (phase 3), graceful handover (phase 4), group coordination HA
-  (phase 5). Until phase 3, `Metadata` still reports a single broker with the
-  same leader for every partition.
+  `acks=all` waits until its segment is in object storage (phase 1);
+  per-partition ownership with per-partition epochs (phase 2); agent liveness,
+  routing tables and leader-aware `Metadata` (phase 3); HA group coordination by
+  rendezvous hashing with a point-of-use fence (phase 5); idempotent producers with
+  duplicate-retry deduplication (phase 6).
+- **Not started:** graceful handover (phase 4).

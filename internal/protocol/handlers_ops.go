@@ -48,9 +48,15 @@ func produceError(err error) int16 {
 		return ErrRequestTimedOut
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return ErrRequestTimedOut
+	case errors.Is(err, storage.ErrPartitionNotOwned), errors.Is(err, storage.ErrPartitionLost),
+		errors.Is(err, storage.ErrPartitionHeld):
+		// This agent does not own the partition, so the client is being sent to
+		// the wrong broker for it. NOT_LEADER_OR_FOLLOWER is exactly what tells
+		// the producer to refresh its metadata and retry against the owner.
+		return ErrNotLeaderForPartition
 	case errors.Is(err, storage.ErrLeaseLost), errors.Is(err, storage.ErrLeaseHeld):
-		// Another agent owns the log, so this broker is the wrong one to
-		// retry against until routing exists (phase 3).
+		// Another agent owns the whole bucket, so this broker is the wrong one
+		// to retry against until routing exists (phase 3).
 		return ErrNotLeaderForPartition
 	case errors.Is(err, storage.ErrUnknownProducer):
 		return ErrUnknownProducerID
@@ -364,6 +370,10 @@ func handleFetch(ctx context.Context, dec *Decoder, enc *Encoder, store *storage
 	// budget for an answer that could not have been different. When the client
 	// asked for data (minBytes > 0) and none is available, park briefly so an
 	// arriving append is served in this same round trip.
+	//
+	// Only partitions this agent owns are worth waiting on: the append latch
+	// fires on this process's writes, so parking for a partition owned by another
+	// agent waits out the full timeout on every poll and then returns nothing.
 	if req.minBytes > 0 && req.maxWaitMs > 0 && !anyDataAvailable(store, req) {
 		wait := req.maxWaitMs
 		if wait > maxFetchWaitMs {
@@ -392,6 +402,24 @@ func handleFetch(ctx context.Context, dec *Decoder, enc *Encoder, store *storage
 		enc.Int32(int32(len(ft.parts)))
 
 		for _, p := range ft.parts {
+			// A partition this agent does not own is refused rather than served.
+			//
+			// The alternative, reading it cold from object storage, was rejected
+			// deliberately: this agent does not know the partition's log end
+			// offset, so every high watermark it reported would be a guess, and a
+			// wrong one is worse than an explicit error. A consumer told "caught
+			// up" at a guessed offset skips records; a consumer told
+			// LEADER_NOT_AVAILABLE refreshes its metadata and retries against the
+			// agent that owns the partition, which is the behaviour that gets it
+			// the data.
+			if !store.Owns(ft.topic, p.partition) {
+				enc.Int32(p.partition)
+				enc.Int16(ErrLeaderNotAvailable)
+				enc.Int64(-1) // HighWatermark: unknown, so -1 rather than a guess
+				encodeFetchTail(enc, version, -1, -1, nil)
+				continue
+			}
+
 			hw := store.HighWaterMark(ft.topic, p.partition)
 			// This broker replicates nothing, so the last stable offset is the
 			// log end. log_start_offset is the retention-aware earliest offset,
@@ -492,9 +520,17 @@ func encodeFetchTail(enc *Encoder, version int16, lastStable, logStart int64, re
 // anyDataAvailable reports whether at least one requested partition has
 // unread data. An offset at or beyond the high watermark has nothing to
 // return: equal means caught up, beyond means out of range.
+//
+// A partition this agent does not own never counts as available, even though
+// its high watermark may be non-zero. It is refused in the response, so waiting
+// for it would burn the whole long-poll timeout on every request and then tell
+// the client nothing it can use.
 func anyDataAvailable(store *storage.StorageEngine, req *fetchRequest) bool {
 	for _, ft := range req.partsByTopic {
 		for _, p := range ft.parts {
+			if !store.Owns(ft.topic, p.partition) {
+				continue
+			}
 			if p.offset < store.HighWaterMark(ft.topic, p.partition) {
 				return true
 			}
