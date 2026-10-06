@@ -22,6 +22,13 @@ func main() {
 	series := flag.Int("series", 5, "number of series")
 	points := flag.Int("points", 20, "samples per series")
 	now := flag.Int64("now", 0, "override timestamp (unix ms)")
+	// The integrity test pushes in batches, and needs to know exactly which
+	// series and samples to expect on the way back out. Values are a pure
+	// function of (series, point) so the expectation is computed rather than
+	// captured, which means a wrong value cannot agree with itself.
+	seriesStart := flag.Int("series-start", 0, "first series index")
+	batch := flag.Int("batch", 0, "series per request (0 = all in one request)")
+	interval := flag.Int64("interval-ms", 60_000, "milliseconds between points")
 	flag.Parse()
 
 	nowMs := *now
@@ -29,8 +36,37 @@ func main() {
 		nowMs = time.Now().UnixMilli()
 	}
 
+	perRequest := *series
+	if *batch > 0 && *batch < perRequest {
+		perRequest = *batch
+	}
+
+	totalSeries := *seriesStart + *series
+	totalBytes := 0
+	requests := 0
+	for first := *seriesStart; first < totalSeries; first += perRequest {
+		count := perRequest
+		if first+count > totalSeries {
+			count = totalSeries - first
+		}
+		n, err := pushBatch(first, count, *points, nowMs, *interval, *endpoint, *tenant)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		totalBytes += n
+		requests++
+	}
+
+	fmt.Printf("push: %d request(s), %d series x %d points, %d bytes\n",
+		requests, *series, *points, totalBytes)
+}
+
+// pushBatch sends one remote-write request covering series [first, first+count).
+func pushBatch(first, count, points int, nowMs, interval int64, endpoint, tenant string) (int, error) {
 	req := &prompb.WriteRequest{}
-	for s := 0; s < *series; s++ {
+	for i := 0; i < count; i++ {
+		s := first + i
 		ts := &prompb.TimeSeries{
 			Labels: []prompb.Label{
 				{Name: "__name__", Value: fmt.Sprintf("kimi_test_metric_%d", s)},
@@ -38,10 +74,10 @@ func main() {
 				{Name: "job", Value: "kimi-e2e"},
 			},
 		}
-		for p := 0; p < *points; p++ {
+		for p := 0; p < points; p++ {
 			ts.Samples = append(ts.Samples, prompb.Sample{
 				Value:     float64(s*100 + p),
-				Timestamp: nowMs - int64((*points-p-1)*60_000),
+				Timestamp: nowMs - int64(points-p-1)*interval,
 			})
 		}
 		req.Timeseries = append(req.Timeseries, *ts)
@@ -49,8 +85,7 @@ func main() {
 
 	raw, err := req.Marshal()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return 0, err
 	}
 
 	// The explicit proto parameter matters: Mimir 3.x sniffs the content type
@@ -59,26 +94,22 @@ func main() {
 	contentType := "application/x-protobuf; proto=prometheus.WriteRequest"
 
 	body := snappy.Encode(nil, raw)
-	hr, err := http.NewRequest("POST", *endpoint, bytes.NewReader(body))
+	hr, err := http.NewRequest("POST", endpoint, bytes.NewReader(body))
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return 0, err
 	}
 	hr.Header.Set("Content-Type", contentType)
 	hr.Header.Set("Content-Encoding", "snappy")
-	hr.Header.Set("X-Scope-OrgID", *tenant)
+	hr.Header.Set("X-Scope-OrgID", tenant)
 
 	resp, err := http.DefaultClient.Do(hr)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "push failed:", err)
-		os.Exit(1)
+		return 0, fmt.Errorf("push failed: %w", err)
 	}
 	defer resp.Body.Close()
 	out, _ := io.ReadAll(resp.Body)
-	fmt.Printf("push: HTTP %d (%d series x %d points, %d bytes) ct=%s\n",
-		resp.StatusCode, *series, *points, len(raw), contentType)
 	if resp.StatusCode/100 != 2 {
-		fmt.Println("  ", string(out))
-		os.Exit(1)
+		return 0, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(out))
 	}
+	return len(raw), nil
 }
