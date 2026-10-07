@@ -298,6 +298,37 @@ func (m *Manager) DeleteTopic(topic string) error {
 // FlushPartition seals a partition's active segment so the uploader can store
 // it. It is a no-op when the partition has nothing buffered or does not exist
 // yet, so the durability loop can call it freely.
+// SealedBelow reports whether the partition still holds a sealed segment whose
+// base offset is strictly below base.
+//
+// A sealed segment is removed from local disk only after its upload succeeds
+// (handleUpload deletes it as its last step, and returns early on a failed
+// PUT), so "no sealed segment below base" means every segment below base has
+// already reached object storage. That makes this a sound test for whether the
+// durability frontier may skip forward to base without claiming a record that
+// is only on local disk.
+//
+// It answers conservatively: if the partition directory cannot be read, it
+// reports a gap so the caller leaves the frontier alone.
+func (m *Manager) SealedBelow(topic string, partition int32, base int64) bool {
+	dir := filepath.Join(m.baseDir, topic, fmt.Sprintf("%d", partition))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return true
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		// active.log does not parse as a segment name, so the in-progress
+		// segment is skipped without a special case here.
+		if b, _, ok := ParseSegmentName(e.Name()); ok && b < base {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) FlushPartition(topic string, partition int32) {
 	p, err := m.getPartitionWAL(topic, partition)
 	if err != nil {

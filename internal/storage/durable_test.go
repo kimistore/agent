@@ -22,9 +22,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"kimistore/internal/storage/wal"
 )
 
 // failingUploadStore lets object writes for log segments fail while the
@@ -155,5 +159,93 @@ func TestDurable_WaitReturnsImmediatelyBelowFrontier(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("WaitDurable parked even though the offset was already durable")
+	}
+}
+
+// TestDurable_FrontierRecoversFromStaleSeed covers the restart wedge.
+//
+// The frontier is seeded once per partition from the log end offset. When a
+// restart leaves that seed behind the partition's real durable position, every
+// segment that later lands has a base past the frontier. Those go to pending,
+// and pending is only drained by a segment whose base is already at or below
+// the frontier -- one that will never come. The partition then wedges and every
+// acks=all producer on it times out forever, even though its records are
+// already in object storage.
+//
+// This is what a live mirror looked like: "offset 130 not in object storage
+// after 10s (durable offset 42)" while segments 128-130 sat in the bucket.
+func TestDurable_FrontierRecoversFromStaleSeed(t *testing.T) {
+	store := NewMockStore()
+	tmp := t.TempDir()
+	se, err := NewStorageEngine(tmp, store, "bucket", RetentionConfig{},
+		WithAgentID("durable"), WithFlushInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	defer se.Close()
+
+	// The partition directory exists but holds no sealed segment: a restart
+	// after every earlier segment was uploaded and trimmed from local disk.
+	dir := filepath.Join(tmp, "orders", "0")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// A restart seeded the frontier from a log end offset that under-reported
+	// where the partition actually was.
+	se.ensureDurable("orders", 0, 42)
+	if got := se.DurableOffset("orders", 0); got != 42 {
+		t.Fatalf("seeded frontier = %d, want 42", got)
+	}
+
+	// No sealed segment sits below 128, so everything below it is already in
+	// object storage and the frontier must skip forward rather than wedge.
+	se.markSegmentDurable("orders", 0, 128, 130)
+
+	if got := se.DurableOffset("orders", 0); got != 130 {
+		t.Errorf("durable offset = %d, want 130 (frontier wedged behind a stale seed)", got)
+	}
+	if err := se.WaitDurable(context.Background(), "orders", 0, 130, time.Second); err != nil {
+		t.Errorf("WaitDurable after repair: %v", err)
+	}
+}
+
+// TestDurable_FrontierHoldsForRealGap is the guard on the repair: the frontier
+// may only skip ahead when nothing is actually waiting below it. A sealed
+// segment still on local disk has not been uploaded, so the frontier must stop
+// short of it rather than acknowledge an offset that is not recoverable.
+func TestDurable_FrontierHoldsForRealGap(t *testing.T) {
+	store := NewMockStore()
+	tmp := t.TempDir()
+	se, err := NewStorageEngine(tmp, store, "bucket", RetentionConfig{},
+		WithAgentID("durable"), WithFlushInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	defer se.Close()
+
+	// A sealed segment at base 43 is still on local disk, so offsets from 43
+	// are not in object storage yet.
+	dir := filepath.Join(tmp, "orders", "0")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	pending := filepath.Join(dir, wal.SegmentName(42, 1))
+	if err := os.WriteFile(pending, []byte("not uploaded"), 0o644); err != nil {
+		t.Fatalf("write pending segment: %v", err)
+	}
+
+	se.ensureDurable("orders", 0, 42)
+	se.markSegmentDurable("orders", 0, 128, 130)
+
+	if got := se.DurableOffset("orders", 0); got >= 128 {
+		t.Errorf("durable offset = %d, want it held below 128 while a segment is unuploaded", got)
+	}
+	// Filling that gap advances the frontier by exactly that segment. It must
+	// still not jump to 130: offsets 43..128 are covered by no segment that has
+	// landed, so acknowledging them would invent durability.
+	se.markSegmentDurable("orders", 0, 42, 43)
+	if got := se.DurableOffset("orders", 0); got != 43 {
+		t.Errorf("durable offset = %d, want 43 (only the gap segment is covered)", got)
 	}
 }

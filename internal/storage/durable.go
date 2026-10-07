@@ -111,7 +111,43 @@ func (s *StorageEngine) markSegmentDurable(topic string, partition int32, base, 
 		st = &durableState{frontier: base}
 		s.durable[key] = st
 	}
+	// A segment landing past the frontier means the frontier is behind. That is
+	// the case worth repairing, so note it and drop the lock: the check below
+	// touches the filesystem and must not be held across an append's wait.
+	staleFrontier := base > st.frontier && len(st.pending) == 0
+	s.durableMu.Unlock()
 
+	// Repair a frontier that fell behind without a real gap under it.
+	//
+	// The switch below stashes a segment whose base is past the frontier into
+	// pending, and pending is only ever drained by a segment whose base is
+	// already at or below the frontier. If the frontier is behind because a
+	// *seed* was behind, no such segment will ever arrive: every later segment
+	// also lands past the frontier, also goes to pending, and the partition
+	// wedges permanently. Every acks=all producer on it then times out forever
+	// even though its records are sitting in object storage.
+	//
+	// The frontier is seeded once per partition from the log end offset, so a
+	// restart whose discovery under-reported it reproduces this exactly.
+	//
+	// Because the uploader is serial and seals are contiguous, a lower segment
+	// cannot be in flight behind this one, so the only thing that could fill the
+	// gap is a sealed segment still on local disk. If there is none, everything
+	// below base is already durable and the frontier may skip forward.
+	//
+	// Without a WAL to inspect there is nothing to prove absence with, so the
+	// frontier is left alone.
+	if staleFrontier && s.walMgr != nil && !s.walMgr.SealedBelow(topic, partition, base) {
+		s.durableMu.Lock()
+		// Re-check under the lock: a concurrent mark may have advanced the
+		// frontier or filled pending while the check was in flight.
+		if base > st.frontier && len(st.pending) == 0 {
+			st.frontier = base
+		}
+		s.durableMu.Unlock()
+	}
+
+	s.durableMu.Lock()
 	advanced := false
 	switch {
 	case base <= st.frontier && end > st.frontier:
