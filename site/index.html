@@ -107,7 +107,7 @@
         <div class="stack-card">
           <div class="stack-card__row"><span class="stack-card__key">Compute</span><span class="stack-card__val">stateless agent</span></div>
           <div class="stack-card__row"><span class="stack-card__key">Hot tier</span><span class="stack-card__val">local WAL, 64 MB segments</span></div>
-          <div class="stack-card__row"><span class="stack-card__key">Cold tier</span><span class="stack-card__val">S3 / MinIO / any S3 API</span></div>
+          <div class="stack-card__row"><span class="stack-card__key">Cold tier</span><span class="stack-card__val">S3 / RustFS / any S3 API</span></div>
           <div class="stack-card__row"><span class="stack-card__key">Coordination</span><span class="stack-card__val">built-in lite coordinator</span></div>
         </div>
       </div>
@@ -295,7 +295,7 @@
           <g>
             <rect x="742" y="118" width="214" height="234" rx="18" class="d-box d-box--s3"/>
             <text x="849" y="150" class="d-title d-title--s3">OBJECT STORAGE</text>
-            <text x="849" y="170" class="d-sub2">AWS S3 · MinIO · R2 · any S3 API</text>
+            <text x="849" y="170" class="d-sub2">AWS S3 · RustFS · R2 · any S3 API</text>
             <rect x="764" y="188" width="170" height="38" rx="9" class="d-chip"/>
             <text x="849" y="212" class="d-label">sealed segments</text>
             <rect x="764" y="234" width="170" height="38" rx="9" class="d-chip"/>
@@ -755,7 +755,7 @@ p.<span class="c-fn">put</span>(<span class="c-str">"value.deserializer"</span>,
         </article>
         <article class="mini reveal">
           <h3>Edge &amp; intermittent</h3>
-          <p>A laptop, a Pi, a spot instance, or a local MinIO. The agent holds nothing durable, so it can be torn down and recreated freely.</p>
+          <p>A laptop, a Pi, a spot instance, or a local RustFS. The agent holds nothing durable, so it can be torn down and recreated freely.</p>
         </article>
         <article class="mini reveal">
           <h3>Cost-sensitive retention</h3>
@@ -860,7 +860,7 @@ p.<span class="c-fn">put</span>(<span class="c-str">"value.deserializer"</span>,
           <p>For the covered API surface, yes. Kafka clients negotiate capabilities through <code>ApiVersions</code>, and Kimistore advertises exactly what it implements. If your application depends on transactions, idempotence, or ACLs, it will get a clear error rather than silent corruption — but it will get an error.</p>
         </details>
         <details>
-          <summary>Can I use MinIO or another S3-compatible store?</summary>
+          <summary>Can I use RustFS or another S3-compatible store?</summary>
           <p>Yes. Set <code>S3_ENDPOINT</code> (or <code>AWS_ENDPOINT_URL</code>) and the client switches to path-style addressing, which is what most self-hosted S3 API implementations expect. This is what makes local development and air-gapped environments practical.</p>
         </details>
         <details>
