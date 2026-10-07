@@ -65,12 +65,14 @@ jobs:
         run: make cover
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        # Action v7, not v6: v6 refuses to install golangci-lint v2 at all
+        # ("golangci-lint v2 is not supported by golangci-lint-action v6").
+        # Under v6, "latest" silently resolved to a v1 binary, which cannot
+        # read this repo's schema v2 config and is built with a Go older than
+        # the go directive in go.mod, so it failed to load the config at all.
+        # Pinned rather than "latest" so the lint result is reproducible.
+        uses: golangci/golangci-lint-action@v7
         with:
-          # Pinned, not "latest". "latest" resolved to a v1 binary, which
-          # cannot read this repo's schema v2 config and is built with a Go
-          # older than the go directive in go.mod, so it failed to load the
-          # config at all. Pinning also keeps the lint result reproducible.
           version: v2.13.2
           args: --timeout=5m
 
