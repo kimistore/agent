@@ -201,24 +201,27 @@ func DefaultServerConfig() ServerConfig {
 // Heartbeat and LeaveGroup stop at v0 because the target client decodes those
 // two with ErrorCode before ThrottleTimeMs, the reverse of the schema.
 var supportedAPIVersions = map[int16]int16{
-	ApiKeyProduce:          3,
-	ApiKeyFetch:            5,
-	ApiKeyListOffsets:      2,
-	ApiKeyMetadata:         7,
-	ApiKeyApiVersions:      0,
-	ApiKeyOffsetCommit:     0,
-	ApiKeyOffsetFetch:      1,
-	ApiKeyFindCoordinator:  0,
-	ApiKeyJoinGroup:        1,
-	ApiKeySyncGroup:        0,
-	ApiKeyHeartbeat:        0,
-	ApiKeyLeaveGroup:       0,
-	ApiKeyCreateTopics:     0,
-	ApiKeyDeleteTopics:     0,
-	ApiKeyListGroups:       0,
-	ApiKeyDescribeGroups:   0,
-	ApiKeySaslHandshake:    1,
-	ApiKeySaslAuthenticate: 0,
+	ApiKeyProduce:         3,
+	ApiKeyFetch:           5,
+	ApiKeyListOffsets:     2,
+	ApiKeyMetadata:        7,
+	ApiKeyApiVersions:     0,
+	ApiKeyOffsetCommit:    0,
+	ApiKeyOffsetFetch:     1,
+	ApiKeyFindCoordinator: 0,
+	ApiKeyJoinGroup:       1,
+	ApiKeySyncGroup:       0,
+	ApiKeyHeartbeat:       0,
+	ApiKeyLeaveGroup:      0,
+	ApiKeyCreateTopics:    0,
+	ApiKeyDeleteTopics:    0,
+	ApiKeyListGroups:      0,
+	ApiKeyDescribeGroups:  0,
+	ApiKeySaslHandshake:   1,
+	// v1 appends session_lifetime_ms to the response. It is advertised and
+	// answered because clients that can use it will otherwise fall back to v0
+	// and lose the ability to tell a non-expiring session from an expiry.
+	ApiKeySaslAuthenticate: 1,
 	ApiKeyInitProducerID:   1,
 }
 
@@ -1165,13 +1168,7 @@ func handleSaslAuthenticate(dec *Decoder, enc *Encoder, version int16, session *
 		password = string(parts[2])
 	} else {
 		log.Printf("SaslAuthenticate: Invalid PLAIN payload format. Parts=%d", len(parts))
-		enc.Int16(ErrSaslAuthenticationFailed)
-		enc.String("Invalid SASL PLAIN payload")
-		// SaslAuth Response V0:
-		// ErrorCode (int16)
-		// ErrorMessage (string)
-		// AuthBytes (bytes)
-		enc.PutBytes(nil)
+		writeSaslAuthenticateResponse(enc, version, ErrSaslAuthenticationFailed, "Invalid SASL PLAIN payload", nil)
 		return enc.Bytes(), nil
 	}
 
@@ -1179,19 +1176,41 @@ func handleSaslAuthenticate(dec *Decoder, enc *Encoder, version int16, session *
 		subtle.ConstantTimeCompare([]byte(password), []byte(cfg.Auth.Password)) == 1 {
 		session.Authenticated = true
 		session.User = username
-		enc.Int16(ErrNone)
-		enc.String("")    // No error message
-		enc.PutBytes(nil) // No auth bytes
+		writeSaslAuthenticateResponse(enc, version, ErrNone, "", nil)
 	} else {
 		// Do not log the attempted username on a failed handshake: this is
 		// attacker-controlled input on an unauthenticated path.
 		log.Printf("SaslAuthenticate: authentication failed")
-		enc.Int16(ErrSaslAuthenticationFailed)
-		enc.String("Authentication failed")
-		enc.PutBytes(nil)
+		writeSaslAuthenticateResponse(enc, version, ErrSaslAuthenticationFailed, "Authentication failed", nil)
 	}
 
 	return enc.Bytes(), nil
+}
+
+// writeSaslAuthenticateResponse emits SaslAuthenticate Response in the shape
+// the requested version requires.
+//
+// V0 is error_code, error_message, auth_bytes. V1 appends session_lifetime_ms,
+// and a client that asked for v1 will read the response with that field
+// present; leaving it off truncates the message and the client sees a short
+// read rather than a clean answer. Every exit path goes through here so the two
+// versions cannot drift apart, which is the failure mode of writing the shape
+// inline at each return.
+//
+// session_lifetime_ms is always 0, meaning the authenticated session does not
+// expire. Clients treat a positive value as "reauthenticate before continuing",
+// and the broker does not implement mid-connection reauthentication -- a
+// connection stays authenticated until it closes -- so advertising a lifetime
+// would commit the broker to a mechanism it does not have.
+func writeSaslAuthenticateResponse(enc *Encoder, version int16, errCode int16, errMsg string, authBytes []byte) {
+	enc.Int16(errCode)
+	// ErrorMessage is non-nullable in v0 and nullable in v1. An empty string
+	// satisfies both, so no separate nullable encoding is needed here.
+	enc.String(errMsg)
+	enc.PutBytes(authBytes)
+	if version >= 1 {
+		enc.Int64(0) // session_lifetime_ms: no expiry
+	}
 }
 
 // Required reports whether SASL authentication is configured.
