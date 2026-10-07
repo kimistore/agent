@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"kimistore/internal/auth"
 	"kimistore/internal/coordinator"
 	"kimistore/internal/metrics"
 	"kimistore/internal/storage"
@@ -87,7 +88,26 @@ const (
 type Session struct {
 	Authenticated bool
 	User          string
+
+	// saslMechanism is the mechanism the client chose in SaslHandshake.
+	//
+	// SaslAuthenticate carries no mechanism field, so the server has to carry
+	// it from the handshake. Guessing PLAIN, as this did before, would work only
+	// because there was only one mechanism to guess; with SCRAM the client's
+	// final message would be parsed as the wrong mechanism's and every
+	// authentication would fail.
+	saslMechanism string
+	// scram is the in-flight SCRAM conversation, nil until a SCRAM
+	// client-first message arrives. It is per-connection because SCRAM spans
+	// several SaslAuthenticate requests.
+	scram *auth.Exchange
 }
+
+// SASLMechanism returns the mechanism negotiated by SaslHandshake.
+func (s *Session) SASLMechanism() string { return s.saslMechanism }
+
+// SCRAM returns the in-flight SCRAM exchange, or nil if none has started.
+func (s *Session) SCRAM() *auth.Exchange { return s.scram }
 
 // ServerConfig is the per-broker configuration the protocol layer needs.
 // The advertised address in particular has to be configurable: it is what
@@ -117,9 +137,50 @@ type ServerConfig struct {
 	AutoCreatePartitions int32
 }
 
+// AuthConfig is the authentication configuration.
+//
+// The two halves are deliberately separate. Username/Password is the original
+// single shared credential behind SASL_USERNAME and SASL_PASSWORD, and it is
+// kept exactly as it was so an existing deployment changes nothing by upgrading.
+// Credentials is the per-user SCRAM store; when it is nil, SCRAM is simply not
+// offered.
 type AuthConfig struct {
 	Username string
 	Password string
+
+	// Credentials is the SCRAM credential store, or nil when no SCRAM
+	// credentials have been created. A nil store is what keeps SCRAM out of the
+	// advertised mechanism list rather than advertising it and failing every
+	// exchange.
+	Credentials *auth.Store
+}
+
+// Mechanisms returns the SASL mechanisms this broker will serve, in the order
+// they should be advertised.
+//
+// SCRAM is listed before PLAIN when both are available, and PLAIN only if it
+// actually has a credential. Advertising a mechanism the broker cannot complete
+// is worse than not advertising it: a client that selects it fails after a
+// round trip instead of negotiating something else.
+func (a AuthConfig) Mechanisms() []string {
+	var out []string
+	if a.Credentials != nil {
+		out = append(out, auth.MechanismSCRAMSHA256, auth.MechanismSCRAMSHA512)
+	}
+	if a.Username != "" {
+		out = append(out, auth.MechanismPlain)
+	}
+	return out
+}
+
+// Supports reports whether a mechanism is enabled.
+func (a AuthConfig) Supports(mechanism string) bool {
+	for _, m := range a.Mechanisms() {
+		if m == mechanism {
+			return true
+		}
+	}
+	return false
 }
 
 // AdvertisedVersions renders the version table for the startup log, one line
@@ -347,7 +408,11 @@ func HandleRequest(ctx context.Context, data []byte, store *storage.StorageEngin
 	// Check Authentication
 	// If auth is configured, we only allow ApiVersions, SaslHandshake, SaslAuthenticate
 	// OR if session is authenticated.
-	authRequired := cfg.Auth.Username != ""
+	// Required(), not a bare Username check: a broker configured only with SCRAM
+	// credentials has no SASL_USERNAME, and testing the username field alone
+	// would leave every request ungated. An unauthenticated client could then
+	// produce and consume on a broker whose credentials exist.
+	authRequired := cfg.Auth.Required()
 	isAuthRelated := apiKey == ApiKeySaslHandshake || apiKey == ApiKeySaslAuthenticate || apiKey == ApiKeyApiVersions
 
 	if authRequired && !session.Authenticated && !isAuthRelated {
@@ -409,9 +474,9 @@ func HandleRequest(ctx context.Context, data []byte, store *storage.StorageEngin
 
 	switch apiKey {
 	case ApiKeySaslHandshake:
-		resp, errProc = handleSaslHandshake(dec, enc, apiVersion)
+		resp, errProc = handleSaslHandshake(dec, enc, apiVersion, session, cfg)
 	case ApiKeySaslAuthenticate:
-		resp, errProc = handleSaslAuthenticate(dec, enc, apiVersion, session, cfg)
+		resp, errProc = handleSaslAuthenticate(ctx, dec, enc, apiVersion, session, cfg)
 	case ApiKeyProduce:
 		resp, errProc = handleProduce(ctx, dec, enc, store, apiVersion, cfg)
 	case ApiKeyFetch:
@@ -1109,7 +1174,7 @@ func handleMetadata(ctx context.Context, dec *Decoder, enc *Encoder, store *stor
 	return enc.Bytes(), nil
 }
 
-func handleSaslHandshake(dec *Decoder, enc *Encoder, version int16) ([]byte, error) {
+func handleSaslHandshake(dec *Decoder, enc *Encoder, version int16, session *Session, cfg ServerConfig) ([]byte, error) {
 	// SaslHandshake Request V0:
 	// Mechanism (string)
 
@@ -1120,23 +1185,52 @@ func handleSaslHandshake(dec *Decoder, enc *Encoder, version int16) ([]byte, err
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("SaslHandshake: Mechanism=%s Version=%d", mech, version)
 
-	// We only support PLAIN
-	if mech == "PLAIN" {
-		enc.Int16(ErrNone)
-		enc.Int32(1)        // Enabled Mechanisms Array Length
-		enc.String("PLAIN") // Mechanism
-	} else {
+	// Every enabled mechanism is listed, not just the one asked for. A client
+	// reads this array to decide whether to continue with its preferred
+	// mechanism or fall back, so returning only the requested one would hide
+	// the alternatives and force a reconnect to discover them.
+	enabled := cfg.Auth.Mechanisms()
+	log.Printf("SaslHandshake: Mechanism=%s Version=%d Enabled=%v", mech, version, enabled)
+
+	if !cfg.Auth.Supports(mech) {
+		// Refuse the mechanism but still report what is on offer, so the client
+		// can see why and retry with something that works.
 		enc.Int16(ErrUnsupportedSaslMechanism)
-		enc.Int32(1)
-		enc.String("PLAIN")
+		enc.Int32(int32(len(enabled)))
+		for _, m := range enabled {
+			enc.String(m)
+		}
+		return enc.Bytes(), nil
+	}
+
+	// Remember the choice. SaslAuthenticate does not carry the mechanism, so
+	// this is the only place the server learns which flow the following
+	// requests belong to.
+	session.saslMechanism = mech
+	if mech != auth.MechanismPlain {
+		ex, err := auth.StartExchange(mech)
+		if err != nil {
+			enc.Int16(ErrUnsupportedSaslMechanism)
+			enc.Int32(int32(len(enabled)))
+			for _, m := range enabled {
+				enc.String(m)
+			}
+			return enc.Bytes(), nil
+		}
+		session.scram = ex
+	}
+
+	enc.Int16(ErrNone)
+	enc.Int32(int32(len(enabled)))
+	for _, m := range enabled {
+		enc.String(m)
 	}
 
 	return enc.Bytes(), nil
 }
 
-func handleSaslAuthenticate(dec *Decoder, enc *Encoder, version int16, session *Session, cfg ServerConfig) ([]byte, error) {
+func handleSaslAuthenticate(ctx context.Context, dec *Decoder, enc *Encoder, version int16, session *Session, cfg ServerConfig) ([]byte, error) {
 	// SaslAuthenticate Request V0:
 	// AuthBytes (bytes)
 
@@ -1145,6 +1239,21 @@ func handleSaslAuthenticate(dec *Decoder, enc *Encoder, version int16, session *
 		return nil, err
 	}
 
+	// Dispatch on the mechanism chosen in SaslHandshake. Falling through to
+	// PLAIN here would be a silent downgrade: a client that negotiated SCRAM
+	// would have its final message parsed as a PLAIN payload, and would be told
+	// its authentication failed rather than that the broker got it wrong.
+	switch session.saslMechanism {
+	case "", auth.MechanismPlain:
+		return handleSaslPlain(enc, version, session, cfg, authBytes)
+	default:
+		return handleSaslSCRAM(ctx, enc, version, session, cfg, authBytes)
+	}
+}
+
+// handleSaslPlain serves the single shared SASL_USERNAME/SASL_PASSWORD
+// credential.
+func handleSaslPlain(enc *Encoder, version int16, session *Session, cfg ServerConfig, authBytes []byte) ([]byte, error) {
 	// SASL PLAIN format: [AuthorizationID] NULL [AuthenticationID] NULL [Password]
 	// We typically ignore AuthorizationID.
 	// We expect: \x00 username \x00 password
@@ -1187,6 +1296,64 @@ func handleSaslAuthenticate(dec *Decoder, enc *Encoder, version int16, session *
 	return enc.Bytes(), nil
 }
 
+// handleSaslSCRAM drives one step of a SCRAM exchange.
+//
+// SCRAM spans three SaslAuthenticate requests, so which step this is has to be
+// derived from the exchange's own state rather than assumed: the first message
+// is a client-first and yields a challenge, the second is a client-final and
+// yields the server signature. Getting that wrong in either direction is
+// invisible locally and fatal to every client.
+//
+// Errors here are deliberately coarse on the wire. A missing user, a wrong
+// password and a malformed final message all answer as ErrSaslAuthenticationFailed,
+// because distinguishing them would let an unauthenticated peer enumerate
+// accounts. The detail goes to the log, which is authenticated-server-side and
+// where the operator can act on it.
+func handleSaslSCRAM(ctx context.Context, enc *Encoder, version int16, session *Session, cfg ServerConfig, authBytes []byte) ([]byte, error) {
+	ex := session.scram
+	if ex == nil {
+		// The handshake should have created this. Reaching here means a client
+		// sent SaslAuthenticate without a preceding SaslHandshake, so there is
+		// no mechanism to interpret the message under.
+		writeSaslAuthenticateResponse(enc, version, ErrSaslAuthenticationFailed, "SCRAM exchange not started", nil)
+		return enc.Bytes(), nil
+	}
+	if cfg.Auth.Credentials == nil {
+		// The credential store went away between handshake and authenticate,
+		// which means the advertised mechanism is no longer honourable.
+		writeSaslAuthenticateResponse(enc, version, ErrSaslAuthenticationFailed, "SCRAM is not configured", nil)
+		return enc.Bytes(), nil
+	}
+
+	if !ex.Challenged() {
+		// Not yet challenged: this message must be the client-first.
+		challenge, err := ex.First(ctx, authBytes, cfg.Auth.Credentials)
+		if err != nil {
+			log.Printf("SaslAuthenticate: SCRAM client-first rejected: %v", err)
+			writeSaslAuthenticateResponse(enc, version, ErrSaslAuthenticationFailed, "authentication failed", nil)
+			return enc.Bytes(), nil
+		}
+		// A challenge is carried in auth_bytes with a success code: that is what
+		// tells the client the exchange is continuing rather than finished.
+		writeSaslAuthenticateResponse(enc, version, ErrNone, "", challenge)
+		return enc.Bytes(), nil
+	}
+
+	// Already challenged: this message must be the client-final. A failure here
+	// is terminal, so do not answer with a challenge the client cannot use.
+	serverFinal, err := ex.Final(authBytes)
+	if err != nil {
+		log.Printf("SaslAuthenticate: SCRAM client-final rejected: %v", err)
+		writeSaslAuthenticateResponse(enc, version, ErrSaslAuthenticationFailed, "authentication failed", nil)
+		return enc.Bytes(), nil
+	}
+
+	session.Authenticated = true
+	session.User = ex.Username()
+	writeSaslAuthenticateResponse(enc, version, ErrNone, "", []byte(serverFinal))
+	return enc.Bytes(), nil
+}
+
 // writeSaslAuthenticateResponse emits SaslAuthenticate Response in the shape
 // the requested version requires.
 //
@@ -1213,5 +1380,5 @@ func writeSaslAuthenticateResponse(enc *Encoder, version int16, errCode int16, e
 	}
 }
 
-// Required reports whether SASL authentication is configured.
-func (a AuthConfig) Required() bool { return a.Username != "" }
+// Required reports whether any SASL authentication is configured.
+func (a AuthConfig) Required() bool { return len(a.Mechanisms()) > 0 }

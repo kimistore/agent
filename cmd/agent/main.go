@@ -28,6 +28,7 @@ import (
 	"strings"
 	"syscall"
 
+	"kimistore/internal/auth"
 	"kimistore/internal/config"
 	"kimistore/internal/metrics"
 	"kimistore/internal/protocol"
@@ -142,11 +143,29 @@ func main() {
 		}
 	}
 
+	// SCRAM credentials live in object storage alongside the log's own control
+	// plane, so every agent pointed at the bucket offers the same set. A store
+	// that cannot be opened is not fatal: PLAIN keeps working, and SCRAM is
+	// simply absent from the advertised mechanisms rather than advertised and
+	// failing every exchange.
+	authCfg := protocol.AuthConfig{
+		Username: cfg.SASLUsername,
+		Password: cfg.SASLPassword,
+	}
+	credStore, err := auth.NewStore(engine)
+	if err != nil {
+		log.Printf("SCRAM: credential store unavailable, SCRAM not offered: %v", err)
+	} else {
+		authCfg.Credentials = credStore
+		if names, lerr := credStore.List(context.Background()); lerr != nil {
+			log.Printf("SCRAM: could not list existing credentials: %v", lerr)
+		} else {
+			log.Printf("SCRAM: %d credential(s) available under %s", len(names), auth.Prefix)
+		}
+	}
+
 	srv := server.NewServer(cfg.ListenAddr, engine, protocol.ServerConfig{
-		Auth: protocol.AuthConfig{
-			Username: cfg.SASLUsername,
-			Password: cfg.SASLPassword,
-		},
+		Auth:                 authCfg,
 		AdvertisedHost:       cfg.AdvertisedHost,
 		AdvertisedPort:       cfg.AdvertisedPort,
 		NodeID:               cfg.NodeID,

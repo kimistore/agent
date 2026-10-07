@@ -19,6 +19,7 @@
 package protocol
 
 import (
+	"context"
 	"testing"
 )
 
@@ -31,7 +32,7 @@ func saslAuthenticate(t *testing.T, version int16, authBytes []byte, cfg ServerC
 	enc.PutBytes(authBytes)
 
 	session := &Session{}
-	resp, err := handleSaslAuthenticate(NewDecoder(enc.Bytes()), NewEncoder(), version, session, cfg)
+	resp, err := handleSaslAuthenticate(context.Background(), NewDecoder(enc.Bytes()), NewEncoder(), version, session, cfg)
 	if err != nil {
 		t.Fatalf("handleSaslAuthenticate(v%d): %v", version, err)
 	}
