@@ -156,10 +156,19 @@ func main() {
 	if err != nil {
 		log.Printf("SCRAM: credential store unavailable, SCRAM not offered: %v", err)
 	} else {
-		authCfg.Credentials = credStore
-		if names, lerr := credStore.List(context.Background()); lerr != nil {
-			log.Printf("SCRAM: could not list existing credentials: %v", lerr)
-		} else {
+		names, lerr := credStore.List(context.Background())
+		switch {
+		case lerr != nil:
+			// Unreadable is not the same as empty. Assuming zero credentials
+			// here would silently disable SCRAM for a working deployment whose
+			// bucket is briefly unreachable, which is the worst time to change
+			// how the broker authenticates.
+			log.Printf("SCRAM: could not read %s, SCRAM not offered: %v", auth.Prefix, lerr)
+		case len(names) == 0:
+			log.Printf("SCRAM: no credentials under %s, SCRAM not offered", auth.Prefix)
+		default:
+			authCfg.Credentials = credStore
+			authCfg.SCRAMEnabled = true
 			log.Printf("SCRAM: %d credential(s) available under %s", len(names), auth.Prefix)
 		}
 	}

@@ -167,7 +167,7 @@ func scramBroker(t *testing.T, user, pass string, mechanisms []string) string {
 	ln.Close()
 
 	cfg := protocol.DefaultServerConfig()
-	cfg.Auth = protocol.AuthConfig{Credentials: store}
+	cfg.Auth = protocol.AuthConfig{Credentials: store, SCRAMEnabled: true}
 	applyAddr(t, &cfg, addr)
 
 	srv := NewServer(addr, engine, cfg)
@@ -398,7 +398,7 @@ func bothMechanismBroker(t *testing.T) string {
 	ln.Close()
 
 	cfg := protocol.DefaultServerConfig()
-	cfg.Auth = protocol.AuthConfig{Username: "legacy", Password: "legacy-pass", Credentials: store}
+	cfg.Auth = protocol.AuthConfig{Username: "legacy", Password: "legacy-pass", Credentials: store, SCRAMEnabled: true}
 	applyAddr(t, &cfg, addr)
 	srv := NewServer(addr, engine, cfg)
 	go func() { _ = srv.Start() }()

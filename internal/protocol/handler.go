@@ -153,6 +153,17 @@ type AuthConfig struct {
 	// advertised mechanism list rather than advertising it and failing every
 	// exchange.
 	Credentials *auth.Store
+
+	// SCRAMEnabled says whether SCRAM should be offered at all.
+	//
+	// It is separate from Credentials being non-nil on purpose. A store can
+	// open successfully and hold nothing, and a broker whose SCRAM store is
+	// merely reachable is not an authenticated broker. Treating an empty store
+	// as "SCRAM configured" makes Required() true, which gates every request on
+	// the session being authenticated, and that silently breaks a deployment
+	// which has no SASL credentials at all -- it would start rejecting
+	// everything. The caller sets this only after confirming credentials exist.
+	SCRAMEnabled bool
 }
 
 // Mechanisms returns the SASL mechanisms this broker will serve, in the order
@@ -162,9 +173,13 @@ type AuthConfig struct {
 // actually has a credential. Advertising a mechanism the broker cannot complete
 // is worse than not advertising it: a client that selects it fails after a
 // round trip instead of negotiating something else.
+//
+// SCRAM additionally requires SCRAMEnabled, so an empty credential store cannot
+// turn a broker that has no authentication at all into one that demands it.
+// See SCRAMEnabled.
 func (a AuthConfig) Mechanisms() []string {
 	var out []string
-	if a.Credentials != nil {
+	if a.SCRAMEnabled && a.Credentials != nil {
 		out = append(out, auth.MechanismSCRAMSHA256, auth.MechanismSCRAMSHA512)
 	}
 	if a.Username != "" {
