@@ -92,6 +92,12 @@ type StorageEngine struct {
 	// leave retention permanently over-protecting segments it no longer needs.
 	committedMu      sync.Mutex
 	committedByGroup map[string]map[string]int64
+	// rehydrateDone is closed once rehydrateCommittedOffsets has finished its
+	// pass over object storage. That pass mutates committedByGroup under
+	// committedMu, but it runs concurrently with whatever the caller does next,
+	// so a reload that also merges committed offsets has to wait for it. The
+	// pass is not instant: it lists _offsets/ and reads one object per entry.
+	rehydrateDone chan struct{}
 	// committedAuthoritative is set once consumer offsets have been loaded
 	// from object storage. Until then retention must not run, because an
 	// empty map would look exactly like "no consumers" and invite deletion of
@@ -270,6 +276,7 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 		segmentCache:     make(map[string][]string),
 		offsetBuf:        make(map[string]int64),
 		committedByGroup: make(map[string]map[string]int64),
+		rehydrateDone:    make(chan struct{}),
 		retentionCfg:     retentionCfg,
 		metadataCache:    NewMetadataCache(),
 		readPos:          make(map[string]readPosition),
@@ -387,6 +394,7 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 	se.wg.Add(1)
 	go func() {
 		defer se.wg.Done()
+		defer close(se.rehydrateDone)
 		se.rehydrateCommittedOffsets(context.Background())
 	}()
 
@@ -1924,9 +1932,26 @@ func (s *StorageEngine) SaveCheckpointContext(ctx context.Context) error {
 	return nil
 }
 
+// waitForRehydrate blocks until the startup rehydration pass has finished.
+//
+// A nil channel means the engine was assembled without that pass (several
+// tests build a StorageEngine literal), so there is nothing to wait for.
+func (s *StorageEngine) waitForRehydrate() {
+	if s.rehydrateDone == nil {
+		return
+	}
+	<-s.rehydrateDone
+}
+
 // LoadCheckpoint re-reads the durable checkpoint. Used by tests and by
 // operators; normal startup restores in NewStorageEngine.
+//
+// It waits for the startup rehydration pass to finish first. That pass merges
+// per-group committed offsets into the same map this reload merges into, and
+// it is still running when the engine is handed back to the caller, so without
+// the wait the two interleave.
 func (s *StorageEngine) LoadCheckpoint() error {
+	s.waitForRehydrate()
 	if err := s.loadCheckpointInto(context.Background(), true); err != nil {
 		return err
 	}

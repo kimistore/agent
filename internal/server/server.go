@@ -110,7 +110,21 @@ func (s *Server) Start() error {
 			}
 		}
 
+		// Join the wait group only if the server is still accepting, and do
+		// the check under the same lock Stop uses to set closing. Stop calls
+		// wg.Wait once closing is set, and Add concurrent with Wait on a zero
+		// counter is a race Go documents as a misuse. Checking in
+		// handleConnection is too late: by then the Add has already happened,
+		// so the handler could only refuse after joining the group.
+		s.stateMu.Lock()
+		if s.closing {
+			s.stateMu.Unlock()
+			_ = conn.Close()
+			return nil
+		}
 		s.wg.Add(1)
+		s.stateMu.Unlock()
+
 		go s.handleConnection(conn)
 	}
 }
