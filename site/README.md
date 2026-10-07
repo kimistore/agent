@@ -41,7 +41,7 @@ aws cloudfront create-invalidation --distribution-id XXXXX --paths "/*"
 
 ### Before you publish
 
-1. **Update the canonical URL.** `sitemap.xml` and `robots.txt` currently assume `https://kimistore.dev`. Change both if the real domain differs, and add a canonical `<link>` to `index.html`.
+1. **Update the canonical URL.** `sitemap.xml` and `robots.txt` currently assume `https://kimistore.eu`. Change both if the real domain differs, and add a canonical `<link>` to `index.html`.
 2. **Replace the OG image.** Convert `og.svg` to a 1200×630 PNG and reference that in the `og:image` meta tag.
 3. **Verify the GitHub links.** They point at `https://github.com/kimistore/agent`. Change the `origin` remote or the links if the repo moves.
 4. **Check the numbers.** "10.5k lines of Go", "68 tests", "27 MB binary" were read from the repo on 2026-09-29, and the binary was last rebuilt with Go 1.27. Refresh them as the code changes or they will quietly become wrong.
