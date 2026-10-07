@@ -7,12 +7,25 @@
 <meta name="description" content="Kimistore is a lightweight, single-binary, Kafka-compatible streaming agent written in Go. It speaks the Kafka wire protocol and stores everything in S3 — no ZooKeeper, no KRaft quorum, no replication." />
 <meta name="theme-color" content="#05070d" />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+<link rel="canonical" href="https://kimistore.eu/" />
 
 <meta property="og:type" content="website" />
+<meta property="og:site_name" content="Kimistore" />
+<meta property="og:url" content="https://kimistore.eu/" />
 <meta property="og:title" content="Kimistore — Kafka-compatible streaming on object storage" />
 <meta property="og:description" content="A single Go binary that speaks the Kafka protocol and keeps your data in S3. Drop-in for producers and consumers. No ZooKeeper, no replicated brokers." />
-<meta property="og:image" content="og.svg" />
+<!-- Absolute URL, and PNG rather than SVG: most crawlers will not resolve a
+     relative path here, and none of them render SVG social cards. -->
+<meta property="og:image" content="https://kimistore.eu/og.png" />
+<meta property="og:image:type" content="image/png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="Kimistore — Kafka's protocol, object storage's economics" />
 <meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="Kimistore — Kafka-compatible streaming on object storage" />
+<meta name="twitter:description" content="A single Go binary that speaks the Kafka protocol and keeps your data in S3." />
+<meta name="twitter:image" content="https://kimistore.eu/og.png" />
+<meta name="twitter:image:alt" content="Kimistore — Kafka's protocol, object storage's economics" />
 
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -778,19 +791,9 @@ p.<span class="c-fn">put</span>(<span class="c-str">"value.deserializer"</span>,
         <p class="lede lede--sm">Built from the ground up to deliver Kafka wire-protocol compatibility with object storage economics. Every guarantee is verified by comprehensive durability, crash-recovery, and protocol test suites.</p>
       </header>
 
-      <div class="grid grid--3">
-        <div class="stat reveal">
-          <span class="stat__num">9.1k</span>
-          <span class="stat__label">lines of Go, plus 6.7k of tests</span>
-        </div>
-        <div class="stat reveal">
-          <span class="stat__num">112</span>
-          <span class="stat__label">unit &amp; integration tests, passing</span>
-        </div>
-        <div class="stat reveal">
-          <span class="stat__num">27 MB</span>
-          <span class="stat__label">single static binary, zero dependencies</span>
-        </div>
+      <div class="stat reveal">
+        <span class="stat__num">27 MB</span>
+        <span class="stat__label">single static binary, zero dependencies</span>
       </div>
 
       <div class="grid grid--2 status-cols">

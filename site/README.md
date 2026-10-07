@@ -11,9 +11,12 @@ Static, dependency-free marketing site. No build step, no bundler, no framework.
 | `styles.css` | All styling (design tokens as CSS custom properties at the top) |
 | `script.js` | Progressive enhancement: sticky nav, mobile menu, scroll reveal, code tabs |
 | `favicon.svg` | Browser icon, same geometry as `logo.svg` |
-| `og.svg` | Social preview card, embeds the same mark — **convert to PNG/JPG before publishing**, most platforms won't render SVG |
-| `robots.txt` | Crawler policy |
+| `og.svg` | Social preview card source — the mark plus the tagline |
+| `og.png` | 1200×630 social card actually served in `og:image`. Social platforms do not render SVG, so this is what crawlers get |
+| `robots.txt` | Crawler policy, points at the sitemap |
 | `sitemap.xml` | Single-URL sitemap |
+| `CNAME` | Custom domain for Cloudflare Pages |
+| `_headers` | Cloudflare Pages response headers: revalidation for the un-fingerprinted assets, longer caching for the SVGs, and `nosniff` / `Referrer-Policy` / `Permissions-Policy` |
 
 ## Run locally
 
@@ -30,7 +33,6 @@ Opening `index.html` directly from disk also works.
 `site/` is pure static output. Any of these work as-is:
 
 ```bash
-# GitHub Pages (push site/ to the gh-pages branch, or /docs)
 # Cloudflare Pages / Netlify / Vercel
 npx serve site
 
@@ -39,12 +41,52 @@ aws s3 sync site/ s3://your-bucket/ --delete
 aws cloudfront create-invalidation --distribution-id XXXXX --paths "/*"
 ```
 
+### Cloudflare Pages
+
+Connect the repository and set:
+
+| Setting | Value |
+| :--- | :--- |
+| Build command | *(leave empty)* |
+| Build output directory | `site` |
+| Production branch | `main` |
+
+There is no build step, so the build command must stay empty — anything you
+put there will be run and is expected to produce output in the directory above.
+`_headers` and `CNAME` are picked up from the output directory automatically.
+
+To regenerate `og.png` after editing `og.svg` (no SVG rasteriser is vendored,
+so this uses whatever Chrome is already installed):
+
+```bash
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --headless --disable-gpu --hide-scrollbars \
+  --screenshot=og.png --window-size=1200,630 "file://$PWD/og.svg"
+```
+
+`og.svg` is already 1200×630, which is the size Open Graph expects. `qlmanage`
+is not usable here: it pads to a square.
+
 ### Before you publish
 
-1. **Update the canonical URL.** `sitemap.xml` and `robots.txt` currently assume `https://kimistore.eu`. Change both if the real domain differs, and add a canonical `<link>` to `index.html`.
-2. **Replace the OG image.** Convert `og.svg` to a 1200×630 PNG and reference that in the `og:image` meta tag.
-3. **Verify the GitHub links.** They point at `https://github.com/kimistore/agent`. Change the `origin` remote or the links if the repo moves.
-4. **Check the numbers.** "10.5k lines of Go", "68 tests", "27 MB binary" were read from the repo on 2026-09-29, and the binary was last rebuilt with Go 1.27. Refresh them as the code changes or they will quietly become wrong.
+1. ~~**Update the canonical URL.**~~ Done: `https://kimistore.eu` is set in
+   `sitemap.xml`, `robots.txt`, the canonical `<link>`, and `CNAME`. It appears
+   in four places — change all four if the domain changes.
+2. ~~**Replace the OG image.**~~ Done: `og.png` is rendered at 1200×630 and
+   referenced by absolute URL from both `og:image` and `twitter:image`.
+3. **Verify the GitHub links.** They point at `https://github.com/kimistore/agent`,
+   which matches the `origin` remote. Update the links if the repo moves.
+4. **Refresh `sitemap.xml`'s `lastmod`.** It is a single-URL sitemap, so
+   `lastmod` is the only signal a crawler gets that anything changed.
+5. **Refresh `og.png` if `og.svg` changes**, per the command above. The PNG is
+   a build artefact checked into the repo, so it will silently go stale.
+
+### Deliberately absent
+
+The page does not advertise lines of code or test counts. Those numbers drift
+out of date within a few commits and say nothing about whether the broker is
+correct; the claims that are on the page are protocol versions, durability
+semantics and stated non-goals, all of which stay true or visibly break.
 
 ## Content sourcing
 

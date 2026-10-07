@@ -1,0 +1,43 @@
+# Cloudflare Pages response headers.
+#
+# _headers is a Cloudflare Pages / Netlify convention: files and globs under it
+# are turned into response headers for matching requests. It needs no build step
+# and no framework.
+
+/*
+  # No Content-Encoding here on purpose. Cloudflare compresses automatically by
+  # content type, and declaring an encoding it is not applying makes browsers
+  # fail to decode the body and render a blank page.
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: geolocation=(), microphone=(), camera=(), interest-cohort=()
+
+# Fingerprinted assets do not exist here: styles.css and script.js are plain
+# names, so they must revalidate or an edit never reaches a returning visitor.
+/styles.css
+  Cache-Control: public, max-age=0, must-revalidate
+
+/script.js
+  Cache-Control: public, max-age=0, must-revalidate
+
+/index.html
+  Cache-Control: public, max-age=0, must-revalidate
+
+# These only change when the brand does. Rarely edited, safe to hold for a while.
+/logo.svg
+  Cache-Control: public, max-age=604800
+
+/favicon.svg
+  Cache-Control: public, max-age=604800
+
+/og.svg
+  Cache-Control: public, max-age=604800
+
+/og.png
+  Cache-Control: public, max-age=604800
+
+/robots.txt
+  Cache-Control: public, max-age=3600
+
+/sitemap.xml
+  Cache-Control: public, max-age=3600
