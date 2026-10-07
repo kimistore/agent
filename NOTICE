@@ -1,0 +1,28 @@
+kimistore-agent
+Copyright (C) 2026 Andy Lo-A-Foe
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
+for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+--------------------------------------------------------------------------------
+
+The full text of the GNU Affero General Public License version 3 is in the
+file LICENSE. It is kept verbatim: the copyright line at the top of that file
+belongs to the Free Software Foundation and covers the license text itself,
+not this program. Copyright in this software is asserted here and in the
+header of each source file, which is where the license's own "How to Apply
+These Terms" appendix points.
+
+Section 13 of the license applies to network interaction. This program is a
+Kafka-compatible broker: it serves clients over a network, so anyone who
+interacts with it over a network must be offered its corresponding source.

@@ -278,3 +278,13 @@ today:
   commit is not immediately readable; `OffsetCommit`/`OffsetFetch` are not fenced
   to the group coordinator; idempotent producer state does not survive moving to a
   different machine. See [`docs/ha-architecture.md`](docs/ha-architecture.md) §14.
+
+## License
+
+Copyright (C) 2026 Andy Lo-A-Foe. Licensed under the
+[GNU Affero General Public License v3.0 or later](LICENSE) — see also
+[`NOTICE`](NOTICE).
+
+This is a network service: the broker serves Kafka clients over a network, so
+anyone who interacts with it over a network is entitled to the corresponding
+source under section 13 of the license.
