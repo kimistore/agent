@@ -67,7 +67,11 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          # Pinned, not "latest". "latest" resolved to a v1 binary, which
+          # cannot read this repo's schema v2 config and is built with a Go
+          # older than the go directive in go.mod, so it failed to load the
+          # config at all. Pinning also keeps the lint result reproducible.
+          version: v2.13.2
           args: --timeout=5m
 
       - name: Benchmark smoke test
