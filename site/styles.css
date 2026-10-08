@@ -532,6 +532,14 @@ p  { margin: 0 0 1rem; }
 .footer__links a:hover { color: var(--text); }
 .footer__legal { margin-top: 2.5rem; padding-top: 1.4rem; border-top: 1px solid var(--border); }
 .footer__legal p { margin: 0; font-size: .8rem; color: var(--text-mute); max-width: 80ch; }
+/* The privacy note sits under the trademark line, so it needs its own gap.
+   Without it the two paragraphs run together with no separation. */
+.footer__legal p + p { margin-top: .8rem; }
+/* The link inherits the muted paragraph colour, which makes it look like plain
+   text. Underline it so it reads as a link. */
+.footer__legal a { text-decoration: underline; text-underline-offset: 2px; }
+/* An abbreviation used for a term that has no room to expand inline. */
+.footer__legal abbr { text-decoration: none; cursor: help; }
 
 /* ========================= REVEAL ========================= */
 .reveal { opacity: 0; transform: translateY(18px); transition: opacity .7s cubic-bezier(.2,.7,.3,1), transform .7s cubic-bezier(.2,.7,.3,1); }

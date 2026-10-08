@@ -924,6 +924,7 @@ p.<span class="c-fn">put</span>(<span class="c-str">"value.deserializer"</span>,
   </div>
   <div class="wrap footer__legal">
     <p>Kimistore is not affiliated with, endorsed by, or sponsored by the Apache Software Foundation. Apache Kafka® is a registered trademark of the ASF.</p>
+    <p>Privacy: this site uses <a href="https://posthog.com" rel="noopener noreferrer" target="_blank">PostHog</a> for anonymous page and interaction analytics, hosted in the EU. No cookies are set for advertising, no data is sold, and no personal data is collected. If your browser sends <abbr title="Do Not Track">DNT</abbr>, nothing is recorded at all.</p>
   </div>
 </footer>
 
@@ -949,6 +950,16 @@ p.<span class="c-fn">put</span>(<span class="c-str">"value.deserializer"</span>,
   </symbol>
 </svg>
 
+  <!-- PostHog uses defer, not async. Both avoid blocking rendering, but defer
+       guarantees the script runs after the document is parsed. That matters:
+       posthog.js looks up the quickstart section to observe it, and an async
+       script may execute mid-parse and find nothing. PostHog then loads its
+       own library with a further async request, so the queue still starts
+       immediately.
+       script.js is deliberately left inline and unindented, exactly as it was,
+       so the no-js class comes off early and the reveal animations do not
+       flash hidden content. -->
+  <script src="posthog.js" defer></script>
 <script src="script.js"></script>
 </body>
 </html>
