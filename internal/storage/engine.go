@@ -1658,10 +1658,17 @@ func (s *StorageEngine) uploadSegments() {
 			Source: "reconciliation",
 		}
 
+		// The counter must be raised here as well as on the fast path. The
+		// uploader worker decrements after every task it takes, so a send that
+		// does not increment drives the counter negative -- and drainUploads
+		// waits for exactly zero, so a negative count means it burns its whole
+		// budget and reports a negative number of segments still uploading.
+		s.pendingUploads.Add(1)
 		select {
 		case s.uploadChan <- task:
 		default:
 			// Queue full, will be picked up in next reconciliation
+			s.pendingUploads.Add(-1)
 		}
 
 		return nil
