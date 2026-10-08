@@ -282,6 +282,15 @@ See "Authorization" in the [`README.md`](README.md) for the rule syntax and the
   `KIMISTORE_REQUIRE_LEASE=false` downgrades the fence to a startup warning.
   `KIMISTORE_PARTITION_OWNERSHIP=false` reverts to one bucket-wide claim that
   refuses a second agent outright.
+  * **Every agent must have a distinct `KIMISTORE_AGENT_ID`.** Two agents sharing
+    one id cannot tell each other apart from the claim record, because the record
+    names the id both of them use. The agent therefore also compares epochs: a
+    live claim at an epoch above the one it holds is a takeover, not a renewal, and
+    it is refused with an error naming the variable. Without that check the two
+    agents hand the partition back and forth forever -- the epoch climbs on every
+    renewal tick, both keep acknowledging writes, and their log end offsets
+    diverge. An *expired* claim above its own epoch is still taken over, which is
+    the ordinary failover after the previous holder died.
   * **Clients are routed to the agent that owns a partition.** `Metadata` reports
     every live agent and names each partition's leader, so a client writes to and
     reads from the agent holding it. A partition whose owner is gone is reported as

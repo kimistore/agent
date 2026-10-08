@@ -263,7 +263,7 @@ func (om *ownershipManager) Claim(ctx context.Context, topic string, partition i
 	claimCtx, cancel := context.WithTimeout(ctx, om.cfg.TTL)
 	defer cancel()
 
-	owner, err := om.claim(claimCtx, topic, partition)
+	owner, err := om.claim(claimCtx, topic, partition, 0)
 	if err != nil {
 		metrics.OwnershipClaimFailures.Inc()
 		return p.epoch.Load(), err
@@ -281,7 +281,13 @@ func (om *ownershipManager) Claim(ctx context.Context, topic string, partition i
 
 // claim performs one compare-and-swap against the partition's claim object,
 // retrying while the object is being written by someone else.
-func (om *ownershipManager) claim(ctx context.Context, topic string, partition int32) (PartitionOwner, error) {
+// claim acquires or renews this agent's claim on a partition.
+//
+// heldEpoch is the epoch the caller believes it holds, or zero when it holds
+// nothing yet. It is what distinguishes re-acquiring our own live record from
+// losing the partition to a peer that is using the same agent id: a live claim
+// above our epoch is a takeover, not a renewal.
+func (om *ownershipManager) claim(ctx context.Context, topic string, partition int32, heldEpoch int64) (PartitionOwner, error) {
 	key := partitionOwnerKey(topic, partition)
 	var lastErr error
 
@@ -323,6 +329,24 @@ func (om *ownershipManager) claim(ctx context.Context, topic string, partition i
 			agent, expires := current.Agent, time.Unix(current.Expires, 0).UTC().Format(time.RFC3339)
 			return PartitionOwner{}, fmt.Errorf("%w: %s is held by %q until %s (epoch %d)",
 				ErrPartitionHeld, key, agent, expires, current.Epoch)
+		case !current.Expired(now) && current.Epoch > heldEpoch:
+			// The claim names us and is still live, but it is at a higher epoch
+			// than the one we hold. That is not us re-acquiring our own record:
+			// it is another process using the same agent id, and it has already
+			// taken the partition from us.
+			//
+			// Renewing here would hand the partition back and forth forever. Two
+			// agents sharing an id would each bump the epoch past the other on
+			// every renewal tick, both would keep believing they owned the
+			// partition, and both would acknowledge writes -- with diverged log
+			// end offsets. An identity collision is not a condition to recover
+			// from; it is a misconfiguration to refuse.
+			//
+			// An *expired* claim above our epoch is still fair game, which is
+			// the case where the holder died and we are genuinely taking over.
+			return PartitionOwner{}, fmt.Errorf("%w: %s is held at epoch %d by an agent using our id %q "+
+				"(we hold epoch %d); every agent must have a distinct KIMISTORE_AGENT_ID",
+				ErrPartitionHeld, key, current.Epoch, om.agent, heldEpoch)
 		default:
 			// Renew our own claim, or take over one that has expired. The epoch
 			// only ever moves forward, so a takeover is always visibly newer
@@ -397,7 +421,7 @@ func (om *ownershipManager) renewPartition(ctx context.Context, p *partitionOwne
 	ctx, cancel := context.WithTimeout(ctx, om.cfg.TTL)
 	defer cancel()
 
-	owner, err := om.claim(ctx, p.topic, p.partition)
+	owner, err := om.claim(ctx, p.topic, p.partition, p.epoch.Load())
 	if err != nil {
 		metrics.OwnershipRenewalFailures.Inc()
 
@@ -508,6 +532,14 @@ func (om *ownershipManager) verifyClaim(ctx context.Context, topic string, parti
 	if current.Expires > 0 && time.Now().Unix() > current.Expires {
 		return fmt.Errorf("%w: the claim for %s/%d expired %ds ago",
 			ErrPartitionNotOwned, topic, partition, time.Now().Unix()-current.Expires)
+	}
+	// A live claim above our epoch means a peer using the same agent id has
+	// already taken the partition. The agent-name check above cannot see that,
+	// because the record names us.
+	if held := p.epoch.Load(); current.Epoch > held {
+		return fmt.Errorf("%w: %s/%d is held at epoch %d by an agent using our id %q (we hold epoch %d); "+
+			"every agent must have a distinct KIMISTORE_AGENT_ID",
+			ErrPartitionLost, topic, partition, current.Epoch, om.agent, held)
 	}
 	return nil
 }
