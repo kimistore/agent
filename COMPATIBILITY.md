@@ -1,11 +1,21 @@
 ## Compatibility Guide
 
-This server implements a subset of the Kafka Protocol (primarily V0-V2). It is designed to be compatible with standard Kafka clients and supports both **Simple Consumer** and **Consumer Group** workflows.
+This server implements a subset of the Kafka Protocol. It is designed to be
+compatible with standard Kafka clients and supports both **Simple Consumer**
+and **Consumer Group** workflows.
+
+Version ceilings differ per API. Several APIs reach the newest non-flexible
+version, and others stop at v0 for a documented reason. See "Version
+ceilings" below for each ceiling and the reason it sits where it does. The
+authoritative list is the `Protocol versions advertised` line the agent logs
+at startup, and the per-API table below.
 
 ### Supported Features
-*   **Protocol Versions**: Kafka 0.10.x-era APIs. `ApiVersions` advertises
-    exactly what is implemented, and any other version of a known API, or an
-    unknown API, is answered `UNSUPPORTED_VERSION` rather than dropped.
+*   **Protocol Versions**: Kafka 0.11-era APIs, with several serving later
+    versions. `Metadata` reaches v7 and `InitProducerId` v1, both newer than
+    0.11. `ApiVersions` advertises exactly what is implemented, and any other
+    version of a known API, or an unknown API, is answered `UNSUPPORTED_VERSION`
+    rather than dropped.
 
     | API | Versions |
     | :--- | :--- |
@@ -21,7 +31,7 @@ This server implements a subset of the Kafka Protocol (primarily V0-V2). It is d
     | CreateTopics / DeleteTopics | 0 |
     | InitProducerId | 0-1 |
     | ListGroups / DescribeGroups | 0 |
-    | SaslHandshake / SaslAuthenticate | 0-1 / 0 |
+    | SaslHandshake / SaslAuthenticate | 0-1 / 0-1 |
 *   **Message Format**:
     *   MessageSet V0/V1 (legacy), including GZIP, Snappy (with Kafka's length
         prefix) and LZ4 compression.
@@ -86,10 +96,13 @@ the two readings coincide.
 **Metadata goes to v7.** v7 is the newest non-flexible version, and the only
 field it adds over v6 is `LeaderEpoch` -- the ownership epoch of the agent that
 leads the partition, which is how a client detects that the leader it cached has
-been replaced. v8 adds topic authorization, which is not implemented, so v7 is
-where the ceiling stops. Note that `cluster_id` is a **v2** field, not v1: a v1
-client reads whatever sits where the controller id belongs, so emitting it early
-desynchronises every field after it.
+been replaced. v8 adds `TopicAuthorizedOperations`, a bitmask of the
+operations a client may perform on each topic. The agent enforces topic
+authorization from its own ACL rules (see "Authorization" below), but it
+does not emit that bitmask, so v7 is where the ceiling stops. Note that
+`cluster_id` is a **v2** field, not v1: a v1 client reads whatever sits
+where the controller id belongs, so emitting it early desynchronises
+every field after it.
 
 **Fetch goes to v5**, which adds `log_start_offset` so a client can find the
 log start without a separate ListOffsets round trip.
@@ -108,8 +121,8 @@ downgrades and retries instead of dropping the connection. Every such refusal
 increments `kimistore_unsupported_api_versions_total{api, version}`, and the
 startup log prints the advertised version table with the reason for each
 ceiling. A client that reads ApiVersions and adapts should never generate that
-counter; if yours does, the label names the API and version it is insisting
-on.
+counter; if yours does, the label names the API and the version your client
+demands.
 
 ### Limitations (What WON'T work)
 1.  **Transactions**: Transactional producing (`AddPartitionsToTxn`, transaction
@@ -168,9 +181,9 @@ kcat -b localhost:19092 -G my-group my-topic
 | Feature Category | Feature | Status | Notes |
 | :--- | :--- | :--- | :--- |
 | **Core Protocol** | Produce API (V0-V3) | ✅ Supported | See the throttle note above |
-| | Fetch API (V2) | ✅ Supported | |
-| | ListOffsets (V1) | ✅ Supported | earliest offset reflects retention, not a hardcoded 0 |
-| | Metadata (V2) | ✅ Supported | |
+| | Fetch API (V0-V5) | ✅ Supported | |
+| | ListOffsets (V0-V2) | ✅ Supported | earliest offset reflects retention, not a hardcoded 0 |
+| | Metadata (V0-V7) | ✅ Supported | |
 | | ApiVersions (V0) | ✅ Supported | Higher versions are refused so the client retries at v0 |
 | **Messaging** | MessageSets (V0, V1) | ✅ Supported | Legacy format |
 | | RecordBatch (V2) | ✅ Supported | bare and message-set-wrapped encodings; record count read from the batch header |
@@ -188,6 +201,74 @@ kcat -b localhost:19092 -G my-group my-topic
 | | Active segment on shutdown | ✅ Supported | sealed and uploaded before exit |
 | **Reliability** | Replication | ❌ No | Single node only |
 | | ISR/HW | ❌ No | Always ISR=1, HW=Max |
+| **Authentication** | SASL/SCRAM-SHA-256 | ✅ Supported | Offered only when credentials exist under `_scram/` |
+| | SASL/SCRAM-SHA-512 | ✅ Supported | Offered only when credentials exist under `_scram/` |
+| | SASL/PLAIN | ✅ Supported | One shared credential from `SASL_USERNAME` and `SASL_PASSWORD` |
+| | `SaslAuthenticate` V1 | ✅ Supported | Server-final-message framing |
+| **Authorization** | Topic ACLs | ✅ Supported | Rules under `_acl/`; deny overrides allow; operations Read, Write, Describe, Create, Delete, Alter, All |
+| | `Describe` on topics | ✅ Enforced | Refused with `TOPIC_AUTHORIZATION_FAILED` |
+| | `Describe` on consumer groups | ❌ No | Groups are not covered by topic rules |
+| | `DescribeGroups` authorization | ❌ No | The v8 `TopicAuthorizedOperations` bitmask is not emitted |
+
+### Authentication
+
+The agent supports three SASL mechanisms. It advertises only the mechanisms
+it can actually complete.
+
+| Mechanism | Configured by | Advertised when |
+| :--- | :--- | :--- |
+| `PLAIN` | `SASL_USERNAME` and `SASL_PASSWORD` | Both variables are set |
+| `SCRAM-SHA-256` | `kimistore-credential create` | A credential exists under `_scram/` |
+| `SCRAM-SHA-512` | `kimistore-credential create` | A credential exists under `_scram/` |
+
+With no credentials and no `PLAIN` variables, the agent serves every request
+without authentication. `ApiVersions` reflects the mechanisms actually on
+offer, so a client never negotiates a mechanism the agent cannot complete.
+
+`PLAIN` compares the supplied username and password against one shared pair.
+It sends the password in the clear unless the connection uses TLS. Use it only
+on a trusted network, or use SCRAM.
+
+SCRAM credentials live under `_scram/` in the object store. The store holds the
+stored key, the salt, and the iteration count. It never holds the password, so
+a read of that prefix does not reveal it. `SaslAuthenticate` supports v0 and v1.
+
+### Authorization
+
+Topic ACLs are optional. Rules live under `_acl/`. With no rules the agent
+allows every request.
+
+The agent enforces topic authorization on `Produce`, `Fetch`, `Metadata`, and
+`CreateTopics` and `DeleteTopics`. A denied request is answered with
+`TOPIC_AUTHORIZATION_FAILED`.
+
+Each operation maps to one API:
+
+| Operation | Enforced on |
+| :--- | :--- |
+| `Read` | `Fetch` |
+| `Write` | `Produce` |
+| `Describe` | `Metadata` |
+| `Create` | `CreateTopics` |
+| `Delete` | `DeleteTopics` |
+| `Alter` | Stored and accepted, but no handler consults it |
+| `All` | Every operation above |
+
+A producer needs `Describe` before it can write. A grant of `Write` alone fails
+at metadata time, and the client never reaches the write check.
+
+Three gaps are deliberate for this release:
+
+- The agent does not enforce `Describe` on consumer groups. Topic rules do not
+  apply to a group coordinate.
+- The agent does not emit the `TopicAuthorizedOperations` bitmask that
+  `Metadata` v8 and `DescribeConfigs` use to advertise per-topic operations.
+- `Alter` is accepted as a rule operation, but the agent implements neither
+  `AlterConfigs` nor `DeleteRecords`, so a rule that names `Alter` has no
+  effect.
+
+See "Authorization" in the [`README.md`](README.md) for the rule syntax and the
+`kimistore-credential acl` command.
 
 ### Operational guarantees that affect the protocol
 
