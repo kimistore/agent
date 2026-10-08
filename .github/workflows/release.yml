@@ -1,0 +1,269 @@
+name: Release
+
+# Builds the release binaries for a tag, checksums them, and attaches them to a
+# GitHub Release. The binaries come from `make release-build`, the same target a
+# developer runs by hand, so a hand-built binary and a released one cannot
+# differ.
+#
+# `make ci` runs first. A release must not be possible from a tree whose race
+# detector or linter fails, and this workflow is the last gate before a tag
+# reaches users.
+#
+# The Mimir end-to-end check does not run here. It needs Docker, it takes
+# about twenty minutes, and CI has already run it against the commit. The tag
+# must point at a commit whose CI was green; that is a reviewer's job, not
+# something to rediscover halfway through a release.
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual runs cut a release without a tag, for checking the workflow itself.
+  # The artefacts are uploaded to the run rather than to a GitHub Release.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to rebuild, for example v1.0.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # A tag is immutable in practice: force-pushing one breaks checksums and
+    # every clone. A manual run needs the write permission to create a release.
+    permissions:
+      contents: write
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+        with:
+          # A tag is not a branch, so a push-triggered run checks out the tag
+          # object rather than the commit it names. Without ref the job builds
+          # a detached HEAD that describes as the bare SHA and loses the
+          # version, which is the one thing this workflow exists to set.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          # The release target needs the full history for `git describe` to
+          # resolve a tag name, and fetch-depth 0 is what gives it that.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Report the resolved version
+        run: |
+          set -euo pipefail
+          echo "tag:      ${{ github.event.inputs.tag || github.ref_name }}"
+          echo "describe: $(git describe --tags --always --dirty)"
+          echo "commit:   $(git rev-parse HEAD)"
+          make version
+
+      # The tag must name this commit. A release built from the wrong commit is
+      # worse than no release, because the checksum file and the tag disagree
+      # and nothing detects that at download time.
+      - name: Verify the tag points at this commit
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          tagged=$(git rev-list -n 1 "$GITHUB_REF_NAME")
+          head=$(git rev-parse HEAD)
+          echo "tag resolves to: $tagged"
+          echo "checked out:      $head"
+          if [ "$tagged" != "$head" ]; then
+            echo "::error::the tag does not name the checked-out commit"
+            exit 1
+          fi
+
+      # A dirty tree cannot happen after a clean checkout, but `git describe`
+      # appends -dirty when it sees untracked files, and a generated file would
+      # then ship a version that no tag matches.
+      - name: Refuse to build from a dirty tree
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the checkout is dirty:"
+            git status --porcelain
+            exit 1
+          fi
+          case "$(git describe --tags --always --dirty)" in
+            *-dirty)
+              echo "::error::git describe reports a dirty tree"
+              exit 1
+              ;;
+          esac
+
+      - name: Run the checks CI runs
+        run: make ci
+
+      - name: Build the release binaries
+        run: make release-build
+
+      - name: Verify the stamp on every binary
+        # A binary stamped "dev" is a broken release. The version is the reason
+        # the stamping code exists, and it is the first thing a user asks.
+        #
+        # The expected value is read from git describe, not matched against a
+        # pattern like v[0-9]. Matching a pattern rejects a legitimate release:
+        # git describe yields a bare SHA unless HEAD carries a tag, so the very
+        # first tagged build would be stamped v1.0.0 and pass, while a rebuild
+        # from a commit with no tag would stamp a SHA and fail. Comparing against
+        # the resolved value accepts both, because both are correct.
+        #
+        # Only the native binary is executed. This runner is x86-64, so an
+        # arm64 binary cannot run here. The arm64 check reads the stamp out of
+        # the file instead. `grep -a` treats the input as text, which is what a
+        # Go binary needs, and it is more reliable here than strings, which can
+        # split a short printable run across a non-printable byte.
+        run: |
+          set -euo pipefail
+          fails=0
+          want=$(git describe --tags --always --dirty)
+          echo "expected stamp: $want"
+
+          for arch in arm64 amd64; do
+            binary="bin/kimistore-$arch"
+            echo "--- $binary"
+            file "$binary" | sed 's/^/    /'
+
+            if [ ! -x "$binary" ]; then
+              echo "    ::error::not executable"
+              fails=1
+              continue
+            fi
+
+            if [ "$arch" = "$(go env GOARCH)" ]; then
+              out=$("$binary" -version)
+              echo "    runs: $out"
+              if [[ "$out" == *"$want"* ]]; then
+                echo "    stamp matches"
+              else
+                echo "    ::error::stamp does not contain $want"
+                fails=1
+              fi
+              if [[ "$out" == *"dev"* ]]; then
+                echo "    ::error::stamp reports dev"
+                fails=1
+              fi
+            else
+              # Foreign architecture: read the stamp out of the file.
+              if grep -aqF "$want" "$binary"; then
+                echo "    stamp string present in the binary"
+              else
+                echo "    ::error::stamp $want not found in the binary"
+                fails=1
+              fi
+              if grep -aqF 'kimistore dev ' "$binary"; then
+                echo "    ::error::binary appears unstamped"
+                fails=1
+              fi
+            fi
+          done
+
+          echo "--- credential tool"
+          for arch in arm64 amd64; do
+            if [ ! -x "bin/kimistore-credential-$arch" ]; then
+              echo "    ::error::bin/kimistore-credential-$arch is missing"
+              fails=1
+              continue
+            fi
+            echo "    kimistore-credential-$arch present"
+          done
+
+          exit "$fails"
+
+      - name: Verify the checksums
+        run: |
+          set -euo pipefail
+          cd bin
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+          # Every binary must be listed. A checksum file that omits a file
+          # verifies clean while leaving that file unverified.
+          listed=$(awk '{print $2}' SHA256SUMS | sort)
+          present=$(ls kimistore-* | sort)
+          if [ "$listed" != "$present" ]; then
+            echo "::error::SHA256SUMS does not match the built binaries"
+            diff <(echo "$listed") <(echo "$present") || true
+            exit 1
+          fi
+          echo "all $(echo "$present" | wc -l) binaries are checksummed"
+
+      - name: Upload the artefacts to the run
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimistore-release
+          path: bin/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish the GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+
+          # Draft notes first, then append the checksums. The checksum block is
+          # generated rather than written by hand so it cannot drift from the
+          # files it describes.
+          {
+            echo "Binaries for \`${tag}\`."
+            echo
+            echo "Download the file for your architecture, then check it:"
+            echo
+            echo '```'
+            echo "sha256sum -c SHA256SUMS"
+            echo '```'
+            echo
+            echo "| File | Platform |"
+            echo "| --- | --- |"
+            echo "| \`kimistore-arm64\` | Linux ARM64, Raspberry Pi 4 or 5 |"
+            echo "| \`kimistore-amd64\` | Linux x86-64 |"
+            echo "| \`kimistore-credential-arm64\` | Linux ARM64 |"
+            echo "| \`kimistore-credential-amd64\` | Linux x86-64 |"
+            echo
+            echo "Checks a build against its stamp:"
+            echo
+            echo '```'
+            echo "./kimistore-arm64 -version"
+            echo '```'
+          } > /tmp/notes.md
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag exists, updating its notes"
+            gh release edit "$tag" --notes-file /tmp/notes.md
+            gh release upload "$tag" bin/kimistore-* bin/SHA256SUMS --clobber
+          else
+            echo "creating release $tag"
+            gh release create "$tag" \
+              --title "Kimistore ${tag}" \
+              --notes-file /tmp/notes.md \
+              --verify-tag \
+              bin/kimistore-arm64 \
+              bin/kimistore-amd64 \
+              bin/kimistore-credential-arm64 \
+              bin/kimistore-credential-amd64 \
+              bin/SHA256SUMS
+          fi
+
+          echo "--- release"
+          gh release view "$tag" --json url,isDraft,tagName \
+            --jq '"    url: \(.url)\n    draft: \(.isDraft)\n    tag: \(.tagName)"'
+
+      - name: Summarise a manual run
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "Download the artefacts from this run:"
+          echo "  https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo
+          echo "No GitHub Release was created. Push the tag ${{ inputs.tag }}"
+          echo "to publish one."
