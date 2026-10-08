@@ -22,10 +22,11 @@ import (
 	"context"
 	"log"
 
+	"kimistore/internal/auth"
 	"kimistore/internal/storage"
 )
 
-func handleCreateTopics(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
+func handleCreateTopics(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16, session *Session, cfg ServerConfig) ([]byte, error) {
 	// Request V0
 	// Array of CreateTopicRequests
 
@@ -45,6 +46,20 @@ func handleCreateTopics(ctx context.Context, dec *Decoder, enc *Encoder, store *
 		if err != nil {
 			return nil, err
 		}
+
+		// Checked as each topic is read rather than after the whole request,
+		// because the response array has to be built either way and this way the
+		// refusal is already in the right position.
+		if code := authorize(cfg, session, auth.OpCreate, auth.Topic(topic)); code != ErrNone {
+			results = append(results, TopicResult{Topic: topic, Error: code})
+			// The rest of this topic's fields still have to be consumed or the
+			// stream desynchronises, but they are no longer interesting.
+			if err := skipCreateTopicRemainder(dec); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
 		numPartitions, err := dec.Int32()
 		if err != nil {
 			return nil, err
@@ -127,7 +142,7 @@ func handleCreateTopics(ctx context.Context, dec *Decoder, enc *Encoder, store *
 	return enc.Bytes(), nil
 }
 
-func handleDeleteTopics(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
+func handleDeleteTopics(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16, session *Session, cfg ServerConfig) ([]byte, error) {
 	// Request V0
 	// Array of Topics (String)
 	count, err := dec.Int32()
@@ -139,6 +154,29 @@ func handleDeleteTopics(ctx context.Context, dec *Decoder, enc *Encoder, store *
 	for i := int32(0); i < count; i++ {
 		t, _ := dec.String()
 		topics = append(topics, t)
+	}
+
+	// Delete is the one operation whose absence of a grant must be a hard
+	// refusal: a caller that cannot delete a topic it can read must not be
+	// able to delete one it cannot either.
+	if code := authorizeTopics(cfg, session, auth.OpDelete, topics); code != ErrNone {
+		log.Printf("DeleteTopics: %s denied Delete", session.principal())
+		results := make([]struct {
+			Topic string
+			Error int16
+		}, 0, len(topics))
+		for _, t := range topics {
+			results = append(results, struct {
+				Topic string
+				Error int16
+			}{t, code})
+		}
+		enc.Int32(int32(len(results)))
+		for _, r := range results {
+			enc.String(r.Topic)
+			enc.Int16(r.Error)
+		}
+		return enc.Bytes(), nil
 	}
 
 	timeoutMs, _ := dec.Int32()
@@ -176,4 +214,53 @@ func handleDeleteTopics(ctx context.Context, dec *Decoder, enc *Encoder, store *
 	}
 
 	return enc.Bytes(), nil
+}
+
+// skipCreateTopicRemainder consumes the rest of a CreateTopics entry so the
+// decoder stays aligned with the request stream.
+//
+// A refused topic still has its fields on the wire. Stopping early would leave
+// them to be read as the next topic, which turns one unauthorised request into a
+// stream of nonsense responses.
+func skipCreateTopicRemainder(dec *Decoder) error {
+	// numPartitions, replicationFactor
+	if _, err := dec.Int32(); err != nil {
+		return err
+	}
+	if _, err := dec.Int16(); err != nil {
+		return err
+	}
+	// replica_assignment: array of (partition, [replicas])
+	n, err := dec.Int32()
+	if err != nil {
+		return err
+	}
+	for i := int32(0); i < n; i++ {
+		if _, err := dec.Int32(); err != nil {
+			return err
+		}
+		r, err := dec.Int32()
+		if err != nil {
+			return err
+		}
+		for j := int32(0); j < r; j++ {
+			if _, err := dec.Int32(); err != nil {
+				return err
+			}
+		}
+	}
+	// config_entries: array of (name, nullable value)
+	c, err := dec.Int32()
+	if err != nil {
+		return err
+	}
+	for i := int32(0); i < c; i++ {
+		if _, err := dec.String(); err != nil {
+			return err
+		}
+		if _, err := dec.String(); err != nil {
+			return err
+		}
+	}
+	return nil
 }

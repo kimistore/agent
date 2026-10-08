@@ -96,7 +96,7 @@ func TestFetch_LongPollWakesOnData(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		handleFetch(context.Background(), NewDecoder(req), enc, se, 0)
+		handleFetch(context.Background(), NewDecoder(req), enc, se, 0, &Session{}, ServerConfig{})
 	}()
 
 	select {
@@ -126,7 +126,7 @@ func TestFetch_LongPollTimesOutWhenIdle(t *testing.T) {
 	start := time.Now()
 	enc := NewEncoder()
 	enc.Int32(1)
-	resp, err := handleFetch(context.Background(), NewDecoder(req), enc, se, 0)
+	resp, err := handleFetch(context.Background(), NewDecoder(req), enc, se, 0, &Session{}, ServerConfig{})
 	if err != nil {
 		t.Fatalf("handleFetch: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestFetch_NoLongPollWhenMinBytesZero(t *testing.T) {
 	start := time.Now()
 	enc := NewEncoder()
 	enc.Int32(1)
-	if _, err := handleFetch(context.Background(), NewDecoder(req), enc, se, 0); err != nil {
+	if _, err := handleFetch(context.Background(), NewDecoder(req), enc, se, 0, &Session{}, ServerConfig{}); err != nil {
 		t.Fatalf("handleFetch: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
@@ -178,7 +178,7 @@ func TestFetch_NoLongPollWhenMaxWaitZero(t *testing.T) {
 	start := time.Now()
 	enc := NewEncoder()
 	enc.Int32(1)
-	if _, err := handleFetch(context.Background(), NewDecoder(req), enc, se, 0); err != nil {
+	if _, err := handleFetch(context.Background(), NewDecoder(req), enc, se, 0, &Session{}, ServerConfig{}); err != nil {
 		t.Fatalf("handleFetch: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
@@ -203,7 +203,7 @@ func TestFetch_CapIsBounded(t *testing.T) {
 	start := time.Now()
 	enc := NewEncoder()
 	enc.Int32(1)
-	if _, err := handleFetch(context.Background(), NewDecoder(req), enc, se, 0); err != nil {
+	if _, err := handleFetch(context.Background(), NewDecoder(req), enc, se, 0, &Session{}, ServerConfig{}); err != nil {
 		t.Fatalf("handleFetch: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
@@ -224,7 +224,7 @@ func TestFetch_DataAvailableSkipsWait(t *testing.T) {
 	start := time.Now()
 	enc := NewEncoder()
 	enc.Int32(1)
-	if _, err := handleFetch(context.Background(), NewDecoder(req), enc, se, 0); err != nil {
+	if _, err := handleFetch(context.Background(), NewDecoder(req), enc, se, 0, &Session{}, ServerConfig{}); err != nil {
 		t.Fatalf("handleFetch: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
@@ -259,7 +259,7 @@ func TestFetch_OutOfRangeWaitsForCatchUp(t *testing.T) {
 	start := time.Now()
 	enc := NewEncoder()
 	enc.Int32(1)
-	if _, err := handleFetch(context.Background(), NewDecoder(req), enc, se, 0); err != nil {
+	if _, err := handleFetch(context.Background(), NewDecoder(req), enc, se, 0, &Session{}, ServerConfig{}); err != nil {
 		t.Fatalf("handleFetch: %v", err)
 	}
 	elapsed := time.Since(start)
@@ -294,7 +294,7 @@ func TestFetch_OutOfRangeEventuallyErrors(t *testing.T) {
 	start := time.Now()
 	enc := NewEncoder()
 	enc.Int32(1)
-	if _, err := handleFetch(context.Background(), NewDecoder(req), enc, se, 0); err != nil {
+	if _, err := handleFetch(context.Background(), NewDecoder(req), enc, se, 0, &Session{}, ServerConfig{}); err != nil {
 		t.Fatalf("handleFetch: %v", err)
 	}
 	elapsed := time.Since(start)

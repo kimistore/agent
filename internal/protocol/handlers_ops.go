@@ -26,6 +26,7 @@ import (
 	"log"
 	"time"
 
+	"kimistore/internal/auth"
 	"kimistore/internal/metrics"
 	"kimistore/internal/storage"
 	"kimistore/internal/storage/wal"
@@ -105,7 +106,7 @@ func handleInitProducerId(ctx context.Context, dec *Decoder, enc *Encoder, store
 	return enc.Bytes(), nil
 }
 
-func handleProduce(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16, _ ServerConfig) ([]byte, error) {
+func handleProduce(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16, session *Session, cfg ServerConfig) ([]byte, error) {
 	// Produce Request V3:
 	// TransactionalID (Nullable String)
 	// Acks (int16)
@@ -167,6 +168,18 @@ func handleProduce(ctx context.Context, dec *Decoder, enc *Encoder, store *stora
 	// so the trailing position is the correct one.
 	// ThrottleTimeMs is written after the topic array, once it is known; see
 	// the response schema note below.
+
+	if aclActive(cfg) {
+		topics, err := peekProduceTopics(dec, count)
+		if err != nil {
+			log.Printf("Produce: authorization peek failed: %v", err)
+			return nil, err
+		}
+		if code := authorizeTopics(cfg, session, auth.OpWrite, topics); code != ErrNone {
+			log.Printf("Produce: %s denied Write", session.principal())
+			return refuseProduce(enc, version, topics, code), nil
+		}
+	}
 
 	enc.Int32(count) // Response Topic Count matches Request
 
@@ -358,10 +371,25 @@ func truncateToBlobs(data []byte, n int64) []byte {
 // msgSetHeaderLen is the size of a message set entry header.
 const msgSetHeaderLen = 12
 
-func handleFetch(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
+func handleFetch(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16, session *Session, cfg ServerConfig) ([]byte, error) {
 	req, err := decodeFetch(dec, version)
 	if err != nil {
 		return nil, err
+	}
+
+	// Read is checked against the topics the client asked for. A Fetch for a
+	// topic the caller may not read is refused whole: returning an empty but
+	// successful partition for it would tell the caller the topic exists and is
+	// caught up, which leaks its existence and its emptiness.
+	if aclActive(cfg) {
+		topics, err := peekFetchTopics(dec, version)
+		if err != nil {
+			return nil, err
+		}
+		if code := authorizeTopics(cfg, session, auth.OpRead, topics); code != ErrNone {
+			log.Printf("Fetch: %s denied Read", session.principal())
+			return refuseFetch(enc, version, topics, code), nil
+		}
 	}
 
 	// Long polling. Previously maxWait was discarded and a caught-up consumer

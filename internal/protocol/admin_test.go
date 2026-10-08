@@ -74,7 +74,7 @@ func TestAdminHandlers(t *testing.T) {
 		dec := NewDecoder(reqEnc.Bytes())
 		respEnc := NewEncoder()
 
-		respBytes, err := handleCreateTopics(context.Background(), dec, respEnc, engine, 0)
+		respBytes, err := handleCreateTopics(context.Background(), dec, respEnc, engine, 0, &Session{Authenticated: true, User: "test"}, ServerConfig{})
 		if err != nil {
 			t.Fatalf("Handle error: %v", err)
 		}
@@ -119,7 +119,7 @@ func TestAdminHandlers(t *testing.T) {
 		dec := NewDecoder(reqEnc.Bytes())
 		respEnc := NewEncoder()
 
-		respBytes, err := handleDeleteTopics(context.Background(), dec, respEnc, engine, 0)
+		respBytes, err := handleDeleteTopics(context.Background(), dec, respEnc, engine, 0, &Session{Authenticated: true, User: "test"}, ServerConfig{})
 		if err != nil {
 			t.Fatal(err)
 		}

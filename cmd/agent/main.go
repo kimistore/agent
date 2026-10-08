@@ -173,6 +173,27 @@ func main() {
 		}
 	}
 
+	// Authorization rules live in the bucket like credentials do, so several
+	// agents enforce the same policy. The policy is read once at startup and
+	// refreshed in the background; the request path never touches object
+	// storage.
+	//
+	// A store that fails to read at startup is not fatal. It leaves
+	// authorization off, which is the same as a deployment that never
+	// configured it, rather than refusing every request because the bucket is
+	// briefly unreachable.
+	if aclStore, aerr := auth.NewACLStore(engine); aerr != nil {
+		log.Printf("ACL: store unavailable, authorization not enforced: %v", aerr)
+	} else if rerr := aclStore.Reload(ctx); rerr != nil {
+		log.Printf("ACL: could not read rules, authorization not enforced: %v", rerr)
+	} else if aclStore.Enabled() {
+		authCfg.ACLs = aclStore
+		aclStore.Start(ctx)
+		log.Printf("ACL: %d rule(s) under %s", len(aclStore.Policy().ACLs()), auth.ACLPrefix)
+	} else {
+		log.Printf("ACL: no rules under %s, all requests allowed", auth.ACLPrefix)
+	}
+
 	srv := server.NewServer(cfg.ListenAddr, engine, protocol.ServerConfig{
 		Auth:                 authCfg,
 		AdvertisedHost:       cfg.AdvertisedHost,

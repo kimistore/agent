@@ -98,6 +98,32 @@ func (d *Decoder) Int64() (int64, error) {
 	return val, nil
 }
 
+// SkipN advances past n bytes, reporting an error if there are not that many
+// left. Used where a request carries an opaque length-prefixed payload that a
+// peek only needs to step over.
+func (d *Decoder) SkipN(n int) error {
+	if n < 0 {
+		return errors.New("skip: negative length")
+	}
+	if d.off+n > len(d.data) {
+		return errors.New("skip: past end of buffer")
+	}
+	d.off += n
+	return nil
+}
+
+// Clone returns a decoder reading from the same position, without advancing this
+// one.
+//
+// Authorization has to look at the topics in a request before the handler
+// answers it, and a Produce request can only be walked once. Cloning lets the
+// check read the topic names and the handler then decode the request normally,
+// instead of either buffering the whole request twice or doing the check after
+// the response has already begun.
+func (d *Decoder) Clone() *Decoder {
+	return &Decoder{data: d.data, off: d.off}
+}
+
 func (d *Decoder) Bytes() ([]byte, error) {
 	lenVal, err := d.Int32()
 	if err != nil {

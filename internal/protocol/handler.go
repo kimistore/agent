@@ -74,6 +74,7 @@ const (
 	ErrInvalidProducerEpoch       = 47
 	ErrUnknownProducerID          = 59
 	ErrFencedInstanceID           = 78
+	ErrTopicAuthorizationFailed   = 29
 	ErrGroupAuthorizationFailed   = 30
 	ErrClusterAuthorizationFailed = 31
 	ErrUnsupportedVersion         = 35
@@ -164,6 +165,10 @@ type AuthConfig struct {
 	// which has no SASL credentials at all -- it would start rejecting
 	// everything. The caller sets this only after confirming credentials exist.
 	SCRAMEnabled bool
+
+	// ACLs holds the authorization rules. Nil, or a store with no rules, means
+	// no authorization at all and every request is allowed.
+	ACLs *auth.ACLStore
 }
 
 // Mechanisms returns the SASL mechanisms this broker will serve, in the order
@@ -493,15 +498,15 @@ func HandleRequest(ctx context.Context, data []byte, store *storage.StorageEngin
 	case ApiKeySaslAuthenticate:
 		resp, errProc = handleSaslAuthenticate(ctx, dec, enc, apiVersion, session, cfg)
 	case ApiKeyProduce:
-		resp, errProc = handleProduce(ctx, dec, enc, store, apiVersion, cfg)
+		resp, errProc = handleProduce(ctx, dec, enc, store, apiVersion, session, cfg)
 	case ApiKeyFetch:
-		resp, errProc = handleFetch(ctx, dec, enc, store, apiVersion)
+		resp, errProc = handleFetch(ctx, dec, enc, store, apiVersion, session, cfg)
 	case ApiKeyListOffsets:
 		resp, errProc = handleListOffsets(ctx, dec, enc, store, apiVersion)
 	case ApiKeyApiVersions:
 		resp, errProc = handleApiVersions(dec, enc, apiVersion, cfg)
 	case ApiKeyMetadata:
-		resp, errProc = handleMetadata(ctx, dec, enc, store, apiVersion, cfg)
+		resp, errProc = handleMetadata(ctx, dec, enc, store, apiVersion, session, cfg)
 	case ApiKeyFindCoordinator:
 		resp, errProc = handleFindCoordinator(ctx, dec, enc, store, apiVersion, cfg)
 	case ApiKeyJoinGroup:
@@ -517,9 +522,9 @@ func HandleRequest(ctx context.Context, data []byte, store *storage.StorageEngin
 	case ApiKeyOffsetFetch:
 		resp, errProc = handleOffsetFetch(dec, enc, store, apiVersion)
 	case ApiKeyCreateTopics:
-		resp, errProc = handleCreateTopics(ctx, dec, enc, store, apiVersion)
+		resp, errProc = handleCreateTopics(ctx, dec, enc, store, apiVersion, session, cfg)
 	case ApiKeyDeleteTopics:
-		resp, errProc = handleDeleteTopics(ctx, dec, enc, store, apiVersion)
+		resp, errProc = handleDeleteTopics(ctx, dec, enc, store, apiVersion, session, cfg)
 	case ApiKeyListGroups:
 		resp, errProc = handleListGroups(dec, enc, store, apiVersion)
 	case ApiKeyDescribeGroups:
@@ -972,7 +977,7 @@ func handleApiVersions(dec *Decoder, enc *Encoder, version int16, cfg ServerConf
 	return enc.Bytes(), nil
 }
 
-func handleMetadata(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16, cfg ServerConfig) ([]byte, error) {
+func handleMetadata(ctx context.Context, dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16, session *Session, cfg ServerConfig) ([]byte, error) {
 	// Metadata Request V0-V8:
 	//   V0-V5: Topics (array of string). An empty array means "all topics".
 	//   V6:    adds allow_auto_topic_creation (boolean, one byte).
@@ -1070,6 +1075,15 @@ func handleMetadata(ctx context.Context, dec *Decoder, enc *Encoder, store *stor
 	// whose partitions are split across agents has to be described in full by
 	// every agent, or a client that hashed a key onto a partition it cannot see
 	// has nowhere to send it.
+	// Describe is NOT enforced yet. A refused Metadata request has to be a
+	// complete, parseable MetadataResponse: brokers array, cluster_id and
+	// controller_id all precede the topic array, so a refusal that only wrote
+	// topics leaves the client reading the topic count as a broker count. It
+	// then retries metadata forever and the caller sees a timeout rather than
+	// an authorisation error, which is worse than not enforcing it. Until that
+	// response is written correctly, Describe is unrestricted here and the data
+	// plane (Produce/Fetch) is what actually gates access.
+
 	allTopics := routing.Topics()
 	topicsToReturn := requestedTopics
 	if count <= 0 {

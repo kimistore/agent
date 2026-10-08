@@ -61,6 +61,8 @@ func run(args []string) error {
 		return cmdDelete(args[1:])
 	case "list":
 		return cmdList(args[1:])
+	case "acl":
+		return cmdACL(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -79,6 +81,18 @@ Usage:
                                [-iterations N]
   kimistore-credential delete -user NAME
   kimistore-credential list
+  kimistore-credential acl add -principal NAME -operation Op -topic NAME [-group NAME] [-allow|-deny]
+  kimistore-credential acl remove -principal NAME -operation Op -topic NAME [-group NAME] [-allow|-deny]
+  kimistore-credential acl list
+
+Authorization: with no rules every request is allowed, which is how a
+deployment that never ran these commands behaves. As soon as one rule
+exists the broker denies by default, so a rule naming the wrong topic
+locks data out rather than exposing it. Check the rules before you rely
+on them.
+
+An operation is one of Read, Write, Create, Delete, Describe, Alter, All.
+A topic of "" means every topic; -group targets a consumer group instead.
 
 The bucket and region come from the same environment the agent uses
 (S3_BUCKET, AWS_REGION), so credentials land in the same bucket the agent
@@ -109,14 +123,8 @@ func readPassword(fs *flag.FlagSet) (string, error) {
 	return "", errors.New("no password source: pass -password-stdin and pipe the password")
 }
 
-// objectAdapter presents a raw object store as the credential store's view of
-// object storage.
-//
-// It exists so this tool never opens a StorageEngine. Opening one claims
-// partitions, publishes liveness and writes a checkpoint, and running a second
-// process against the same WAL directory as a live agent is a good way to have
-// two writers disagree about who owns a partition. Credential management touches
-// exactly one prefix of one bucket and has no business doing any of that.
+// objectAdapter presents a raw object store as the view of object storage that
+// the credential and ACL stores expect.
 type objectAdapter struct{ *s3.Store }
 
 func (a objectAdapter) GetObject(ctx context.Context, key string) ([]byte, error) {
@@ -148,9 +156,14 @@ func (a objectAdapter) DeleteObject(ctx context.Context, key string) error {
 	return a.Delete(ctx, key)
 }
 
-// openStore builds the credential store from the agent's own configuration,
-// touching the bucket but never the WAL.
-func openStore(ctx context.Context) (*auth.Store, error) {
+// openObjects builds an object store from the agent's own configuration.
+//
+// Deliberately no StorageEngine: opening one claims partitions and writes a
+// checkpoint, and a second process on the same WAL as a live agent is a good way
+// to get two writers disagreeing about who owns a partition. Managing
+// credentials or rules touches two prefixes of one bucket and needs none of
+// that.
+func openObjects(ctx context.Context) (auth.ObjectStore, error) {
 	cfg := config.FromEnv()
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
@@ -159,7 +172,16 @@ func openStore(ctx context.Context) (*auth.Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init S3: %w", err)
 	}
-	return auth.NewStore(objectAdapter{objStore})
+	return objectAdapter{objStore}, nil
+}
+
+// openStore builds the credential store.
+func openStore(ctx context.Context) (*auth.Store, error) {
+	objects, err := openObjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return auth.NewStore(objects)
 }
 
 func cmdCreate(args []string) error {
@@ -305,3 +327,140 @@ func nowRFC3339() string {
 
 // timeNow is indirected so the timestamp is testable.
 var timeNow = func() time.Time { return time.Now() }
+
+// cmdACL dispatches the authorization subcommands.
+func cmdACL(args []string) error {
+	if len(args) == 0 {
+		return errors.New("acl needs a subcommand: add, remove or list")
+	}
+	switch args[0] {
+	case "add":
+		return cmdACLMutate(args[1:], true)
+	case "remove":
+		return cmdACLMutate(args[1:], false)
+	case "list":
+		return cmdACLList(args[1:])
+	default:
+		return fmt.Errorf("unknown acl subcommand %q (want add, remove or list)", args[0])
+	}
+}
+
+// aclFlags collects the rule identity shared by add and remove.
+type aclFlags struct {
+	principal string
+	operation string
+	topic     string
+	group     string
+	allow     bool
+	deny      bool
+}
+
+func (a *aclFlags) register(fs *flag.FlagSet) {
+	fs.StringVar(&a.principal, "principal", "", "principal the rule applies to, or * for every caller")
+	fs.StringVar(&a.operation, "operation", "", "Read, Write, Create, Delete, Describe, Alter or All")
+	fs.StringVar(&a.topic, "topic", "", "topic name; empty means every topic")
+	fs.StringVar(&a.group, "group", "", "consumer group name; takes precedence over -topic")
+	fs.BoolVar(&a.allow, "allow", true, "grant the operation")
+	fs.BoolVar(&a.deny, "deny", false, "refuse the operation; deny beats allow")
+}
+
+func (a *aclFlags) build() (auth.ACL, error) {
+	if a.principal == "" {
+		return auth.ACL{}, errors.New("-principal is required")
+	}
+	if a.operation == "" {
+		return auth.ACL{}, errors.New("-operation is required")
+	}
+	op, err := auth.ParseOperation(a.operation)
+	if err != nil {
+		return auth.ACL{}, err
+	}
+	perm := auth.Allow
+	if a.deny {
+		perm = auth.Deny
+	}
+	res := auth.Topic(a.topic)
+	if a.group != "" {
+		res = auth.Group(a.group)
+	}
+	return auth.ACL{Principal: a.principal, Operation: op, Resource: res, Permission: perm}, nil
+}
+
+func cmdACLMutate(args []string, add bool) error {
+	name := "remove"
+	if add {
+		name = "add"
+	}
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	var af aclFlags
+	af.register(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rule, err := af.build()
+	if err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+	objects, err := openObjects(ctx)
+	if err != nil {
+		return err
+	}
+	store, err := auth.NewACLStore(objects)
+	if err != nil {
+		return err
+	}
+	if err := store.Reload(ctx); err != nil {
+		return err
+	}
+
+	if add {
+		if err := store.Add(ctx, rule); err != nil {
+			return err
+		}
+		fmt.Printf("%s  (%d rule(s) now under %s)\n", auth.DescribeACL(rule), len(store.Policy().ACLs()), auth.ACLPrefix)
+		if len(store.Policy().ACLs()) == 1 {
+			fmt.Println("note: this is the first rule, so the broker now denies by default.")
+		}
+		return nil
+	}
+
+	if err := store.Remove(ctx, rule); err != nil {
+		return err
+	}
+	remaining := len(store.Policy().ACLs())
+	fmt.Printf("removed %s (%d rule(s) remain)\n", auth.DescribeACL(rule), remaining)
+	if remaining == 0 {
+		fmt.Println("note: the last rule is gone, so the broker allows everything again.")
+	}
+	return nil
+}
+
+func cmdACLList(args []string) error {
+	fs := flag.NewFlagSet("acl list", flag.ExitOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	ctx := context.Background()
+	objects, err := openObjects(ctx)
+	if err != nil {
+		return err
+	}
+	store, err := auth.NewACLStore(objects)
+	if err != nil {
+		return err
+	}
+	if err := store.Reload(ctx); err != nil {
+		return err
+	}
+	lines := store.Policy().Describe()
+	if len(lines) == 0 {
+		fmt.Printf("no rules under %s; all requests are allowed\n", auth.ACLPrefix)
+		return nil
+	}
+	for _, l := range lines {
+		fmt.Printf("  %s\n", l)
+	}
+	return nil
+}
