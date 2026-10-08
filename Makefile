@@ -12,12 +12,25 @@ BIN_DIR    := bin
 COVER_OUT  := coverage.out
 COVER_HTML := coverage.html
 
-# -timeout guards against a hung test rather than letting CI sit until the job
-# limit; the storage tests deliberately exercise bounded shutdown paths.
-TEST_FLAGS := -count=1 -timeout 300s
+  # -timeout guards against a hung test rather than letting CI sit until the job
+  # limit; the storage tests deliberately exercise bounded shutdown paths.
+  TEST_FLAGS := -count=1 -timeout 300s
 
-GO       ?= go
-GOFILES  := $(shell find . -name '*.go' -not -path './.git/*')
+  # Build stamps. VERSION comes from the git tag so that a release and a local
+  # build share one source of truth. A dirty tree appends -dirty, because a
+  # binary built from uncommitted source is not the tagged release no matter
+  # what the tag says.
+  VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+  COMMIT     ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+  BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+  VERSION_PKG := kimistore/internal/version
+  LDFLAGS   := -s -w \
+                -X '$(VERSION_PKG).Version=$(VERSION)' \
+                -X '$(VERSION_PKG).Commit=$(COMMIT)' \
+                -X '$(VERSION_PKG).Date=$(BUILD_DATE)'
+
+  GO       ?= go
+  GOFILES  := $(shell find . -name '*.go' -not -path './.git/*')
 
 .PHONY: help
 help: ## Show this help
@@ -28,12 +41,36 @@ help: ## Show this help
 
 .PHONY: build
 build: ## Build the agent binary
-	$(GO) build -o $(AGENT) ./cmd/agent
+	$(GO) build -ldflags "$(LDFLAGS)" -o $(AGENT) ./cmd/agent
+
+.PHONY: version
+version: ## Print the build stamp this tree would produce
+	@echo "VERSION=$(VERSION)"
+	@echo "COMMIT=$(COMMIT)"
+	@echo "DATE=$(BUILD_DATE)"
+
+# The two architectures that matter: arm64 for the Raspberry Pi nodes, amd64 for
+# any x86 peer. Release artefacts use the same list, so a binary built here
+# matches one built by the workflow.
+.PHONY: release-build
+release-build: ## Build the release binaries for linux/arm64 and linux/amd64
+	@mkdir -p $(BIN_DIR)
+	@for arch in arm64 amd64; do \
+	  echo "  building linux/$$arch"; \
+	  CGO_ENABLED=0 GOOS=linux GOARCH=$$arch \
+	    $(GO) build -ldflags "$(LDFLAGS)" \
+	      -o $(BIN_DIR)/kimistore-$$arch ./cmd/agent || exit 1; \
+	  CGO_ENABLED=0 GOOS=linux GOARCH=$$arch \
+	    $(GO) build -ldflags "$(LDFLAGS)" \
+	      -o $(BIN_DIR)/kimistore-credential-$$arch ./cmd/credential || exit 1; \
+	done
+	@cd $(BIN_DIR) && sha256sum kimistore-* > SHA256SUMS
+	@echo "  checksums in $(BIN_DIR)/SHA256SUMS"
 
 .PHONY: build-tools
 build-tools: ## Build the benchmark and load-test tools
-	$(GO) build -o $(BIN_DIR)/benchmark ./cmd/benchmark
-	$(GO) build -o $(BIN_DIR)/load-test ./cmd/load-test
+	$(GO) build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/benchmark ./cmd/benchmark
+	$(GO) build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/load-test ./cmd/load-test
 
 .PHONY: run
 run: build ## Build and run the agent

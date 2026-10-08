@@ -21,6 +21,8 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -35,12 +37,25 @@ import (
 	"kimistore/internal/server"
 	"kimistore/internal/storage"
 	"kimistore/internal/storage/s3"
+	"kimistore/internal/version"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// versionFlag prints the build and exits. The flag is checked before any
+// configuration or storage setup so that "what version is this" needs neither
+// a valid environment nor a reachable object store.
+var versionFlag = flag.Bool("version", false, "Print the build version and exit")
+
 func main() {
+	flag.Parse()
+	if *versionFlag {
+		fmt.Println(version.String())
+		return
+	}
+
 	log.Println("Starting Kimistore Agent...")
+	log.Println(version.Line())
 
 	// Setup Storage
 	ctx := context.Background()

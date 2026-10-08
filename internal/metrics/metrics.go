@@ -22,6 +22,8 @@ import (
 	"strconv"
 	"time"
 
+	"kimistore/internal/version"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -314,6 +316,9 @@ var (
 	// These will be registered manually via callbacks
 	TopicCount     prometheus.GaugeFunc
 	PartitionCount prometheus.GaugeFunc
+
+	// BuildInfo carries the build stamp as labels with a constant value of 1.
+	BuildInfo *prometheus.GaugeVec
 )
 
 // Init initializes functional metrics that rely on callbacks to other systems
@@ -327,6 +332,22 @@ func Init(topicCountFn func() float64, partitionCountFn func() float64) {
 		Name: "kimistore_partition_total_count",
 		Help: "Total number of partitions",
 	}, partitionCountFn)
+
+	// Build info, following the Prometheus convention: a constant value of 1
+	// carrying the version and commit as labels. A gauge rather than an
+	// info-style metric because this agent does not register a custom
+	// collector, and the label form is what dashboards and alert queries
+	// already expect.
+	BuildInfo = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "kimistore_build_info",
+		Help: "Build information; the value is always 1",
+	}, []string{"version", "commit", "date"})
+
+	BuildInfo.With(prometheus.Labels{
+		"version": version.Version,
+		"commit":  version.Commit,
+		"date":    version.Date,
+	}).Set(1)
 }
 
 // Helpers
