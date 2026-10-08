@@ -284,6 +284,15 @@ var (
 		Help: "Handovers that kept their claim because the partition's tail was not safe to release",
 	})
 
+	// ManifestWritesRejected counts partition manifests this agent declined to
+	// write because the object store says the claim moved. A non-zero rate means
+	// two agents believed they owned the same partition, which is the condition
+	// the epoch in the segment key mitigates but does not close.
+	ManifestWritesRejected = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_manifest_writes_rejected_total",
+		Help: "Partition manifests not written because the ownership claim was no longer held",
+	})
+
 	HandoverSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "kimistore_handover_seconds",
 		Help:    "Wall time to hand a partition over, from seal to released claim",

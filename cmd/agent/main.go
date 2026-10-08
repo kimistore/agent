@@ -257,6 +257,21 @@ func main() {
 	if err := metricsSrv.Close(); err != nil {
 		log.Printf("Error stopping metrics server: %v", err)
 	}
+	// Hand the partitions over before closing the engine.
+	//
+	// This is what turns an orderly shutdown from a recovery into a handover.
+	// Without it, Close releases the claims in bulk and the next owner has to
+	// reconcile its position against object storage from scratch, where any gap
+	// in that reconciliation costs records. With it, each partition is sealed,
+	// made durable, recorded, and released in that order, so the successor
+	// starts from a written position instead of an inferred one.
+	//
+	// A drain failure is logged and not fatal. The partitions that failed keep
+	// their claims and expire on their own schedule, which is a slower recovery
+	// rather than a lossy one, so there is nothing useful to retry here.
+	if _, err := engine.DrainOwned(context.Background(), storage.DrainShutdownBudget); err != nil {
+		log.Printf("Drain finished with errors; claims kept where the tail was not durable: %v", err)
+	}
 	if err := engine.Close(); err != nil {
 		log.Printf("Error closing storage engine: %v", err)
 	}

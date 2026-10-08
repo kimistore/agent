@@ -1842,6 +1842,20 @@ func (s *StorageEngine) markManifestDirty(topic string, partition int32) {
 	s.manifestMu.Unlock()
 }
 
+// clearManifestDirty drops the mark for one partition, leaving its siblings
+// alone.
+//
+// forgetManifestDirty takes a topic and clears every partition under it, which
+// is right for a deleted topic and wrong here: a save rejected because the
+// claim moved must not discard the pending marks of partitions this agent still
+// owns.
+func (s *StorageEngine) clearManifestDirty(topic string, partition int32) {
+	key := topic + "/" + strconv.Itoa(int(partition))
+	s.manifestMu.Lock()
+	delete(s.manifestDirty, key)
+	s.manifestMu.Unlock()
+}
+
 // forgetManifestDirty drops every pending mark for a topic. A deleted
 // partition is gone from the snapshot, so a mark left behind would never be
 // written and never be cleared.

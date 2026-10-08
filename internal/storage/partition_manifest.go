@@ -27,6 +27,8 @@ import (
 	"log"
 	"strconv"
 	"strings"
+
+	"kimistore/internal/metrics"
 )
 
 // The durable log position used to live in one bucket-global object,
@@ -145,6 +147,28 @@ func (s *StorageEngine) savePartitionManifests(ctx context.Context) error {
 			// the real owner would then read a position it did not write.
 			if s.ownership != nil && !s.ownership.Owns(topic, pid) {
 				continue
+			}
+
+			// The check above is a local belief, and a local belief goes stale:
+			// the claim can be taken the instant it ages out, and this agent
+			// learns of it at its next renewal, up to a third of a TTL later.
+			// The manifest is an unconditional PUT, so a stale writer that
+			// skipped this would overwrite the new owner's record with its own
+			// lower epoch and log end.
+			//
+			// Asking the store costs one read per dirty partition per save. The
+			// save runs on a 30-second timer, not on the append path, so the
+			// read is affordable and the alternative is two writers.
+			if s.ownership != nil && s.ownership.fenced {
+				if err := s.ownership.verifyClaim(ctx, topic, pid); err != nil {
+					log.Printf("Manifest: not writing %s/%d: %v", topic, pid, err)
+					metrics.ManifestWritesRejected.Inc()
+					// Drop it from the dirty set too: it is no longer ours to
+					// write, so retrying on the next tick would fail the same
+					// way for as long as this agent runs.
+					s.clearManifestDirty(topic, pid)
+					continue
+				}
 			}
 
 			segments := ps.Segments

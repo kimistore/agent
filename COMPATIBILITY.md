@@ -282,14 +282,32 @@ See "Authorization" in the [`README.md`](README.md) for the rule syntax and the
   `KIMISTORE_REQUIRE_LEASE=false` downgrades the fence to a startup warning.
   `KIMISTORE_PARTITION_OWNERSHIP=false` reverts to one bucket-wide claim that
   refuses a second agent outright.
-* **Clients are routed to the agent that owns a partition.** `Metadata` reports
-  every live agent and names each partition's leader, so a client writes to and
-  reads from the agent holding it. A partition whose owner is gone is reported as
-  `LEADER_NOT_AVAILABLE`, and a `Fetch` or `ListOffsets` for a partition this
-  broker does not own is refused -- an agent that does not own a partition cannot
-  know its log end offset, so any answer it gave would be a guess. `Metadata` is
-  advertised up to v7, which is the only version past v6 that is not flexible; it
-  adds `LeaderEpoch`, so a client can detect a leader change.
+  * **Clients are routed to the agent that owns a partition.** `Metadata` reports
+    every live agent and names each partition's leader, so a client writes to and
+    reads from the agent holding it. A partition whose owner is gone is reported as
+    `LEADER_NOT_AVAILABLE`, and a `Fetch` or `ListOffsets` for a partition this
+    broker does not own is refused -- an agent that does not own a partition cannot
+    know its log end offset, so any answer it gave would be a guess. `Metadata` is
+    advertised up to v7, which is the only version past v6 that is not flexible; it
+    adds `LeaderEpoch`, so a client can detect a leader change.
+  * **An orderly shutdown hands the partitions over.** On `SIGTERM` the agent stops
+    accepting, then for each partition it owns: seals the active segment, waits until
+    the durable frontier covers the log end, writes the partition manifest, and only
+    then releases the claim. The order is load-bearing, because the claim is gone the
+    moment it is released. A partition whose tail cannot be made durable within the
+    budget *keeps* its claim and lets it expire, so a slow object store produces a
+    slower failover rather than lost records. The whole run is bounded by a 25 second
+    deadline, so set the container grace period above that. A `SIGKILL` skips all of
+    this: the claims are released in bulk and the next owner recovers by reconciling
+    against object storage.
+  * **The manifest write is fenced against the object store.** Before writing a
+    partition manifest the agent re-reads its claim rather than trusting its local
+    view, because the manifest is an unconditional put and a stale writer would
+    otherwise overwrite the new owner's epoch and log end with its own. A refused
+    write increments `kimistore_manifest_writes_rejected_total` and drops the
+    partition from the pending set. The append path itself still trusts the local
+    view, which refreshes every third of the claim time to live, so an agent that has
+    lost a claim can accept writes briefly before it notices.
 * **Groups are coordinated by one agent, and it is checked.** `FindCoordinator`
   picks the agent by rendezvous hashing of the group id over the live set, and
   `JoinGroup`, `SyncGroup` and `Heartbeat` answer `NOT_COORDINATOR` on any agent

@@ -441,7 +441,9 @@ The agent has the following limits.
 
 - The agent has no replication. A failover costs a degraded read path until a peer claims the partition.
 - The claim time to live is the failover window.
-- `DrainPartition` has no runtime trigger. A partition moves only when the agent crashes or shuts down.
+- A `SIGTERM` drains the partitions first. The agent seals each segment, waits for object storage, writes the manifest, and releases the claim in that order. A partition whose tail is not durable keeps its claim. It expires on its own schedule, which is a slower failover rather than a lossy one. Set the container grace period above 25 seconds, which is the `DrainShutdownBudget`.
+- A `SIGKILL` drains nothing. The agent releases its claims in bulk and the next owner reconciles its position from object storage. Set the ownership time to live as low as the object store tolerates, because it sets the crash failover window.
+- The write path trusts a local view of the claim. An agent that loses the claim keeps accepting writes until its next renewal, up to a third of the claim time to live. Durable state it writes in that window is fenced against the object store, so it cannot corrupt the new owner.
 - The agent acknowledges a consumer offset before it stores the offset.
 - The agent does not fence `OffsetCommit` and `OffsetFetch` to the group coordinator.
 - Idempotent producer state does not survive a move to another machine.

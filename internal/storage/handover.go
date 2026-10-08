@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"time"
 
 	"kimistore/internal/metrics"
@@ -213,6 +215,140 @@ func (s *StorageEngine) DrainPartitions(ctx context.Context, refs []PartitionRef
 	}
 	return out, nil
 }
+
+// OwnedPartitionRefs lists the partitions this agent currently holds a claim on,
+// as PartitionRef values suitable for DrainPartition.
+//
+// OwnedPartitions reports keys of the form "topic/partition". This parses them,
+// so the two cannot disagree about what "owned" means.
+//
+// The list comes from the local view, so a partition whose claim has moved may
+// still appear. DrainOwned asks the object store before acting on any of them.
+func (s *StorageEngine) OwnedPartitionRefs() ([]PartitionRef, error) {
+	keys := s.OwnedPartitions()
+	out := make([]PartitionRef, 0, len(keys))
+	for _, key := range keys {
+		topic, partition, err := splitOwnedPartitionKey(key)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, PartitionRef{Topic: topic, Partition: partition})
+	}
+	return out, nil
+}
+
+// splitOwnedPartitionKey reads a "topic/partition" ownership key.
+//
+// The split takes the last slash rather than the first. A topic name may contain
+// a slash, and splitting on the first one would read "a/b/2" as topic "a" and
+// partition 0 rather than the 2.
+func splitOwnedPartitionKey(key string) (string, int32, error) {
+	topic, part, ok := strings.Cut(key, "/")
+	if !ok {
+		return "", 0, fmt.Errorf("owned partition key %q is not topic/partition", key)
+	}
+	// A topic with a slash in it leaves more segments after the first cut, so
+	// rejoin everything before the final segment.
+	if idx := strings.LastIndex(key, "/"); idx != len(topic) {
+		topic = key[:idx]
+		part = key[idx+1:]
+	}
+	pid, err := strconv.Atoi(part)
+	if err != nil {
+		return "", 0, fmt.Errorf("owned partition key %q has a non-numeric partition: %w", key, err)
+	}
+	return topic, int32(pid), nil
+}
+
+// DrainOwned hands over every partition this agent owns, and is the call a
+// SIGTERM handler should make.
+//
+// It differs from DrainPartitions in two ways that matter during shutdown. It
+// does not stop at the first failure, because one partition with a slow tail
+// must not strand the claims on all the others; the process is leaving either
+// way, and every claim it keeps costs the cluster a full TTL. And a partition
+// that could not be handed over safely is left held rather than released, so
+// the claim expires on its own schedule instead of being handed to another agent
+// while its tail is still local-only.
+//
+// The returned error joins every failure, so a caller can report the count
+// without losing the individual reasons.
+func (s *StorageEngine) DrainOwned(ctx context.Context, budget time.Duration) ([]HandoverReport, error) {
+	refs, err := s.OwnedPartitionRefs()
+	if err != nil {
+		return nil, err
+	}
+	if len(refs) == 0 {
+		return nil, nil
+	}
+
+	if budget <= 0 {
+		budget = DrainShutdownBudget
+	}
+	log.Printf("Draining %d owned partition(s) before shutdown, budget %s", len(refs), budget)
+
+	// The deadline is enforced by the context rather than by summing per-partition
+	// budgets. Dividing a budget across N partitions does not bound the total once
+	// the per-partition share falls under a second: the floor that keeps each
+	// attempt meaningful then makes the run as long as N seconds, and a process
+	// killed mid-drain loses the seal it was attempting.
+	//
+	// So the context is the hard bound and the per-partition budget is advisory,
+	// derived from what is actually left.
+	deadline := time.Now().Add(budget)
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
+	reports := make([]HandoverReport, 0, len(refs))
+	var errs []error
+	released, kept := 0, 0
+
+	for _, ref := range refs {
+		left := time.Until(deadline)
+		if left <= 0 {
+			errs = append(errs, fmt.Errorf("%s/%d: not attempted, the drain budget ran out", ref.Topic, ref.Partition))
+			kept++
+			continue
+		}
+
+		// At least a second per attempt, but never more than the time that is
+		// left. DrainPartition substitutes its own default for a non-positive
+		// budget, which is 30 seconds and would ignore the deadline entirely.
+		share := left / time.Duration(len(refs)-len(reports))
+		if share < time.Second {
+			share = time.Second
+		}
+		if share > left {
+			share = left
+		}
+
+		report, drainErr := s.DrainPartition(ctx, ref.Topic, ref.Partition, share)
+		reports = append(reports, report)
+		if drainErr != nil {
+			errs = append(errs, fmt.Errorf("%s/%d: %w", ref.Topic, ref.Partition, drainErr))
+			kept++
+			continue
+		}
+		released++
+	}
+
+	summary := fmt.Sprintf("drained %d of %d partition(s); %d kept their claim", released, len(refs), kept)
+	if len(errs) == 0 {
+		log.Printf("Drain: %s", summary)
+		return reports, nil
+	}
+
+	log.Printf("Drain: %s", summary)
+	return reports, errors.Join(errs...)
+}
+
+// DrainShutdownBudget bounds the whole shutdown drain.
+//
+// It has to cover the slowest partition upload plus its manifest write, and it
+// has to sit inside whatever grace period the supervisor gives the process. A
+// budget larger than the grace period is worse than a small one, because the
+// process is killed mid-drain and loses the seal it was attempting.
+const DrainShutdownBudget = 25 * time.Second
 
 // PartitionRef names one partition to hand over.
 type PartitionRef struct {
