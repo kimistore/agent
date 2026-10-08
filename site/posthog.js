@@ -122,6 +122,11 @@
     // Pageviews and pageleaves are the point of the site. Both stay on.
     capture_pageview: true,
     capture_pageleave: true,
+    // Bounce rate is computed from $pageview, $pageleave, and autocaptured
+    // events together, so autocapture is a requirement rather than a nicety.
+    // It is on by default, but stated here so the requirement is visible and
+    // cannot regress if a default changes.
+    autocapture: true,
     // Session recording stays off. The site has no form and no account, so a
     // recording adds cost and privacy exposure without answering a question
     // this site needs answered. Turn it on in PostHog project settings rather
