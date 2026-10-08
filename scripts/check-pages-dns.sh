@@ -64,10 +64,11 @@ done
 # Extra addresses are not automatically wrong, but they send traffic to
 # whatever else claims the name, so they are worth surfacing.
 for ip in "${got_a[@]:-}"; do
-  case "${want_a[@]:-}" in
-    *" $ip "*) ;;
-    *) [[ -n "$ip" ]] && note "A $ip" "unexpected extra address" ;;
-  esac
+  [[ -z "$ip" ]] && continue
+  if printf '%s\n' "${want_a[@]:-}" | grep -qx "$ip"; then
+    continue
+  fi
+  note "A $ip" "unexpected extra address"
 done
 
 cname=$(resolver "$WWW" CNAME -t CNAME | head -1)
