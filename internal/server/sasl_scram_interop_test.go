@@ -106,8 +106,26 @@ func (m *memoryStore) Delete(_ context.Context, key string) error {
 	return nil
 }
 
-func (m *memoryStore) GetRange(context.Context, string, int64, int64) (io.ReadCloser, error) {
-	return nil, errors.New("unsupported")
+// GetRange serves a byte range, which is how the broker reads records out of
+// object storage. Returning "unsupported" here is worse than it sounds: the
+// fetch handler turns any read error into OffsetOutOfRange, so a consumer is
+// sent back to reset its offset and retries forever. That presented as "this
+// broker cannot be consumed from", which is not true.
+func (m *memoryStore) GetRange(_ context.Context, key string, start, length int64) (io.ReadCloser, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.data[key]
+	if !ok {
+		return nil, errors.New("not found")
+	}
+	if start < 0 || start >= int64(len(b)) {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	end := int64(len(b))
+	if length > 0 && start+length < end {
+		end = start + length
+	}
+	return io.NopCloser(bytes.NewReader(b[start:end])), nil
 }
 
 // applyAddr points the advertised listener at the address the test broker
@@ -307,31 +325,56 @@ func TestSCRAM_Interop_MechanismNotOffered(t *testing.T) {
 	}
 }
 
-// TestSCRAM_Interop_ProduceOverAuthenticatedConnection proves the connection is
-// not merely authenticated but usable, which is the whole point of SASL: it
-// gates real traffic, and a broker that authenticated and then refused writes
+// TestSCRAM_Interop_ProduceFetchRoundTrip proves the connection is not merely
+// authenticated but usable in both directions, which is the point of SASL: it
+// gates real traffic, and a broker that authenticated and then could not read
 // would be no better than one that refused everything.
-//
-// It deliberately asserts on produce only. A raw kgo consumer cannot read back
-// from this broker in-process -- verified with the same test and no
-// authentication at all, so it is not a SCRAM problem and not this test's to fix.
-// The consumer side is exercised end to end by test/mimir-e2e.sh, where Mimir
-// reads the log through the broker's own path.
-func TestSCRAM_Interop_ProduceOverAuthenticatedConnection(t *testing.T) {
+func TestSCRAM_Interop_ProduceFetchRoundTrip(t *testing.T) {
 	addr := scramBroker(t, "alice", "s3cret", []string{auth.MechanismSCRAMSHA256})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	cl, err := connect(t, addr, scram.Auth{User: "alice", Pass: "s3cret"}.AsSha256Mechanism())
+	// Deliberately no Ping first: ProduceSync cannot succeed without an
+	// authenticated connection, so it proves authentication and usability
+	// together.
+	producer, err := connect(t, addr, scram.Auth{User: "alice", Pass: "s3cret"}.AsSha256Mechanism())
 	if err != nil {
-		t.Fatalf("new client: %v", err)
+		t.Fatalf("new producer: %v", err)
 	}
-	defer cl.Close()
+	defer producer.Close()
 
-	// No Ping first: ProduceSync cannot succeed without an authenticated
-	// connection, so it proves authentication and usability together.
-	if err := cl.ProduceSync(ctx, &kgo.Record{Topic: "interop", Value: []byte("hello over SCRAM")}).FirstErr(); err != nil {
+	const topic = "interop"
+	if err := producer.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("hello over SCRAM")}).FirstErr(); err != nil {
 		t.Fatalf("produce over an authenticated connection: %v", err)
+	}
+
+	// A separate consumer, so the read path is authenticated too.
+	consumer, err := kgo.NewClient(
+		kgo.SeedBrokers(addr),
+		kgo.SASL(scram.Auth{User: "alice", Pass: "s3cret"}.AsSha256Mechanism()),
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.RetryTimeout(5*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("new consumer: %v", err)
+	}
+	defer consumer.Close()
+
+	fetches := consumer.PollFetches(ctx)
+	if fetches.IsClientClosed() {
+		t.Fatal("consumer closed before any fetch")
+	}
+	if err := fetches.Err(); err != nil {
+		t.Fatalf("fetch over an authenticated connection: %v", err)
+	}
+	var got []kgo.Record
+	fetches.EachRecord(func(r *kgo.Record) { got = append(got, *r) })
+	if len(got) == 0 {
+		t.Fatal("no record came back over the authenticated connection")
+	}
+	if string(got[0].Value) != "hello over SCRAM" {
+		t.Errorf("value = %q, want %q", got[0].Value, "hello over SCRAM")
 	}
 }
 
