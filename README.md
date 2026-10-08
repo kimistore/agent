@@ -285,6 +285,8 @@ not allow every request because the bucket was briefly unreachable.
 
 The agent implements the following APIs.
 
+| API | Key | Versions | Purpose |
+| --- | --- | --- | --- |
 | `Produce` | 0 | V0-V3 | Send records. |
 | `Fetch` | 1 | V0-V5 | Read records. |
 | `ListOffsets` | 2 | V0-V2 | Get the earliest and latest offsets. |
@@ -299,11 +301,14 @@ The agent implements the following APIs.
 | `DescribeGroups` | 15 | V0 | Describe a group. |
 | `ListGroups` | 16 | V0 | List the groups. |
 | `SaslHandshake` | 17 | V0-V1 | Select a SASL mechanism. |
-| `SaslAuthenticate` | 36 | V0-V1 | Run the SASL exchange. |
 | `ApiVersions` | 18 | V0 | Negotiate the protocol. |
 | `CreateTopics` | 19 | V0 | Create topics. |
 | `DeleteTopics` | 20 | V0 | Delete topics. |
 | `InitProducerId` | 22 | V0-V1 | Allocate a producer id. |
+| `SaslAuthenticate` | 36 | V0-V1 | Run the SASL exchange. |
+
+The rows sort by API key. The `SaslAuthenticate` key is 36, so the row sits at the
+end of the table.
 
 The agent answers `UNSUPPORTED_VERSION` for any other key. The agent keeps the
 connection open.
