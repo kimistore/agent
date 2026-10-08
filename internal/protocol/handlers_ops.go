@@ -521,7 +521,17 @@ func handleFetch(ctx context.Context, dec *Decoder, enc *Encoder, store *storage
 
 			enc.Int32(p.partition)
 			if rerr != nil {
-				enc.Int16(ErrOffsetOutOfRange)
+				// The error code tells the client what to do next, so the three
+				// failures must not share one answer.
+				//
+				// Reporting OFFSET_OUT_OF_RANGE for every read failure used to
+				// tell a client its offset was invalid when the offset was fine
+				// and the broker was broken. A client believes that, resets to
+				// earliest and retries forever: one record cost 1222 round trips
+				// before this was traced to a test object store that could not
+				// serve a range read. The offset being genuinely gone is the one
+				// case that warrants a reset.
+				enc.Int16(readErrorCode(rerr))
 				enc.Int64(hw)
 				encodeFetchTail(enc, version, lastStable, logStart, nil)
 				continue

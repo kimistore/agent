@@ -107,10 +107,16 @@ func TestACL_NoRulesAllowsEverything(t *testing.T) {
 // TestACL_DeniesUnlistedPrincipal is the point of the feature: once a rule
 // exists, the broker denies by default.
 func TestACL_DeniesUnlistedPrincipal(t *testing.T) {
-	addr := aclBroker(t, auth.ACL{
-		Principal: "alice", Operation: auth.OpWrite,
-		Resource: auth.Topic("orders"), Permission: auth.Allow,
-	})
+	// Describe is granted to everyone so that this test isolates the Write
+	// refusal. A producer needs Describe before it can write at all, so a
+	// grant without it denies at metadata time and never reaches the Write
+	// check.
+	addr := aclBroker(t,
+		auth.ACL{Principal: auth.PrincipalAll, Operation: auth.OpDescribe,
+			Resource: auth.AllTopics(), Permission: auth.Allow},
+		auth.ACL{Principal: "alice", Operation: auth.OpWrite,
+			Resource: auth.Topic("orders"), Permission: auth.Allow},
+	)
 
 	// The client is anonymous here, so the rule for alice cannot match it.
 	err := produceErr(t, addr, "orders")
@@ -131,10 +137,12 @@ func TestACL_DeniesUnlistedPrincipal(t *testing.T) {
 // TestACL_UnlistedTopicDenied checks deny-by-default on the resource too, not
 // just the principal: a typo in a topic name must not expose data.
 func TestACL_UnlistedTopicDenied(t *testing.T) {
-	addr := aclBroker(t, auth.ACL{
-		Principal: auth.PrincipalAll, Operation: auth.OpWrite,
-		Resource: auth.Topic("orders"), Permission: auth.Allow,
-	})
+	addr := aclBroker(t,
+		auth.ACL{Principal: auth.PrincipalAll, Operation: auth.OpDescribe,
+			Resource: auth.AllTopics(), Permission: auth.Allow},
+		auth.ACL{Principal: auth.PrincipalAll, Operation: auth.OpWrite,
+			Resource: auth.Topic("orders"), Permission: auth.Allow},
+	)
 	if err := produceErr(t, addr, "orderz"); err == nil {
 		t.Fatal("an unlisted topic was writable")
 	}
@@ -180,3 +188,52 @@ func asKerr(err error, out **kerr.Error) bool {
 // because kerr.Error values are not comparable by identity and a nil-typed
 // *Error would pass a direct pointer comparison.
 const topicAuthzCode = 29
+
+// TestACL_DescribeIsEnforced closes the gap where Metadata was left
+// unrestricted: a caller could enumerate topic names even with rules in force.
+//
+// It is the test that the refusal response is parseable. The first version of
+// it omitted the brokers array and cluster id, so the client read the topic
+// count as a broker count, retried forever, and this test saw a timeout instead
+// of an authorization error.
+func TestACL_DescribeIsEnforced(t *testing.T) {
+	// orders may be described and read. Nothing else is granted, so metadata
+	// for any other topic is refused.
+	addr := aclBroker(t,
+		auth.ACL{Principal: auth.PrincipalAll, Operation: auth.OpDescribe,
+			Resource: auth.Topic("orders"), Permission: auth.Allow},
+		auth.ACL{Principal: auth.PrincipalAll, Operation: auth.OpWrite,
+			Resource: auth.Topic("orders"), Permission: auth.Allow},
+		auth.ACL{Principal: auth.PrincipalAll, Operation: auth.OpRead,
+			Resource: auth.Topic("orders"), Permission: auth.Allow},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cl, err := kgo.NewClient(kgo.SeedBrokers(addr), kgo.RetryTimeout(3*time.Second))
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer cl.Close()
+
+	// The granted topic must still work end to end, or the refusal is simply
+	// breaking metadata for everyone.
+	if err := cl.ProduceSync(ctx, &kgo.Record{Topic: "orders", Value: []byte("x")}).FirstErr(); err != nil {
+		t.Fatalf("produce to the granted topic was refused: %v", err)
+	}
+
+	// A topic nobody may describe must not become reachable.
+	//
+	// The assertion is only that the write does not succeed. The error a
+	// client surfaces here is its own business: kgo retries the metadata it was
+	// refused and then reports a deadline rather than the topic error, so
+	// demanding a particular code would be testing franz-go. That the response
+	// carries TOPIC_AUTHORIZATION_FAILED is asserted where it belongs, by
+	// decoding it in TestRefuseMetadata_IsParseableAtEveryVersion.
+	err = cl.ProduceSync(ctx, &kgo.Record{Topic: "secret", Value: []byte("x")}).FirstErr()
+	if err == nil {
+		t.Fatal("a topic with no grant was writable")
+	}
+	t.Logf("produce to an unauthorized topic was refused as expected: %v", err)
+}

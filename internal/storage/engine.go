@@ -887,7 +887,7 @@ func (s *StorageEngine) ReadBatchContext(ctx context.Context, topic string, part
 
 	bestKey := bestSegmentFor(keys, offset)
 	if bestKey == "" {
-		return nil, 0, fmt.Errorf("offset %d not found in any segment under %s", offset, prefix)
+		return nil, 0, fmt.Errorf("%w: offset %d not found in any segment under %s", ErrOffsetUnavailable, offset, prefix)
 	}
 
 	baseOffset := parseOffsetFromKey(bestKey)

@@ -58,6 +58,16 @@ var (
 	// ErrUnsupported is returned by an object store that cannot make writes
 	// conditional on the current object version.
 	ErrUnsupported = errors.New("operation not supported by this object store")
+
+	// ErrOffsetUnavailable means the requested offset is in no segment this
+	// agent can reach: the log is shorter, or retention already reclaimed it.
+	//
+	// It is a distinct type because the protocol layer must answer it
+	// differently from a storage failure. A genuinely gone offset is the one
+	// case where OFFSET_OUT_OF_RANGE is correct, and telling a client to reset
+	// its offset when the broker is what is broken turns a recoverable error
+	// into a loop.
+	ErrOffsetUnavailable = errors.New("offset is not available")
 )
 
 // Engine represents the primary storage interface for the streaming platform.

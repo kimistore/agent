@@ -19,7 +19,10 @@
 package protocol
 
 import (
+	"context"
 	"errors"
+
+	"kimistore/internal/storage"
 )
 
 // Peek helpers for authorization.
@@ -209,4 +212,104 @@ func refuseFetch(enc *Encoder, version int16, topics []string, code int16) []byt
 		enc.PutBytes(nil) // no records
 	}
 	return enc.Bytes()
+}
+
+// refuseMetadata encodes a MetadataResponse that refuses every requested topic.
+//
+// The whole prelude has to be present. MetadataResponse is the one response
+// where the broker list, cluster id and controller id all come BEFORE the topic
+// array. A refusal that wrote only the topics left the client reading the topic
+// count as a broker count; it then retried metadata forever and the caller saw a
+// timeout instead of an authorisation error. That is worse than not enforcing,
+// because it looks like an outage.
+//
+// The broker list is the live view, not an empty one. A client that has nowhere
+// to send a request because of a refusal has to be able to tell that apart from
+// a cluster with no brokers, and the two look different on the wire.
+func refuseMetadata(enc *Encoder, version int16, topics []string, brokers []storage.Broker, nodeID int32, code int16) []byte {
+	if version >= 3 {
+		enc.Int32(0) // ThrottleTimeMs
+	}
+
+	// Brokers
+	enc.Int32(int32(len(brokers)))
+	for _, b := range brokers {
+		enc.Int32(b.NodeID)
+		enc.String(b.Host)
+		enc.Int32(b.Port)
+		if version >= 1 {
+			enc.String("") // Rack
+		}
+	}
+
+	// ClusterId: nullable from v2.
+	if version >= 2 {
+		enc.String(clusterID)
+	}
+
+	// ControllerId: must be an id from the broker list above.
+	if version >= 1 {
+		enc.Int32(nodeID)
+	}
+
+	// Topics
+	// Field order is the schema's declaration order, not a convenient one.
+	// At topic level the error code precedes the name; at partition level it
+	// precedes the partition number. Both were written after the name here, and
+	// a client then read a two-byte code as the high half of a string length and
+	// failed to parse the whole response.
+	enc.Int32(int32(len(topics)))
+	for _, t := range topics {
+		enc.Int16(code) // topic-level error, first
+		enc.String(t)   // then the name
+		if version >= 1 {
+			// is_internal sits between the name and the partition array.
+			enc.Int8(0)
+		}
+		// One partition, carrying the same error. A client reads the partition
+		// error codes, so a topic-level code alone can leave it retrying.
+		enc.Int32(1)    // partition count
+		enc.Int16(code) // partition-level error, first
+		enc.Int32(0)    // partition 0
+		enc.Int32(-1)   // Leader: unknown rather than a broker that would refuse
+		if version >= 7 {
+			enc.Int32(-1) // LeaderEpoch
+		}
+		enc.Int32(0) // replicas
+		enc.Int32(0) // in-sync replicas
+		if version >= 5 {
+			enc.Int32(0) // offline replicas
+		}
+	}
+	return enc.Bytes()
+}
+
+// readErrorCode maps a storage read failure to the code that tells a client what
+// to do about it.
+//
+// The distinction that matters is between "your offset is wrong" and "the broker
+// cannot serve right now". Only the first justifies a consumer resetting its
+// position, and answering the second with a reset turns a transient storage
+// fault into an unbounded retry loop.
+func readErrorCode(err error) int16 {
+	switch {
+	case err == nil:
+		return ErrNone
+	case errors.Is(err, storage.ErrOffsetUnavailable):
+		// The offset is genuinely gone: retention reclaimed it, or it is before
+		// the start of the log. The client should reset.
+		return ErrOffsetOutOfRange
+	case errors.Is(err, context.Canceled):
+		// The client went away. Nothing to report and nothing to retry; the
+		// connection is going to close regardless.
+		return ErrUnknown
+	case errors.Is(err, context.DeadlineExceeded):
+		return ErrRequestTimedOut
+	default:
+		// The object store failed. KAFKA_STORAGE_ERROR is retriable, so the
+		// client asks again rather than resetting its position, which is the
+		// correct response to a broker that is broken rather than to a log
+		// that has moved.
+		return ErrKafkaStorageError
+	}
 }

@@ -59,9 +59,13 @@ const (
 )
 
 const (
-	ErrNone                       = 0
-	ErrUnknown                    = -1
-	ErrUnknownTopicOrPartition    = 3
+	ErrNone                    = 0
+	ErrUnknown                 = -1
+	ErrUnknownTopicOrPartition = 3
+	// ErrKafkaStorageError is Kafka's KAFKA_STORAGE_ERROR: the broker could not
+	// read from its log. Clients treat it as retriable, which is what a
+	// transient object-store failure is.
+	ErrKafkaStorageError          = 56
 	ErrLeaderNotAvailable         = 5
 	ErrNotLeaderForPartition      = 6
 	ErrNotCoordinator             = 16
@@ -1075,14 +1079,16 @@ func handleMetadata(ctx context.Context, dec *Decoder, enc *Encoder, store *stor
 	// whose partitions are split across agents has to be described in full by
 	// every agent, or a client that hashed a key onto a partition it cannot see
 	// has nowhere to send it.
-	// Describe is NOT enforced yet. A refused Metadata request has to be a
-	// complete, parseable MetadataResponse: brokers array, cluster_id and
-	// controller_id all precede the topic array, so a refusal that only wrote
-	// topics leaves the client reading the topic count as a broker count. It
-	// then retries metadata forever and the caller sees a timeout rather than
-	// an authorisation error, which is worse than not enforcing it. Until that
-	// response is written correctly, Describe is unrestricted here and the data
-	// plane (Produce/Fetch) is what actually gates access.
+	// Describe is checked on the topics the client named. It runs after the
+	// broker view is built so a refusal can carry a real broker list: a client
+	// with nowhere to send a request cannot tell an authorisation failure from
+	// a cluster with no brokers.
+	if aclActive(cfg) && count > 0 {
+		if code := authorizeTopics(cfg, session, auth.OpDescribe, requestedTopics); code != ErrNone {
+			log.Printf("Metadata: %s denied Describe", session.principal())
+			return refuseMetadata(enc, version, requestedTopics, brokers, cfg.NodeID, code), nil
+		}
+	}
 
 	allTopics := routing.Topics()
 	topicsToReturn := requestedTopics
