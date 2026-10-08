@@ -1,0 +1,52 @@
+name: GitHub Pages
+
+# The site folder is hand-written static HTML, CSS, and JavaScript. There is no
+# build step and no bundler, so this workflow uploads the folder as it stands.
+# A generator here would add a toolchain to publish four files.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - site/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time. A queued run must not cancel the run that is
+# already publishing, because a cancelled deploy can leave the live site
+# pointing at an artifact that never finished uploading.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload the site folder as the Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # .nojekyll is not in the folder on purpose. This workflow uploads a
+          # tarball rather than asking Jekyll to build the branch, so Jekyll
+          # never filters the artifact. The file would only matter if a
+          # Jekyll build were later switched on.
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
