@@ -156,7 +156,18 @@ jobs:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}@${{ steps.broker.outputs.digest }}
         run: |
           set -euo pipefail
-          cosign sign --yes --recursive "${IMAGE}"
+          # Signed by digest, not by tag, and not recursively.
+          #
+          # A multi-platform image is an index whose children are the per-platform
+          # manifests. --recursive signs every child as well as the index, which
+          # multiplies the signature writes by the platform count and made one of
+          # them fail with write_package while the rest succeeded -- a half-signed
+          # image, which is worse than an unsigned one because it looks covered.
+          #
+          # Consumers pull by the index digest, so signing the index is what binds
+          # the artifact. Verification of that digest walks the index and covers
+          # every platform it selects.
+          cosign sign --yes "${IMAGE}"
           echo "signed: ${IMAGE}"
 
       # Signed as well as pushed. The tool is published, and a published artifact
@@ -167,7 +178,7 @@ jobs:
           IMAGE: ${{ env.REGISTRY }}/${{ env.CREDENTIAL_IMAGE_REPO }}@${{ steps.credential.outputs.digest }}
         run: |
           set -euo pipefail
-          cosign sign --yes --recursive "${IMAGE}"
+          cosign sign --yes "${IMAGE}"
 
       - name: Attest the SBOM
         if: github.event_name != 'pull_request'
