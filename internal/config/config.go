@@ -21,6 +21,8 @@
 package config
 
 import (
+	"errors"
+
 	"fmt"
 	"log"
 	"net"
@@ -84,6 +86,9 @@ type Config struct {
 	// corrupt the ones it does.
 	Ownership OwnershipConfig
 
+	// Assignment is the runtime shape of deterministic partition assignment.
+	Assignment AssignmentConfig
+
 	// AgentID is this agent's stable durable identity. It namespaces the
 	// checkpoint object (see storage.WithAgentID) so two agents sharing a
 	// bucket cannot overwrite each other's. Empty selects the hostname, which
@@ -126,6 +131,26 @@ type OwnershipConfig struct {
 	// TTL is how long a claim survives without renewal, and therefore how long
 	// a crashed agent blocks its replacement for that one partition.
 	TTL time.Duration
+}
+
+// AssignmentConfig is the runtime shape of deterministic partition assignment.
+//
+// It is off by default. Without it every agent races to claim every partition
+// and the first one to start keeps all of them, so scaling out adds cost and
+// failure surface without adding throughput. Assignment bounds an agent's reach
+// so a fleet actually shares the work.
+//
+// It is opt-in because turning it on changes which agent owns what, which is a
+// visible change to an existing deployment rather than a pure optimisation.
+type AssignmentConfig struct {
+	// Enabled turns assignment on. It requires per-partition ownership, because
+	// the claim in the object store is what settles a disagreement between two
+	// agents that computed different assignments.
+	Enabled bool
+	// Settle is how long the live agent set must hold still before this agent
+	// rebalances. Without it a rolling deploy, where the live set churns as each
+	// agent restarts, would release and re-acquire partitions continuously.
+	Settle time.Duration
 }
 
 type LeaseConfig struct {
@@ -311,6 +336,19 @@ func (c *Config) Validate() error {
 	// the previous agent is merely slow rather than gone. This holds for both
 	// fences, so it is checked against whichever is in force.
 	ttl, label := c.Lease.TTL, "lease"
+	c.Assignment.Enabled = env("KIMISTORE_ASSIGNMENT", "") == "rendezvous"
+	c.Assignment.Settle = time.Duration(envInt64("KIMISTORE_ASSIGNMENT_SETTLE_MS",
+		int64(c.Ownership.TTL/time.Millisecond))) * time.Millisecond
+	if c.Assignment.Enabled {
+		if !c.Ownership.Enabled {
+			return errors.New("KIMISTORE_ASSIGNMENT=rendezvous needs KIMISTORE_PARTITION_OWNERSHIP: " +
+				"the claim in the object store is what settles a disagreement about the assignment")
+		}
+		if c.Assignment.Settle <= 0 {
+			return errors.New("KIMISTORE_ASSIGNMENT_SETTLE_MS must be greater than zero")
+		}
+	}
+
 	if c.Ownership.Enabled {
 		ttl, label = c.Ownership.TTL, "partition ownership"
 	}
@@ -331,6 +369,10 @@ func (c Config) Log() {
 	} else {
 		log.Printf("Lease: enabled=%v key=%q holder=%s ttl=%s requireConditionalWrites=%v",
 			c.Lease.Enabled, orDefault(c.Lease.Key, "(default)"), orDefault(c.Lease.Holder, "hostname/pid"), c.Lease.TTL, c.RequireLease)
+	}
+	if c.Assignment.Enabled {
+		log.Printf("Assignment: enabled mode=rendezvous settle=%s (an agent claims only the partitions "+
+			"rendezvous hashing gives it, and drains the rest when the live set changes)", c.Assignment.Settle)
 	}
 	log.Printf("Agent: id=%s nodeId=%d (namespaces the checkpoint object; the id clients see) advertised=%s:%d",
 		orDefault(c.AgentID, "hostname"), c.NodeID, c.AdvertisedHost, c.AdvertisedPort)

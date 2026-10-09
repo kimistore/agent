@@ -288,6 +288,22 @@ var (
 	// write because the object store says the claim moved. A non-zero rate means
 	// two agents believed they owned the same partition, which is the condition
 	// the epoch in the segment key mitigates but does not close.
+	// AssignmentReleased counts partitions this agent gave up because the
+	// deterministic assignment moved them elsewhere. It is the signal that
+	// load balancing is happening at all: without it, one agent holds
+	// everything and scaling out buys nothing.
+	AssignmentReleased = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_assignment_released_total",
+		Help: "Partitions drained and released because the assignment moved them to another agent",
+	})
+
+	// AssignmentAcquired counts partitions this agent took because the
+	// deterministic assignment gave them to it.
+	AssignmentAcquired = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_assignment_acquired_total",
+		Help: "Partitions claimed because the assignment gave them to this agent",
+	})
+
 	ManifestWritesRejected = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "kimistore_manifest_writes_rejected_total",
 		Help: "Partition manifests not written because the ownership claim was no longer held",

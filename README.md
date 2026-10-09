@@ -376,6 +376,8 @@ The agent reads these environment variables.
 | `KIMISTORE_S3_TIMEOUT_MS` | `30000` | Deadline for one object-store request. |
 | `KIMISTORE_PARTITION_OWNERSHIP` | `true` | Claim each partition separately. Set false for one bucket-wide claim. |
 | `KIMISTORE_OWNERSHIP_TTL_MS` | `60000` | Time that a partition claim survives without renewal. |
+| `KIMISTORE_ASSIGNMENT` | `off` | Set to `rendezvous` to share partitions across agents by hash. Needs per-partition ownership. |
+| `KIMISTORE_ASSIGNMENT_SETTLE_MS` | the claim TTL | How long the live agent set must hold still before an agent rebalances. |
 | `KIMISTORE_WRITER_LEASE` | `true` | Take the bucket-wide claim. This variable applies only when ownership is off. |
 | `KIMISTORE_LEASE_KEY` | `_meta/lease.json` | Object for the bucket-wide claim. |
 | `KIMISTORE_WRITER_ID` | Hostname and pid | Identifies this writer in the bucket-wide claim. |

@@ -98,6 +98,10 @@ func main() {
 			TTL:     cfg.Ownership.TTL,
 			Require: cfg.RequireLease,
 		}),
+		storage.WithAssignment(storage.AssignmentConfig{
+			Enabled: cfg.Assignment.Enabled,
+			Settle:  cfg.Assignment.Settle,
+		}),
 		storage.WithOperationTimeout(cfg.S3Timeout),
 		storage.WithAgentID(cfg.AgentID),
 		storage.WithFlushInterval(cfg.FlushInterval),

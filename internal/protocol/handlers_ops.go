@@ -50,10 +50,14 @@ func produceError(err error) int16 {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return ErrRequestTimedOut
 	case errors.Is(err, storage.ErrPartitionNotOwned), errors.Is(err, storage.ErrPartitionLost),
-		errors.Is(err, storage.ErrPartitionHeld):
+		errors.Is(err, storage.ErrPartitionHeld), errors.Is(err, storage.ErrPartitionNotAssigned):
 		// This agent does not own the partition, so the client is being sent to
 		// the wrong broker for it. NOT_LEADER_OR_FOLLOWER is exactly what tells
 		// the producer to refresh its metadata and retry against the owner.
+		//
+		// ErrPartitionNotAssigned is the assignment gate refusing to claim a
+		// partition that belongs to a peer by rule. The client is no more lost
+		// than in the other cases here: Metadata names the owner.
 		return ErrNotLeaderForPartition
 	case errors.Is(err, storage.ErrLeaseLost), errors.Is(err, storage.ErrLeaseHeld):
 		// Another agent owns the whole bucket, so this broker is the wrong one

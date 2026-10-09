@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"hash/fnv"
 	"sort"
+	"strconv"
 )
 
 // AgentRef is a candidate coordinator, as published in an agent's routing view.
@@ -30,6 +31,31 @@ type AgentRef struct {
 	NodeID int32
 	Host   string
 	Port   int32
+}
+
+// PartitionKey is the rendezvous key for a topic partition.
+//
+// It exists so that the key derivation lives in one place. Assignment and group
+// coordination must not drift apart here: both are "hash this string against the
+// live set", and a change to one that did not reach the other would be a
+// correctness bug in whichever was not updated.
+func PartitionKey(topic string, partition int32) string {
+	return topic + "/" + strconv.FormatInt(int64(partition), 10)
+}
+
+// AssignPartition names the agent a topic partition belongs to, by the same
+// rendezvous hashing that picks a group coordinator.
+//
+// It is the same function for the same reason. Rendezvous rather than modulo
+// means a departing agent releases only its own partitions: adding a fourth
+// agent to three does not reshuffle the other six, and the sixth partition a
+// newcomer takes is the one it scores highest for, not an arbitrary one.
+//
+// The result is an *admission* decision, not authority. Two agents can disagree
+// about the live set, and the object store's claim is what settles it. See
+// StorageEngine.assignedTo.
+func AssignPartition(topic string, partition int32, agents []AgentRef) (AgentRef, bool) {
+	return Rendezvous(PartitionKey(topic, partition), agents)
 }
 
 // Rendezvous picks the coordinator for a group from the live agent set, by

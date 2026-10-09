@@ -282,6 +282,34 @@ See "Authorization" in the [`README.md`](README.md) for the rule syntax and the
   `KIMISTORE_REQUIRE_LEASE=false` downgrades the fence to a startup warning.
   `KIMISTORE_PARTITION_OWNERSHIP=false` reverts to one bucket-wide claim that
   refuses a second agent outright.
+  * **Partition assignment is opt-in.** Without it, partition claims are a race
+    that the first agent to start wins outright: three agents and six partitions
+    gives one agent all six and leaves two idle, so scaling out adds cost and
+    failure surface without adding throughput. `KIMISTORE_ASSIGNMENT=rendezvous`
+    makes each agent claim only the partitions rendezvous hashing gives it, by the
+    same function that picks a group coordinator. When the live set changes, an
+    agent drains and releases the partitions it no longer wins, and claims the
+    ones it now does.
+
+    Assignment is an admission gate, never an authority. Two agents refresh their
+    view of the live set independently and can compute different winners; the
+    claim in the object store settles it, and the loser is refused with
+    `NOT_LEADER_OR_FOLLOWER`. A disagreement therefore costs one failed claim
+    rather than two writers.
+
+    Rebalancing waits for the live set to hold still first
+    (`KIMISTORE_ASSIGNMENT_SETTLE_MS`, defaulting to the claim TTL). Without that
+    window a rolling deploy, where the live set changes once per agent, would
+    release and re-acquire partitions continuously and nothing would settle. An
+    agent also refuses to rebalance on a stale view, because a stale live set may
+    name an agent that no longer exists and acting on it would hand a partition
+    to nobody.
+
+    The grace policy here is the claim TTL, deliberately *not* the stricter one
+    the coordinator uses. A partition owner carries a fencing token in the epoch,
+    so a writer that has lost its claim cannot corrupt its successor's data; a
+    coordinator has no such token, so it refuses on the first failed renewal.
+
   * **Every agent must have a distinct `KIMISTORE_AGENT_ID`.** Two agents sharing
     one id cannot tell each other apart from the claim record, because the record
     names the id both of them use. The agent therefore also compares epochs: a

@@ -53,6 +53,26 @@ store.
 - `kimistore-credential` for SCRAM credentials and ACL rules
 - A static site published to GitHub Pages
 
+### Changed
+
+- Partitions can be shared across agents by deterministic hash rather than won
+  by whichever agent started first. Opt in with `KIMISTORE_ASSIGNMENT=rendezvous`.
+  Off by default, because it changes which agent owns what
+- A partition owner that has lost its claim to an agent using the same id is
+  refused rather than renewing, so two agents sharing an id cannot hand a
+  partition back and forth
+- Partition manifests are only written after the claim is re-checked against the
+  object store, so a writer that has lost its claim cannot overwrite its
+  successor's record
+- A `SIGTERM` seals, uploads, and records each partition before releasing it, so
+  an orderly shutdown is a handover rather than a recovery
+
+### Fixed
+
+- The pending-upload counter went negative when a segment was re-uploaded by the
+  reconciler, which made every shutdown wait out its full 30 second budget and
+  report a negative number of segments still uploading
+
 ### Known limitations
 
 These are deliberate for 1.0. Each one is a gap a user can hit.

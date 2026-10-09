@@ -55,6 +55,11 @@ var (
 	// the partition over.
 	ErrPartitionLost = errors.New("partition ownership lost")
 
+	// ErrPartitionNotAssigned reports that the deterministic assignment gives a
+	// partition to another agent, so this one did not try to claim it. It is not
+	// a failure: the partition is served by its owner.
+	ErrPartitionNotAssigned = errors.New("partition is assigned to another agent")
+
 	// ErrUnsupported is returned by an object store that cannot make writes
 	// conditional on the current object version.
 	ErrUnsupported = errors.New("operation not supported by this object store")

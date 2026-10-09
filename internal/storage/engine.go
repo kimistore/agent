@@ -76,6 +76,10 @@ type StorageEngine struct {
 	// read as empty while a task is still being enqueued.
 	pendingUploads atomic.Int64
 
+	// assignment bounds which partitions this agent claims and rebalances the
+	// ones it no longer wins. Off unless WithAssignment says otherwise.
+	assignment AssignmentConfig
+
 	// Cache for S3 List results (topic/partition -> []keys)
 	segmentCache map[string][]string
 	cacheMu      sync.RWMutex
@@ -363,10 +367,21 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 
 	// Start background uploader (reconciliation), offset flusher, retention,
 	// checkpoint, and durability flush loops.
-	se.wg.Add(5)
+	// The rebalance loop only runs when assignment is on, so the WaitGroup is
+	// sized conditionally rather than always counting a loop that was not
+	// started. Counting one that never runs would make Close hang forever; not
+	// counting one that does runs panics on the matching Done.
+	loops := 5
+	if se.assignment.Enabled {
+		loops++
+	}
+	se.wg.Add(loops)
 	go se.uploaderLoop()
 	go se.offsetFlusherLoop()
 	go se.retentionLoop()
+	if se.assignment.Enabled {
+		go se.rebalanceLoop(se.closedCtx)
+	}
 	go se.checkpointLoop()
 	go se.flushLoop()
 
@@ -673,6 +688,17 @@ func (s *StorageEngine) claimPartition(ctx context.Context, topic string, partit
 	if s.ownership == nil {
 		return 0, nil
 	}
+
+	// The assignment gate. Every claim funnels through here, so one check bounds
+	// the whole engine: startup, lazy claim on first append, and topic creation.
+	//
+	// A refusal is not an error to retry. The partition belongs to another agent
+	// by rule, and it will be picked up by that agent's own claim pass or by the
+	// claim expiring if that agent is gone.
+	if !s.assignedTo(s.assignmentAgents(), topic, partition) {
+		return 0, fmt.Errorf("%w: %s/%d is assigned elsewhere", ErrPartitionNotAssigned, topic, partition)
+	}
+
 	epoch, err := s.ownership.Claim(ctx, topic, partition)
 	if err != nil {
 		return 0, err
