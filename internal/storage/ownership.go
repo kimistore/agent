@@ -144,6 +144,16 @@ type ownershipManager struct {
 
 	quit chan struct{}
 	wg   sync.WaitGroup
+
+	// lastRenewOK is when a renewal pass last completed without a failure that
+	// cost this agent a claim. It is the signal for readiness: an agent that has
+	// not been able to renew for a full TTL is no longer the owner of anything
+	// and must not be advertised as one.
+	//
+	// The per-partition lost flag cannot serve this purpose. A clean handover
+	// sets it, so an agent that handed a partition over on purpose would be
+	// marked permanently unready, which is the opposite of what happened.
+	lastRenewOK atomic.Int64
 }
 
 // newOwnershipManager starts per-partition ownership.
@@ -369,6 +379,14 @@ func (om *ownershipManager) claim(ctx context.Context, topic string, partition i
 			}
 			return PartitionOwner{}, fmt.Errorf("ownership: could not write %s: %w", key, err)
 		}
+
+		// Reaching the object store and winning the write is proof this agent is
+		// alive, so it counts towards liveness. Only stamping on the renewal path
+		// would leave a freshly started agent looking dead until its first renewal
+		// tick, which is up to a third of the TTL later -- long enough for a
+		// readiness probe to keep the pod it just started out of rotation.
+		om.lastRenewOK.Store(time.Now().UnixNano())
+
 		return next, nil
 	}
 
@@ -405,17 +423,42 @@ func (om *ownershipManager) renewLoop(ctx context.Context) {
 // agent that loses one partition still owns the rest, and fencing it out of
 // that one partition is the correct and useful outcome.
 func (om *ownershipManager) renewAll(ctx context.Context) {
+	ok := true
 	for _, p := range om.snapshot() {
-		om.renewPartition(ctx, p)
+		if !om.renewPartition(ctx, p) {
+			ok = false
+		}
+	}
+	if ok {
+		om.lastRenewOK.Store(time.Now().UnixNano())
 	}
 }
 
-func (om *ownershipManager) renewPartition(ctx context.Context, p *partitionOwnership) {
+// Live reports whether this agent can currently prove it holds what it holds.
+//
+// It is false once a renewal pass has failed for a full TTL, which is the point
+// at which the claims this agent is serving are no longer safe to advertise. An
+// agent that holds nothing is always live: there is nothing to lose.
+func (om *ownershipManager) Live() bool {
+	if om == nil || !om.fenced {
+		return true
+	}
+	if om.count() == 0 {
+		return true
+	}
+	last := time.Unix(0, om.lastRenewOK.Load())
+	return time.Since(last) < om.cfg.TTL
+}
+
+// renewPartition renews one claim and reports whether it is still held
+// afterwards. A partition this agent no longer holds is not a failure of the
+// pass: it was handed over deliberately.
+func (om *ownershipManager) renewPartition(ctx context.Context, p *partitionOwnership) bool {
 	p.claimMu.Lock()
 	defer p.claimMu.Unlock()
 
 	if !p.held.Load() {
-		return
+		return true
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, om.cfg.TTL)
@@ -437,11 +480,11 @@ func (om *ownershipManager) renewPartition(ctx context.Context, p *partitionOwne
 				}
 			}
 			metrics.PartitionsOwned.Set(float64(om.count()))
-			return
+			return false
 		}
 		log.Printf("Ownership: renewal of %s/%d failed (%v); still within the %s window",
 			p.topic, p.partition, err, om.cfg.TTL)
-		return
+		return true
 	}
 
 	p.epoch.Store(owner.Epoch)
@@ -451,6 +494,7 @@ func (om *ownershipManager) renewPartition(ctx context.Context, p *partitionOwne
 		log.Printf("Ownership: re-acquired %s/%d at epoch %d", p.topic, p.partition, owner.Epoch)
 	}
 	metrics.PartitionsOwned.Set(float64(om.count()))
+	return true
 }
 
 // release hands every claim over so the next owner of those partitions does not

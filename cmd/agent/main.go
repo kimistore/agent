@@ -144,6 +144,13 @@ func main() {
 	// Start Metrics Server
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.Handler())
+	// Two probes, not one. Readiness decides whether clients are sent here;
+	// liveness decides whether this process is killed. A broker that has lost
+	// its claims must be taken out of rotation without being restarted, because a
+	// restart is slower than the thing it would fix and it can still serve reads
+	// from object storage in the meantime.
+	metricsMux.Handle("/ready", engine.ReadyHandler())
+	metricsMux.Handle("/live", engine.LiveHandler())
 	metricsSrv := &http.Server{Addr: cfg.MetricsAddr, Handler: metricsMux}
 	go func() {
 		log.Printf("Metrics listening on %s", cfg.MetricsAddr)
