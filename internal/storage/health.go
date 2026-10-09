@@ -129,12 +129,14 @@ func (s *StorageEngine) ReadyHandler() http.Handler {
 
 		if !state.Ready {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprintf(w, "not ready: %s\n", state.Reason)
+			// The status line is already sent, so a write failure here cannot
+			// change the response: the only error is a client that hung up.
+			_, _ = fmt.Fprintf(w, "not ready: %s\n", state.Reason)
 			return
 		}
 
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "ready: %d partition(s) owned\n", len(s.OwnedPartitions()))
+		_, _ = fmt.Fprintf(w, "ready: %d partition(s) owned\n", len(s.OwnedPartitions()))
 	})
 }
 
@@ -152,6 +154,6 @@ func (s *StorageEngine) LiveHandler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, "alive")
+		_, _ = fmt.Fprintln(w, "alive")
 	})
 }

@@ -39,7 +39,7 @@ func assignmentEnabled() AssignmentConfig {
 func newAssignedEngine(t *testing.T, store ObjectStore, agent string, nodeID int32) *StorageEngine {
 	t.Helper()
 
-	port := int32(19092 + nodeID)
+	port := 19092 + nodeID
 	engine, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{},
 		WithOwnership(testOwnership(agent, 30*time.Second)),
 		WithAgentID(agent),
