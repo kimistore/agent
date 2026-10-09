@@ -104,16 +104,18 @@ jobs:
           # looked tidier but crane is not on the runner, and pulling a second
           # tool in to move a tag that ko can set itself was the wrong trade.
           #
-          # ko prints one line per platform plus a summary line of the form
-          #   ghcr.io/kimistore/agent:main: digest: sha256:...
-          # The summary is the only line carrying "digest:", so that is what the
-          # parse keys on. Signing has to address the digest, not the tag: a tag
-          # can be repointed after the fact, and a signature on a tag proves only
-          # that something was signed once.
-          output=$(ko build --bare --tags="${{ steps.tag.outputs.tag }}" \
+          # ko writes progress to stderr and only the resolved reference to
+          # stdout, as "repo:tag@sha256:...". Parsing the "digest:" form that
+          # appears in its stderr log therefore finds nothing here. Only stdout is
+          # captured so the progress still streams to the job log.
+          #
+          # The digest is what gets signed, not the tag: a tag can be repointed
+          # afterwards, so a signature over a tag proves only that something was
+          # signed once.
+          ref=$(ko build --bare --tags="${{ steps.tag.outputs.tag }}" \
             --platform="${PLATFORMS}" --sbom-dir=/tmp/sbom ./cmd/agent)
-          echo "${output}"
-          digest=$(echo "${output}" | grep -oE 'digest: sha256:[0-9a-f]{64}' | tail -1 | awk '{print $2}')
+          echo "resolved: ${ref}"
+          digest=$(echo "${ref}" | grep -oE 'sha256:[0-9a-f]{64}$' | tail -1)
           if [ -z "${digest}" ]; then
             echo "::error::could not find the pushed digest in the ko output"
             exit 1
@@ -134,10 +136,10 @@ jobs:
           # A separate image, not a second binary in the broker image: ko builds
           # one image per main, and a running broker should not carry a tool
           # that can rewrite its own ACLs.
-          output=$(ko build --bare --tags="${{ steps.tag.outputs.tag }}" \
+          ref=$(ko build --bare --tags="${{ steps.tag.outputs.tag }}" \
             --platform="${PLATFORMS}" ./cmd/credential)
-          echo "${output}"
-          digest=$(echo "${output}" | grep -oE 'digest: sha256:[0-9a-f]{64}' | tail -1 | awk '{print $2}')
+          echo "resolved: ${ref}"
+          digest=$(echo "${ref}" | grep -oE 'sha256:[0-9a-f]{64}$' | tail -1)
           if [ -z "${digest}" ]; then
             echo "::error::could not find the pushed digest in the ko output"
             exit 1
