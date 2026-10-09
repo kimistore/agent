@@ -1,0 +1,47 @@
+# ko configuration
+#
+# The agent is a pure-Go binary: it builds with CGO_ENABLED=0 and has no
+# c-backed dependency, so a static base is all it needs. That is why the image
+# can be distroless rather than glibc-with-a-shell, and why the chart can run
+# with readOnlyRootFilesystem: true.
+#
+# Distroless means no shell, so `kubectl exec ... -- sh` does not work. That is
+# a deliberate trade for a ~8 MB image with nothing to patch. Use `kubectl logs`
+# and the /ready endpoint to diagnose, or run the credential tool as its own
+# short-lived pod.
+#
+# Two images, because ko produces one image per `main`. The broker and the
+# administration tool are separate images on purpose: the credential tool is a
+# one-shot admin task that wants the bucket and nothing else, and putting it in
+# the broker's pod would hand every running broker an extra binary that can
+# rewrite its own ACLs.
+#
+#   ghcr.io/kimistore/agent            the broker
+#   ghcr.io/kimistore/agent-credential kimistore-credential
+#
+# `make image` and the release workflow both pass --bare with these repository
+# names, so the tags are exactly those rather than ko's importpath-derived ones.
+
+defaultBaseImage: cgr.dev/chainguard/static:latest
+
+# arm64 is what the Raspberry Pi nodes run. amd64 is for any x86 peer and for CI.
+# Building both in one push matters because the release binaries are also built
+# for both, so an image and a binary of the same version agree.
+defaultPlatforms:
+  - linux/arm64
+  - linux/amd64
+
+builds:
+  - id: agent
+    main: ./cmd/agent
+    # ko 0.19 exposes only .Env to templates; the older .Version and .GitCommit
+    # variables are gone. `make image` and the release workflow export all three,
+    # so the stamp has exactly one source: git describe.
+    ldflags:
+      - -s -w
+      - -X kimistore/internal/version.Version={{.Env.KIMISTORE_BUILD_VERSION}}
+      - -X kimistore/internal/version.Commit={{.Env.KIMISTORE_BUILD_COMMIT}}
+      - -X kimistore/internal/version.Date={{.Env.KIMISTORE_BUILD_DATE}}
+
+  - id: credential
+    main: ./cmd/credential

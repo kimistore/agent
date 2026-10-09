@@ -43,6 +43,36 @@ help: ## Show this help
 build: ## Build the agent binary
 	$(GO) build -ldflags "$(LDFLAGS)" -o $(AGENT) ./cmd/agent
 
+# Container images. KO_REPO is the broker image; the administration tool gets
+# its own because ko builds one image per main, and because a running broker
+# should not carry a binary that can rewrite its own ACLs.
+KO_REPO        ?= ghcr.io/kimistore/agent
+KO_CRED_REPO   ?= ghcr.io/kimistore/agent-credential
+KO_PLATFORMS   ?= linux/arm64,linux/amd64
+
+.PHONY: image
+image: ## Build and push the broker image (and the credential image) with ko
+	@# The stamp comes from the same VERSION the binary build uses, so an image
+	@# and a binary of the same commit report the same version.
+	KIMISTORE_BUILD_VERSION=$(VERSION) \
+	KIMISTORE_BUILD_COMMIT=$(COMMIT) \
+	KIMISTORE_BUILD_DATE=$(BUILD_DATE) \
+	KO_DOCKER_REPO=$(KO_REPO) \
+	  ko build --bare --platform=$(KO_PLATFORMS) ./cmd/agent
+	KIMISTORE_BUILD_VERSION=$(VERSION) \
+	KIMISTORE_BUILD_COMMIT=$(COMMIT) \
+	KIMISTORE_BUILD_DATE=$(BUILD_DATE) \
+	KO_DOCKER_REPO=$(KO_CRED_REPO) \
+	  ko build --bare --platform=$(KO_PLATFORMS) ./cmd/credential
+
+.PHONY: image-local
+image-local: ## Build the broker image into the local docker daemon, unpushed
+	KIMISTORE_BUILD_VERSION=$(VERSION) \
+	KIMISTORE_BUILD_COMMIT=$(COMMIT) \
+	KIMISTORE_BUILD_DATE=$(BUILD_DATE) \
+	KO_DOCKER_REPO=$(KO_REPO) \
+	  ko build --bare --local --platform=linux/arm64 ./cmd/agent
+
 .PHONY: version
 version: ## Print the build stamp this tree would produce
 	@echo "VERSION=$(VERSION)"

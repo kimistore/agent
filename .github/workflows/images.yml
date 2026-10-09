@@ -1,0 +1,205 @@
+name: Images
+
+# Builds the container images with ko and signs them with cosign, keyless.
+#
+# Keyless means Sigstore issues a short-lived certificate from this job's
+# GitHub OIDC identity, so nothing has to be stored. A verifier needs no key at
+# all: cosign resolves the certificate from the transparency log and checks the
+# workflow identity, so anyone can confirm the image came from this repository's
+# workflow and not from somebody with a stolen credential.
+#
+# Triggers:
+#   - main            -> :main, so the chart's default tag tracks the branch
+#   - v* tag          -> :vX.Y.Z, signed, which is the release artifact
+#   - pull_request    -> built but not pushed, so a change cannot break the build
+#
+# The tag build is the one that matters for supply-chain trust: a moving :main
+# tag is convenient for development and worth little as a provenance claim.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_REPO: kimistore/agent
+  CREDENTIAL_IMAGE_REPO: kimistore/agent-credential
+  # arm64 is the Raspberry Pi nodes; amd64 covers any x86 peer and CI.
+  PLATFORMS: linux/arm64,linux/amd64
+
+permissions:
+  contents: read
+  packages: write
+  # Keyless signing exchanges this token for a Sigstore certificate. Without
+  # id-token: write, cosign has no identity to present and the signing step
+  # fails rather than falling back to something weaker.
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        # ko needs the tags to resolve a version, and the history for a commit.
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install ko
+        uses: ko-build/setup-ko-action@v1
+        with:
+          version: v0.19.1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # GHCR rejects an unsigned push, so the token has to be in place before ko
+      # runs rather than after.
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve the tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+            echo "publishing a release image: ${tag}"
+          else
+            tag="main"
+            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+            echo "publishing a moving branch tag: ${tag}"
+          fi
+          echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push the broker image
+        if: github.event_name != 'pull_request'
+        env:
+          KIMISTORE_BUILD_VERSION: ${{ steps.tag.outputs.version }}
+          KIMISTORE_BUILD_COMMIT: ${{ steps.tag.outputs.commit }}
+          KIMISTORE_BUILD_DATE: ${{ steps.tag.outputs.date }}
+          KO_DOCKER_REPO: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}
+        run: |
+          set -euo pipefail
+          # --bare names the image exactly KO_DOCKER_REPO rather than deriving a
+          # name from the Go importpath, so the tag is ghcr.io/kimistore/agent.
+          ref=$(ko build --bare --platform="${PLATFORMS}" --sbom-dir=/tmp/sbom ./cmd/agent)
+          echo "ref=${ref}" >> "$GITHUB_ENV"
+          echo "broker image: ${ref}"
+          crane tag "${ref}" "${KO_DOCKER_REPO}:${{ steps.tag.outputs.tag }}"
+          echo "sha256=$(crane digest "${KO_DOCKER_REPO}:${{ steps.tag.outputs.tag }}")" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push the credential image
+        id: credential
+        if: github.event_name != 'pull_request'
+        env:
+          KIMISTORE_BUILD_VERSION: ${{ steps.tag.outputs.version }}
+          KIMISTORE_BUILD_COMMIT: ${{ steps.tag.outputs.commit }}
+          KIMISTORE_BUILD_DATE: ${{ steps.tag.outputs.date }}
+          KO_DOCKER_REPO: ${{ env.REGISTRY }}/${{ env.CREDENTIAL_IMAGE_REPO }}
+        run: |
+          set -euo pipefail
+          # A separate image, not a second binary in the broker image: ko builds
+          # one image per main, and a running broker should not carry a tool
+          # that can rewrite its own ACLs.
+          ref=$(ko build --bare --platform="${PLATFORMS}" ./cmd/credential)
+          echo "credential image: ${ref}"
+          crane tag "${ref}" "${KO_DOCKER_REPO}:${{ steps.tag.outputs.tag }}"
+          echo "sha256=$(crane digest "${KO_DOCKER_REPO}:${{ steps.tag.outputs.tag }}")" >> "$GITHUB_OUTPUT"
+
+      # Keyless. cosign reads the OIDC token the runner provides, trades it for a
+      # Fulcio certificate bound to this repository's workflow identity, and
+      # records the signature in the transparency log.
+      - name: Sign the broker image
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}@${{ steps.tag.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes --recursive "${IMAGE}"
+          echo "signed: ${IMAGE}"
+
+      # Signed as well as pushed. The tool is published, and a published artifact
+      # that is not signed teaches everyone to skip the check on the one that is.
+      - name: Sign the credential image
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.CREDENTIAL_IMAGE_REPO }}@${{ steps.credential.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes --recursive "${IMAGE}"
+
+      - name: Attest the SBOM
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}@${{ steps.tag.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          for sbom in /tmp/sbom/*.spdx.json; do
+            [ -e "$sbom" ] || continue
+            cosign attest --yes --type spdxjson --predicate "$sbom" "${IMAGE}"
+          done
+
+      # Verify rather than assume. A signing step that silently did nothing would
+      # leave the tag looking signed to anyone who trusted the workflow.
+      - name: Verify the signature
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}@${{ steps.tag.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          cosign verify "${IMAGE}" \
+            --certificate-identity-regexp 'https://github\.com/${{ github.repository }}/.github/workflows/images\.yml@.*' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+      # A pull request still proves the build works, without spending a push or
+      # minting a certificate for an untrusted commit.
+      - name: Build without pushing
+        if: github.event_name == 'pull_request'
+        env:
+          KIMISTORE_BUILD_VERSION: pr-${{ github.event.number }}
+          KIMISTORE_BUILD_COMMIT: ${{ github.event.pull_request.head.sha }}
+          KIMISTORE_BUILD_DATE: ${{ steps.tag.outputs.date }}
+        run: |
+          set -euo pipefail
+          ko build --bare --push=false --platform=linux/amd64 ./cmd/agent
+          echo "the image builds for pull requests"
+
+      - name: Summarise
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}@${{ steps.tag.outputs.sha256 }}
+        run: |
+          {
+            echo "## Image published"
+            echo
+            echo '```'
+            echo "${IMAGE}"
+            echo '```'
+            echo
+            echo "Tag: \`${{ steps.tag.outputs.tag }}\`"
+            echo
+            echo "Signed keyless. Verify with:"
+            echo
+            echo '```'
+            echo "cosign verify ${IMAGE} \\"
+            echo "  --certificate-identity-regexp 'https://github.com/${{ github.repository }}/.github/workflows/images.yml@.*' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
