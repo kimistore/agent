@@ -71,9 +71,15 @@ jobs:
         # read this repo's schema v2 config and is built with a Go older than
         # the go directive in go.mod, so it failed to load the config at all.
         # Pinned rather than "latest" so the lint result is reproducible.
+        #
+        # v2.14.0 for the typecheck pass: v2.13.2 is built with an x/tools that
+        # cannot decode Go 1.27 export data ("export data version 5 is greater
+        # than maximum supported version 4"), so every standard-library import
+        # failed to load and the run died with typecheck errors that had
+        # nothing to do with this code. v2.14.0 carries x/tools 0.50.
         uses: golangci/golangci-lint-action@v7
         with:
-          version: v2.13.2
+          version: v2.14.0
           args: --timeout=5m
 
       - name: Benchmark smoke test

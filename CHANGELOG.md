@@ -52,6 +52,16 @@ store.
   `kimistore_build_info` metrics
 - `kimistore-credential` for SCRAM credentials and ACL rules
 - A static site published to GitHub Pages
+- Multi-platform container images for `linux/arm64` and `linux/amd64`, built
+  with ko and published to `ghcr.io/kimistore/agent` and
+  `ghcr.io/kimistore/agent-credential`. Both are signed keyless with cosign, so
+  verification needs no key and a stolen registry credential cannot mint a
+  certificate claiming to be this repository's build workflow. Every `vX.Y.Z`
+  tag publishes a signed release image; `:main` tracks the branch
+- `/ready` and `/live` on the metrics port, so a Kubernetes probe can tell a
+  broker that should be sent clients apart from one that should merely be
+  restarted. `/ready` reports 503 with a reason when partition claims cannot be
+  renewed or the cluster view is stale
 
 ### Changed
 

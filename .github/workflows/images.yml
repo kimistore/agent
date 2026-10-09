@@ -10,11 +10,14 @@ name: Images
 #
 # Triggers:
 #   - main            -> :main, so the chart's default tag tracks the branch
-#   - v* tag          -> :vX.Y.Z, signed, which is the release artifact
+#   - v* tag          -> :vX.Y.Z and :X.Y.Z, signed, which is the release artifact
 #   - pull_request    -> built but not pushed, so a change cannot break the build
 #
 # The tag build is the one that matters for supply-chain trust: a moving :main
 # tag is convenient for development and worth little as a provenance claim.
+#
+# Release images get both the v-prefixed and the bare semver spelling, because
+# the chart's appVersion is bare and Helm resolves image tags by string.
 
 on:
   push:
@@ -78,10 +81,29 @@ jobs:
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             tag="${GITHUB_REF_NAME}"
             echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-            echo "publishing a release image: ${tag}"
+            # A git tag carries the conventional "v" prefix; semver itself does
+            # not. Publish both spellings so a consumer that derives the image
+            # tag from the chart's appVersion finds the bare one, while the
+            # v-prefixed one still matches the git tag and every other tool's
+            # default. Both names resolve to the same digest, and the digest is
+            # what gets signed, so the second name adds reach, not trust.
+            #
+            # Only for a bare vMAJOR.MINOR.PATCH (an optional pre-release suffix
+            # is allowed). Anything else falls through to the tag verbatim, so a
+            # malformed or non-semver tag is never silently rewritten.
+            if [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              tags="${tag},${tag#v}"
+              echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+              echo "publishing semver tags: ${tags}"
+            else
+              tags="${tag}"
+              echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+              echo "publishing a release image: ${tag}"
+            fi
           else
             tag="main"
             echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+            echo "tags=main" >> "$GITHUB_OUTPUT"
             echo "publishing a moving branch tag: ${tag}"
           fi
           echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
@@ -112,7 +134,7 @@ jobs:
           # The digest is what gets signed, not the tag: a tag can be repointed
           # afterwards, so a signature over a tag proves only that something was
           # signed once.
-          ref=$(ko build --bare --tags="${{ steps.tag.outputs.tag }}" \
+          ref=$(ko build --bare --tags="${{ steps.tag.outputs.tags }}" \
             --platform="${PLATFORMS}" --sbom-dir=/tmp/sbom ./cmd/agent)
           echo "resolved: ${ref}"
           digest=$(echo "${ref}" | grep -oE 'sha256:[0-9a-f]{64}$' | tail -1)
@@ -136,7 +158,7 @@ jobs:
           # A separate image, not a second binary in the broker image: ko builds
           # one image per main, and a running broker should not carry a tool
           # that can rewrite its own ACLs.
-          ref=$(ko build --bare --tags="${{ steps.tag.outputs.tag }}" \
+          ref=$(ko build --bare --tags="${{ steps.tag.outputs.tags }}" \
             --platform="${PLATFORMS}" ./cmd/credential)
           echo "resolved: ${ref}"
           digest=$(echo "${ref}" | grep -oE 'sha256:[0-9a-f]{64}$' | tail -1)
@@ -228,7 +250,7 @@ jobs:
             echo "${IMAGE}"
             echo '```'
             echo
-            echo "Tag: \`${{ steps.tag.outputs.tag }}\`"
+            echo "Tag: \`${{ steps.tag.outputs.tags }}\`"
             echo
             echo "Signed keyless. Verify with:"
             echo
