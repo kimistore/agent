@@ -11,6 +11,42 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.2
+
+The object-store listing that a read used to locate a segment is gone from the
+read path, and so is the listing that used to rebuild it.
+
+Listing a partition grows with that partition's entire history, and it stops
+completing well before a partition gets large: against RustFS a single 1000-key
+page took over 60 seconds and a full pass did not finish in 200. Since an
+object-store call is bounded by the 30 second operation timeout, every read for
+an offset below the local WAL failed. A consumer could not catch up, and a read
+path that fails is an outage rather than a slow read.
+
+This was the same slow listing behind the 1.0.1 upload deadlock. That release
+stopped it starving the upload workers; this removes it.
+
+### Fixed
+
+- A read resolves the segment covering an offset from the manifest's segment
+  inventory, by binary search, instead of listing the partition prefix. The
+  listing remains only as a fallback for a partition with no inventory yet
+- Each uploaded segment is recorded in the inventory and marks its manifest
+  dirty, so the index survives a restart and recovery never lists. Before this,
+  recovery rebuilt the inventory by listing, which timed out, so a restarted
+  agent came up with an empty inventory and every cold read fell back to the
+  listing that had just failed
+- Recording a segment already present replaces it rather than appending, so a
+  reconciliation re-upload cannot grow the manifest without bound
+
+### Known limitations
+
+- The inventory only covers segments uploaded after upgrading to this release.
+  History written by an earlier version was never recorded and cannot be read
+  back, because doing so needs the listing this release removes. Backfill it by
+  replaying the partition, or accept that consumers resume from the oldest
+  segment recorded since the upgrade
+
 ## 1.0.1
 
 A read-path deadlock that could stop the log uploading without stopping the
