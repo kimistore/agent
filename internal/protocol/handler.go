@@ -906,6 +906,34 @@ func handleOffsetFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine,
 
 	// Response V1: topics[] of (name, partitions[] of
 	//              (partition, offset, metadata, error))
+
+	// An empty topic list means "every topic this group has an offset for",
+	// which is how librdkafka asks when it wants the whole group position and
+	// how Mimir's ingester asks. Answering with an empty array there is what
+	// makes it fall back to auto.offset.reset and replay the log from the
+	// beginning: on knode3 the ingester ignored a committed offset of 618775
+	// and fetched from 0, so a consumer could never catch up.
+	//
+	// The group is rebuilt from JoinGroup on a coordinator change, so the
+	// committed offsets are the only durable record of where it was. Losing
+	// them to an empty answer is silent: the consumer still works, it just
+	// starts over.
+	if count <= 0 {
+		committed := store.CommittedOffsetsFor(groupID)
+		enc.Int32(int32(len(committed)))
+		for topic, parts := range committed {
+			enc.String(topic)
+			enc.Int32(int32(len(parts)))
+			for partition, offset := range parts {
+				enc.Int32(partition)
+				enc.Int64(offset)
+				enc.String("") // Metadata
+				enc.Int16(ErrNone)
+			}
+		}
+		return enc.Bytes(), nil
+	}
+
 	enc.Int32(count)
 
 	for i := 0; i < int(count); i++ {

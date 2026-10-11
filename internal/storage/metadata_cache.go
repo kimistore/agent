@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -352,6 +353,46 @@ func (mc *MetadataCache) AddSegment(topic string, partition int32, seg *SegmentM
 	ps.Segments = append(ps.Segments, nil)
 	copy(ps.Segments[i+1:], ps.Segments[i:])
 	ps.Segments[i] = seg
+}
+
+// CommittedOffsetsFor returns a group's durable committed offsets grouped by
+// topic, then partition.
+func (mc *MetadataCache) CommittedOffsetsFor(groupID string) map[string]map[int32]int64 {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+
+	out := make(map[string]map[int32]int64)
+	for key, offset := range mc.Committed[groupID] {
+		slash := strings.LastIndex(key, "/")
+		if slash <= 0 || slash == len(key)-1 {
+			continue
+		}
+		p, err := strconv.ParseInt(key[slash+1:], 10, 32)
+		if err != nil {
+			continue
+		}
+		topic := key[:slash]
+		if out[topic] == nil {
+			out[topic] = make(map[int32]int64)
+		}
+		out[topic][int32(p)] = offset
+	}
+	return out
+}
+
+// SetCommitted records a group's committed offset in the durable map. It is
+// how a position recovered from a checkpoint becomes visible again.
+func (mc *MetadataCache) SetCommitted(groupID, topic string, partition int32, offset int64) {
+	key := topic + "/" + strconv.Itoa(int(partition))
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	if mc.Committed == nil {
+		mc.Committed = make(map[string]map[string]int64)
+	}
+	if mc.Committed[groupID] == nil {
+		mc.Committed[groupID] = make(map[string]int64)
+	}
+	mc.Committed[groupID][key] = offset
 }
 
 // TopicsSnapshot returns a deep copy of the durable state, suitable for

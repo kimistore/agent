@@ -2740,3 +2740,43 @@ func (s *StorageEngine) endOffsetsFromObject(ctx context.Context, topic string, 
 	}
 	return end, start, nil
 }
+
+// CommittedOffsetsFor exposes a group's committed offsets grouped by topic and
+// partition, for an OffsetFetch that named no topics.
+//
+// Both stores are consulted. committedByGroup is current within a run, while
+// metadataCache.Committed is what a restart recovered from the checkpoint and
+// is only refreshed at checkpoint time; reading either alone would answer -1
+// for a position the broker genuinely holds.
+func (s *StorageEngine) CommittedOffsetsFor(groupID string) map[string]map[int32]int64 {
+	merged := make(map[string]int64)
+
+	s.metadataCache.mu.RLock()
+	for k, v := range s.metadataCache.Committed[groupID] {
+		merged[k] = v
+	}
+	s.metadataCache.mu.RUnlock()
+
+	s.committedMu.Lock()
+	for k, v := range s.committedByGroup[groupID] {
+		merged[k] = v
+	}
+	s.committedMu.Unlock()
+
+	out := make(map[string]map[int32]int64)
+	for key, offset := range merged {
+		slash := strings.LastIndex(key, "/")
+		if slash <= 0 || slash == len(key)-1 {
+			continue
+		}
+		p, err := strconv.ParseInt(key[slash+1:], 10, 32)
+		if err != nil {
+			continue
+		}
+		if out[key[:slash]] == nil {
+			out[key[:slash]] = make(map[int32]int64)
+		}
+		out[key[:slash]][int32(p)] = offset
+	}
+	return out
+}
