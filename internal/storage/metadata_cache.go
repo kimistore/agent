@@ -327,6 +327,33 @@ func (mc *MetadataCache) SegmentFor(topic string, partition int32, offset int64)
 	return seg.S3Key
 }
 
+// AddSegment records an uploaded segment in a partition's ordered inventory.
+//
+// The order is by start offset because that is the order the manifest
+// documents and the order SegmentFor's binary search needs. An existing entry
+// with the same key is replaced rather than duplicated, so a reconciliation
+// re-upload is idempotent.
+func (mc *MetadataCache) AddSegment(topic string, partition int32, seg *SegmentMetadata) {
+	if seg == nil {
+		return
+	}
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	ps := mc.touchLocked(topic, partition)
+	i := sort.Search(len(ps.Segments), func(i int) bool {
+		return ps.Segments[i].StartOffset >= seg.StartOffset
+	})
+	if i < len(ps.Segments) && ps.Segments[i].StartOffset == seg.StartOffset && ps.Segments[i].S3Key == seg.S3Key {
+		// Same segment recorded again: refresh its end rather than duplicate it.
+		ps.Segments[i] = seg
+		return
+	}
+	ps.Segments = append(ps.Segments, nil)
+	copy(ps.Segments[i+1:], ps.Segments[i:])
+	ps.Segments[i] = seg
+}
+
 // TopicsSnapshot returns a deep copy of the durable state, suitable for
 // serialising without holding the lock across I/O.
 func (mc *MetadataCache) TopicsSnapshot() map[string]map[int32]*PartitionState {

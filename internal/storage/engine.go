@@ -1773,6 +1773,18 @@ func (s *StorageEngine) handleUpload(ctx context.Context, task wal.UploadTask) {
 	metrics.UploaderTaskCount.WithLabelValues("success", task.Source).Inc()
 	metrics.UploaderBytesUploaded.Add(float64(info.Size()))
 
+	// Record the segment in the durable inventory, so the manifest carries the
+	// partition's segment index without anything having to list object storage
+	// to rebuild it.
+	//
+	// Recovery used to reconstruct this by listing the whole prefix. That
+	// listing grows with the partition's history and stops completing well
+	// before a partition is large, so a restarted agent came up with an empty
+	// inventory and every read for a cold offset fell back to the same listing
+	// and failed. Recording each upload here makes the manifest the durable
+	// source of the index instead.
+	s.recordSegmentUploaded(task.Topic, task.Partition, task.BaseOffset, task.EndOffset, key)
+
 	cacheKey := fmt.Sprintf("%s/%d", task.Topic, task.Partition)
 	s.cacheMu.Lock()
 	// Only append when the key is already cached. If a fill is in flight or the
@@ -1783,6 +1795,26 @@ func (s *StorageEngine) handleUpload(ctx context.Context, task wal.UploadTask) {
 		s.segmentCache[cacheKey] = append(list, key)
 	}
 	s.cacheMu.Unlock()
+}
+
+// recordSegmentUploaded adds one uploaded segment to a partition's ordered
+// inventory and marks its manifest dirty.
+//
+// The inventory is kept ordered by start offset because that is the order the
+// manifest documents and the order a binary search over it needs. A segment
+// whose start is below every known segment is inserted at the front; one that
+// is already present is replaced, which is what a re-upload of the same segment
+// after a reconciliation pass does.
+func (s *StorageEngine) recordSegmentUploaded(topic string, partition int32, base, end int64, key string) {
+	if key == "" {
+		return
+	}
+	s.metadataCache.AddSegment(topic, partition, &SegmentMetadata{
+		StartOffset: base,
+		EndOffset:   end,
+		S3Key:       key,
+	})
+	s.markManifestDirty(topic, partition)
 }
 
 func (s *StorageEngine) uploaderLoop() {

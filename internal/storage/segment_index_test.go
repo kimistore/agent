@@ -160,3 +160,83 @@ func TestReadBatchContext_ResolvesFromManifestWithoutListing(t *testing.T) {
 func segmentNameForTest(base int64) string {
 	return fmt.Sprintf("%020d-e1.log", base)
 }
+
+// The inventory a restart recovers must come from the manifest, not from a
+// listing. This is the case that was broken on knode3: recovery rebuilt the
+// index with objectSegments, whose listing cannot complete on a partition with
+// tens of thousands of segments, so the agent came up with an empty inventory
+// and every read for a cold offset fell back to that same listing and failed.
+func TestSegmentFor_RecoveredFromManifestWithoutListing(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine := newEngine(t, store)
+	defer engine.Close()
+
+	// Two uploaded segments recorded the way handleUpload records them.
+	engine.recordSegmentUploaded("orders", 0, 100, 200, "orders/0/00000000000000000100-e1.log")
+	engine.recordSegmentUploaded("orders", 0, 200, 300, "orders/0/00000000000000000200-e1.log")
+
+	if _, dirty := engine.manifestDirty["orders/0"]; !dirty {
+		t.Error("uploading a segment did not mark its manifest dirty, so the index would not survive a restart")
+	}
+
+	// Serialise the way a checkpoint does, then rebuild from it alone.
+	raw, err := engine.metadataCache.ToJSON()
+	if err != nil {
+		t.Fatalf("serialise: %v", err)
+	}
+	recovered := NewMetadataCache()
+	if err := recovered.FromJSON(raw); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	cases := map[int64]string{
+		150:  "orders/0/00000000000000000100-e1.log",
+		200:  "orders/0/00000000000000000200-e1.log",
+		250:  "orders/0/00000000000000000200-e1.log",
+		99:   "",
+		1000: "orders/0/00000000000000000200-e1.log",
+	}
+	for offset, want := range cases {
+		if got := recovered.SegmentFor("orders", 0, offset); got != want {
+			t.Errorf("after restart SegmentFor(%d) = %q, want %q", offset, got, want)
+		}
+	}
+}
+
+// Recording the same segment twice must not grow the inventory: a
+// reconciliation pass re-uploads segments, and a duplicate would make the
+// manifest grow without bound over the life of a partition.
+func TestAddSegment_IsIdempotent(t *testing.T) {
+	mc := NewMetadataCache()
+	seg := &SegmentMetadata{StartOffset: 100, EndOffset: 200, S3Key: "orders/0/a.log"}
+	for i := 0; i < 5; i++ {
+		mc.AddSegment("orders", 0, seg)
+	}
+	if got := len(mc.Topics["orders"].Partitions[0].Segments); got != 1 {
+		t.Errorf("recorded the same segment %d times, inventory holds %d entries, want 1", 5, got)
+	}
+}
+
+// The inventory is searched by binary search, so it has to stay sorted as
+// segments arrive out of order.
+func TestAddSegment_KeepsOrder(t *testing.T) {
+	mc := NewMetadataCache()
+	for _, base := range []int64{500, 100, 300, 200} {
+		mc.AddSegment("orders", 0, &SegmentMetadata{
+			StartOffset: base, EndOffset: base + 50,
+			S3Key: fmt.Sprintf("orders/0/%020d-e1.log", base),
+		})
+	}
+	segs := mc.Topics["orders"].Partitions[0].Segments
+	if len(segs) != 4 {
+		t.Fatalf("inventory holds %d segments, want 4", len(segs))
+	}
+	for i := 1; i < len(segs); i++ {
+		if segs[i-1].StartOffset >= segs[i].StartOffset {
+			t.Fatalf("inventory is not sorted at %d: %d >= %d", i, segs[i-1].StartOffset, segs[i].StartOffset)
+		}
+	}
+	if got := mc.SegmentFor("orders", 0, 320); got != "orders/0/00000000000000000300-e1.log" {
+		t.Errorf("SegmentFor(320) = %q, want the 300 segment", got)
+	}
+}
