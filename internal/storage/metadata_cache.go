@@ -289,6 +289,44 @@ func (mc *MetadataCache) LogStartOffset(topic string, partition int32) int64 {
 	return ps.LogStartOffset
 }
 
+// SegmentFor returns the key of the uploaded segment covering offset, found by
+// binary search over the ordered inventory the manifest carries.
+//
+// It exists so a read never has to list object storage. The inventory is
+// ordered oldest first, so the segment covering an offset is the last one
+// whose start is at or below it. Returning "" means the inventory does not
+// cover the offset, and the caller has to fall back to a listing.
+//
+// EndOffset is deliberately not consulted. It is -1 for any segment this
+// agent cannot prove an end for, and treating that as the end of the range
+// would make a reader conclude the offset falls past it and look in the wrong
+// place. The start offsets alone already order the inventory unambiguously.
+func (mc *MetadataCache) SegmentFor(topic string, partition int32, offset int64) string {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	ts, ok := mc.Topics[topic]
+	if !ok {
+		return ""
+	}
+	ps, ok := ts.Partitions[partition]
+	if !ok || len(ps.Segments) == 0 {
+		return ""
+	}
+
+	segs := ps.Segments
+	i := sort.Search(len(segs), func(i int) bool { return segs[i].StartOffset > offset })
+	if i == 0 {
+		// Every segment starts after the requested offset, so the offset
+		// predates the oldest segment still on record.
+		return ""
+	}
+	seg := segs[i-1]
+	if seg == nil || seg.S3Key == "" {
+		return ""
+	}
+	return seg.S3Key
+}
+
 // TopicsSnapshot returns a deep copy of the durable state, suitable for
 // serialising without holding the lock across I/O.
 func (mc *MetadataCache) TopicsSnapshot() map[string]map[int32]*PartitionState {

@@ -930,12 +930,23 @@ func (s *StorageEngine) ReadBatchContext(ctx context.Context, topic string, part
 	prefix := partitionPrefix(topic, partition)
 	cacheKey := fmt.Sprintf("%s/%d", topic, partition)
 
-	keys, err := s.cachedSegments(ctx, prefix, cacheKey)
-	if err != nil {
-		return nil, 0, err
+	// The manifest carries the partition's segment inventory, so the segment
+	// covering this offset can be found in memory. Listing the whole prefix to
+	// find it does not scale: the listing grows with the partition's entire
+	// history, and on a partition with tens of thousands of segments a single
+	// page already outlasts the operation timeout, which makes every read
+	// below the local WAL fail. That is a read-path outage, not a slow read.
+	//
+	// The listing is kept as a fallback for the one case the inventory cannot
+	// answer: a partition this agent has no inventory for yet.
+	bestKey := s.metadataCache.SegmentFor(topic, partition, offset)
+	if bestKey == "" {
+		keys, err := s.cachedSegments(ctx, prefix, cacheKey)
+		if err != nil {
+			return nil, 0, err
+		}
+		bestKey = bestSegmentFor(keys, offset)
 	}
-
-	bestKey := bestSegmentFor(keys, offset)
 	if bestKey == "" {
 		return nil, 0, fmt.Errorf("%w: offset %d not found in any segment under %s", ErrOffsetUnavailable, offset, prefix)
 	}
@@ -953,7 +964,10 @@ func (s *StorageEngine) ReadBatchContext(ctx context.Context, topic string, part
 		_ = rc.Close()
 	}
 
-	var rc io.ReadCloser
+	var (
+		rc  io.ReadCloser
+		err error
+	)
 	if indexed {
 		// The index already points at the start of a record, so only the
 		// region from there to the end of the segment is needed. Sizing this
