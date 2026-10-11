@@ -11,6 +11,31 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.1
+
+A read-path deadlock that could stop the log uploading without stopping the
+broker from accepting connections.
+
+### Fixed
+
+- The segment cache no longer holds its lock across an object-store LIST.
+  `handleUpload` needs that same lock to record a finished upload, so a slow
+  LIST under concurrent reads could starve every upload worker. Nothing would
+  then drain the upload queue, sealed segments would pile up on local disk, and
+  every `acks=all` producer would time out while the broker still answered
+  metadata and health probes. Observed on knode3 with all eight workers parked
+  for 17.7 hours and 15,133 segments stranded; see `fix: stop holding the
+  segment cache lock across a LIST`
+
+### Changed
+
+- Concurrent cache misses on one partition issue a single LIST rather than one
+  per reader, via a per-key flight rather than a global lock
+- A failed LIST is memoised for five seconds, so an object store that is down
+  is not asked once per reader
+- Retention invalidation bumps a per-key generation, so a LIST already in
+  flight when segments were deleted is discarded instead of republishing them
+
 ## 1.0.0
 
 The first release. Kimistore serves the Kafka protocol from a Write-Ahead Log
