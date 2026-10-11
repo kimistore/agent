@@ -204,9 +204,7 @@ func (s *StorageEngine) deleteStaleEpochSegments(ctx context.Context, cacheKey s
 		log.Printf("Retention: deleted %s, superseded by a newer ownership epoch", seg.Key)
 	}
 	if deleted > 0 {
-		s.cacheMu.Lock()
-		delete(s.segmentCache, cacheKey)
-		s.cacheMu.Unlock()
+		s.invalidateCache(cacheKey)
 	}
 	return deleted
 }
@@ -330,9 +328,7 @@ func (s *StorageEngine) processPartitionRetention(ctx context.Context, topic str
 	if deleted > 0 {
 		// The cached key list is now stale, and the index sidecars for the
 		// deleted segments are gone with them.
-		s.cacheMu.Lock()
-		delete(s.segmentCache, cacheKey)
-		s.cacheMu.Unlock()
+		s.invalidateCache(cacheKey)
 
 		// The log start has moved. ListOffsets has to report it, otherwise a
 		// consumer that resets to "earliest" is sent to an offset that no

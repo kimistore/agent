@@ -80,9 +80,30 @@ type StorageEngine struct {
 	// ones it no longer wins. Off unless WithAssignment says otherwise.
 	assignment AssignmentConfig
 
-	// Cache for S3 List results (topic/partition -> []keys)
+	// Cache for S3 List results (topic/partition -> []keys).
+	//
+	// cacheMu guards the map and nothing else. It is never held across an
+	// object-store call: doing so made the cache the broker's narrowest
+	// bottleneck, because the uploader needs this same lock to record a
+	// finished upload and a burst of cold reads can hold it indefinitely.
+	// Concurrent misses on one key collapse into a single LIST through
+	// cacheFlights instead.
 	segmentCache map[string][]string
 	cacheMu      sync.RWMutex
+
+	// cacheFlights holds an in-flight cache fill per key, so N concurrent
+	// readers missing the same prefix produce one LIST rather than N.
+	cacheFlights map[string]*cacheFlight
+
+	// cacheRetryAfter memoises a failed LIST per key until the deadline. A
+	// store that is slow or down would otherwise have every reader retry it,
+	// each holding a slot in the fill below for as long as the call takes.
+	cacheRetryAfter map[string]time.Time
+
+	// cacheGen counts invalidations per key. A fill that started before the
+	// current generation discards its result, so a LIST that was already in
+	// flight when retention deleted segments cannot republish them.
+	cacheGen map[string]uint64
 
 	// Buffer for offsets (groupID/topic/partition -> offset)
 	offsetBuf   map[string]int64
@@ -278,6 +299,9 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 		quit:             make(chan struct{}),
 		uploadChan:       make(chan wal.UploadTask, 1024),
 		segmentCache:     make(map[string][]string),
+		cacheFlights:     make(map[string]*cacheFlight),
+		cacheRetryAfter:  make(map[string]time.Time),
+		cacheGen:         make(map[string]uint64),
 		offsetBuf:        make(map[string]int64),
 		committedByGroup: make(map[string]map[string]int64),
 		rehydrateDone:    make(chan struct{}),
@@ -980,34 +1004,157 @@ const singleEntryBudget int64 = 1 << 40
 
 // cachedSegments returns the segment keys under prefix, listing object
 // storage only on a cache miss.
+//
+// The lock is held only for map access, never across the LIST. The previous
+// version held cacheMu for the whole call, which put a network round trip on
+// the uploader's critical path: handleUpload needs the same lock to record a
+// finished upload, so a cold cache under concurrent reads could starve all
+// eight upload workers indefinitely. On knode3 that wedged the pool for 17
+// hours -- 15,133 segments stranded on disk and every acks=all producer
+// timing out -- because nothing was draining the upload queue and the fast
+// path had nowhere to hand its sealed segments.
+//
+// One fill per key happens at a time; concurrent misses for the same prefix
+// wait for that fill rather than issuing their own LIST.
 func (s *StorageEngine) cachedSegments(ctx context.Context, prefix, cacheKey string) ([]string, error) {
-	s.cacheMu.RLock()
-	keys, hit := s.segmentCache[cacheKey]
-	s.cacheMu.RUnlock()
-	if hit {
+	if keys, ok := s.cachedSegmentsHit(cacheKey); ok {
 		return keys, nil
 	}
-
-	// Serialise the refill so a burst of cold reads produces one LIST rather
-	// than one per reader.
-	s.cacheMu.Lock()
-	defer s.cacheMu.Unlock()
-	if keys, hit := s.segmentCache[cacheKey]; hit {
-		return keys, nil
+	// A fill that failed recently is memoised, so a store that is down does not
+	// get one LIST per reader. Checked before claiming a fill, because
+	// otherwise every fresh caller becomes a leader and re-issues the call.
+	if err := s.cacheFillErr(cacheKey); err != nil {
+		return nil, err
 	}
 
+	// Claim the fill, or wait for whoever already holds it.
+	for {
+		wait, ok := s.beginCacheFill(cacheKey)
+		if !ok {
+			wait()
+			// The fill may have succeeded or failed. Either way, the answer
+			// is now in the cache or the retry memo, so re-check rather than
+			// loop: a failed fill would otherwise be retried in a tight loop.
+			if keys, hit := s.cachedSegmentsHit(cacheKey); hit {
+				return keys, nil
+			}
+			if err := s.cacheFillErr(cacheKey); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		break
+	}
+
+	// Outside the lock: this is the call the old code held cacheMu for.
 	objects, err := s.objList(ctx, prefix)
+	var keys []string
 	if err != nil {
-		return nil, fmt.Errorf("failed to list %s: %w", prefix, err)
-	}
-	keys = make([]string, 0, len(objects))
-	for _, o := range objects {
-		if strings.HasSuffix(o.Key, ".log") {
-			keys = append(keys, o.Key)
+		err = fmt.Errorf("failed to list %s: %w", prefix, err)
+	} else {
+		keys = make([]string, 0, len(objects))
+		for _, o := range objects {
+			if strings.HasSuffix(o.Key, ".log") {
+				keys = append(keys, o.Key)
+			}
 		}
 	}
-	s.segmentCache[cacheKey] = keys
+	s.endCacheFill(cacheKey, keys, err)
+
+	if err != nil {
+		return nil, err
+	}
 	return keys, nil
+}
+
+// cacheFlight is one in-progress cache fill for a key.
+type cacheFlight struct {
+	done chan struct{}
+	gen  uint64
+}
+
+// cacheFillRetryAfter is how long a failed LIST is memoised. Short enough
+// that a recovered store is picked up promptly, long enough to stop every
+// reader hammering a store that is down.
+const cacheFillRetryAfter = 5 * time.Second
+
+// cachedSegmentsHit returns the cached key list, and reports whether the cache
+// could answer without listing.
+func (s *StorageEngine) cachedSegmentsHit(cacheKey string) ([]string, bool) {
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
+	keys, ok := s.segmentCache[cacheKey]
+	return keys, ok
+}
+
+// cacheFillErr returns the memoised error for a key whose last fill failed and
+// whose backoff has not yet elapsed, and nil otherwise.
+func (s *StorageEngine) cacheFillErr(cacheKey string) error {
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
+	until, ok := s.cacheRetryAfter[cacheKey]
+	if !ok {
+		return nil
+	}
+	if time.Now().After(until) {
+		return nil
+	}
+	return fmt.Errorf("object storage listing for %s is backing off after a recent failure", cacheKey)
+}
+
+// beginCacheFill claims the fill for cacheKey. It returns wait non-nil when
+// another goroutine already holds the fill, in which case the caller must call
+// it to wait for that fill to finish.
+func (s *StorageEngine) beginCacheFill(cacheKey string) (wait func(), leader bool) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
+	if f, ok := s.cacheFlights[cacheKey]; ok {
+		return func() { <-f.done }, false
+	}
+	s.cacheFlights[cacheKey] = &cacheFlight{
+		done: make(chan struct{}),
+		gen:  s.cacheGen[cacheKey],
+	}
+	return nil, true
+}
+
+// invalidateCache drops the cached keys for cacheKey and bumps its generation,
+// so a fill already in flight is discarded rather than republished.
+//
+// It never waits on that fill. Callers are retention sweeps, which run on a
+// timer and must not block behind a slow LIST.
+func (s *StorageEngine) invalidateCache(cacheKey string) {
+	s.cacheMu.Lock()
+	delete(s.segmentCache, cacheKey)
+	delete(s.cacheRetryAfter, cacheKey)
+	s.cacheGen[cacheKey]++
+	s.cacheMu.Unlock()
+}
+
+// endCacheFill publishes the result of a fill and releases everyone waiting on
+// it. An error is memoised rather than retried per reader.
+func (s *StorageEngine) endCacheFill(cacheKey string, keys []string, err error) {
+	s.cacheMu.Lock()
+	f := s.cacheFlights[cacheKey]
+	delete(s.cacheFlights, cacheKey)
+	switch {
+	case f == nil:
+		// Invalidated and finished in the same instant; nothing to publish to.
+	case f.gen != s.cacheGen[cacheKey]:
+		// Retention invalidated this key while the LIST was in flight, so the
+		// result describes segments that may since have been deleted.
+	case err != nil:
+		s.cacheRetryAfter[cacheKey] = time.Now().Add(cacheFillRetryAfter)
+	default:
+		s.segmentCache[cacheKey] = keys
+		delete(s.cacheRetryAfter, cacheKey)
+	}
+	s.cacheMu.Unlock()
+
+	if f != nil {
+		close(f.done)
+	}
 }
 
 // bestSegmentFor picks the newest segment whose start offset is at or below
@@ -1614,6 +1761,10 @@ func (s *StorageEngine) handleUpload(ctx context.Context, task wal.UploadTask) {
 
 	cacheKey := fmt.Sprintf("%s/%d", task.Topic, task.Partition)
 	s.cacheMu.Lock()
+	// Only append when the key is already cached. If a fill is in flight or the
+	// key was invalidated, appending here would either lose the segment or
+	// resurrect a list retention has just invalidated; the fill or the next
+	// read picks it up from object storage instead.
 	if list, ok := s.segmentCache[cacheKey]; ok {
 		s.segmentCache[cacheKey] = append(list, key)
 	}
