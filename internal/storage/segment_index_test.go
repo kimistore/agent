@@ -240,3 +240,83 @@ func TestAddSegment_KeepsOrder(t *testing.T) {
 		t.Errorf("SegmentFor(320) = %q, want the 300 segment", got)
 	}
 }
+
+// A re-claimed partition writes the same base offset under a new ownership
+// epoch, and both objects exist in the bucket: the new one is live, the old one
+// is unreachable garbage that retention reclaims. The inventory must serve the
+// newer epoch.
+//
+// The listing path already gets this right -- bestSegmentFor prefers the higher
+// epoch at a tie -- so the two paths disagreeing would be worse than either
+// being wrong on its own.
+func TestSegmentFor_PrefersNewerEpochAtSameOffset(t *testing.T) {
+	mc := NewMetadataCache()
+	mc.AddSegment("orders", 0, &SegmentMetadata{StartOffset: 100, EndOffset: 200, S3Key: "orders/0/00000000000000000100-e1.log"})
+	mc.AddSegment("orders", 0, &SegmentMetadata{StartOffset: 100, EndOffset: 200, S3Key: "orders/0/00000000000000000100-e2.log"})
+
+	if n := len(mc.Topics["orders"].Partitions[0].Segments); n != 1 {
+		t.Errorf("a superseded epoch left %d entries at base 100, want 1", n)
+	}
+	got := mc.SegmentFor("orders", 0, 150)
+	if got != "orders/0/00000000000000000100-e2.log" {
+		t.Errorf("SegmentFor(150) = %q, want the newer epoch e2", got)
+	}
+}
+
+// currentSegments is how retention rebuilds the inventory after deleting
+// segments. It lists object storage, and on knode3 that listing times out --
+// so it must not be allowed to answer. Returning nil here is what makes the
+// next line publish an empty inventory and send every read back to the listing
+// that had just failed, which is the outage this inventory exists to remove.
+func TestCurrentSegments_ListFailureDoesNotWipeInventory(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine := newEngine(t, store)
+	defer engine.Close()
+
+	engine.recordSegmentUploaded("orders", 0, 100, 200, "orders/0/00000000000000000100-e1.log")
+
+	segs := engine.currentSegments(context.Background(), "orders", 0)
+	if len(segs) != 0 {
+		t.Logf("currentSegments returned %d segments", len(segs))
+	}
+
+	// This is the retention call site, verbatim.
+	engine.metadataCache.SetPartitionState("orders", 0,
+		engine.metadataCache.LogEndOffset("orders", 0), 100, segs)
+
+	if got := engine.metadataCache.SegmentFor("orders", 0, 150); got == "" {
+		t.Error("the inventory was wiped when the listing failed, so every read " +
+			"falls back to that same listing and fails")
+	}
+}
+
+// When retention deletes segments it prunes the inventory from the listing.
+// If that listing fails, currentSegments returns nil and SetPartitionState
+// keeps the old inventory -- which is right, because an empty one would send
+// every read back to a listing that just failed. But the inventory then still
+// names segments retention has deleted, so a read of a reclaimed offset finds a
+// key whose object is gone rather than falling back. This records that
+// boundary: the inventory is stale, not wrong in a way that returns bad data.
+func TestRetention_ListFailureLeavesStaleKeysNotWrongData(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine := newEngine(t, store)
+	defer engine.Close()
+
+	engine.recordSegmentUploaded("orders", 0, 100, 200, "orders/0/00000000000000000100-e1.log")
+	engine.recordSegmentUploaded("orders", 0, 200, 300, "orders/0/00000000000000000200-e1.log")
+
+	// Retention's call site, with the listing failing.
+	segs := engine.currentSegments(context.Background(), "orders", 0)
+	engine.metadataCache.SetPartitionState("orders", 0,
+		engine.metadataCache.LogEndOffset("orders", 0), 200, segs)
+
+	// Both segments are still named, so a read resolves to a key rather than
+	// silently falling back. The key may name a deleted object; what must never
+	// happen is the inventory going empty.
+	if got := engine.metadataCache.SegmentFor("orders", 0, 150); got == "" {
+		t.Error("inventory emptied: reads fall back to a listing that just failed")
+	}
+	if got := engine.metadataCache.SegmentFor("orders", 0, 250); got == "" {
+		t.Error("inventory emptied for the second segment as well")
+	}
+}

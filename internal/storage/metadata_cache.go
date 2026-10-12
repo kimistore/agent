@@ -331,11 +331,17 @@ func (mc *MetadataCache) SegmentFor(topic string, partition int32, offset int64)
 // AddSegment records an uploaded segment in a partition's ordered inventory.
 //
 // The order is by start offset because that is the order the manifest
-// documents and the order SegmentFor's binary search needs. An existing entry
-// with the same key is replaced rather than duplicated, so a reconciliation
-// re-upload is idempotent.
+// documents and the order SegmentFor's binary search needs. There is exactly
+// one entry per start offset: a re-claimed partition writes the same base
+// offset again under a newer ownership epoch, and both objects exist in the
+// bucket. Keeping both leaves the binary search choosing between two entries
+// with an identical start offset by position rather than by epoch, and it picks
+// the superseded one -- serving a consumer a segment the current owner has
+// replaced, which is the read-side twin of the corruption the claim exists to
+// prevent. The listing path already prefers the higher epoch at a tie, so the
+// two paths have to agree.
 func (mc *MetadataCache) AddSegment(topic string, partition int32, seg *SegmentMetadata) {
-	if seg == nil {
+	if seg == nil || seg.S3Key == "" {
 		return
 	}
 	mc.mu.Lock()
@@ -345,14 +351,26 @@ func (mc *MetadataCache) AddSegment(topic string, partition int32, seg *SegmentM
 	i := sort.Search(len(ps.Segments), func(i int) bool {
 		return ps.Segments[i].StartOffset >= seg.StartOffset
 	})
-	if i < len(ps.Segments) && ps.Segments[i].StartOffset == seg.StartOffset && ps.Segments[i].S3Key == seg.S3Key {
-		// Same segment recorded again: refresh its end rather than duplicate it.
-		ps.Segments[i] = seg
+
+	if i < len(ps.Segments) && ps.Segments[i] != nil && ps.Segments[i].StartOffset == seg.StartOffset {
+		if segmentEpoch(seg.S3Key) >= segmentEpoch(ps.Segments[i].S3Key) {
+			ps.Segments[i] = seg
+		}
 		return
 	}
+
 	ps.Segments = append(ps.Segments, nil)
 	copy(ps.Segments[i+1:], ps.Segments[i:])
 	ps.Segments[i] = seg
+}
+
+// segmentEpoch reads the ownership epoch out of a segment key, reporting -1
+// when the key does not carry one.
+func segmentEpoch(key string) int64 {
+	if _, epoch, ok := parseSegmentKey(key); ok {
+		return epoch
+	}
+	return -1
 }
 
 // CommittedOffsetsFor returns a group's durable committed offsets grouped by
