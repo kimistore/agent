@@ -11,6 +11,39 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.5
+
+Every graceful shutdown was destroying the segment index.
+
+### Fixed
+
+- A shutdown drain no longer erases the durable position and index. The journal
+  from knode3:
+
+      Draining 1 owned partition(s) before shutdown, budget 25s
+      Ownership: released mimir-distributor/0 at epoch 21405
+      Drain: drained 1 of 1 partition(s); 0 kept their claim
+      Saved metadata checkpoint to _agents/knode3/checkpoint.json (259 bytes)
+
+  `DrainOwned` ran the same routine a peer takeover runs, and a handover drops the
+  partition from the cache. On shutdown that is pure loss: the claim is released
+  so a peer may take over, but nobody does, and this same agent is the next
+  reader. The segments were still in object storage -- only the index describing
+  them was gone, and rebuilding it needs the very listing the index exists to
+  avoid. The next start found a 124-byte checkpoint and rebuilt the index from
+  scratch at about 640 bytes a minute.
+- `DrainPartition` takes a handoff flag. A real handover still erases the position
+  and index, because the new owner recovers them from the manifest. A shutdown
+  drain releases the claim and keeps them, dropping only the in-memory serving
+  state that the next append rebuilds.
+- An unowned partition is no longer removed from the metadata cache at startup.
+  This was not the cause of the above, but removing durable state on an unowned
+  check is unsafe regardless, and both paths that cared already guard
+  themselves: `HighWaterMark` answers 0 for an unowned partition and Metadata emits
+  `LEADER_NOT_AVAILABLE` when `routing.Owner` finds no claim.
+
+The test reproduces the recorded failure: 745 bytes before the drain, 13 after.
+
 ## 1.0.4
 
 1.0.3 added the window-and-bucket index but left recovery repopulating the flat
