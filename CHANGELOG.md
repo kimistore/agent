@@ -11,6 +11,55 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.6
+
+Retention reclaimed nothing. It could not: its sweep began by listing every
+object in the partition, and on knode3 that listing does not finish. The sweep
+logged the failure and moved on, once per interval, forever.
+
+### Changed
+
+- Retention reclaims through the index. `DropSegmentsBefore` had no caller, so
+  sealed buckets would have accumulated regardless. A bucket wholly below the
+  retention boundary is now one `DELETE` for the bucket plus one per segment it
+  covers, and the index shrinks by that whole bucket
+- A bucket the boundary passes through is rewritten without the reclaimed
+  prefix. This is the one place a sealed bucket is not immutable, and it cannot
+  be left alone: the entries it drops name segments that are about to be
+  deleted, so a read of a reclaimed offset would resolve to an object that is
+  gone instead of falling back. It happens at most once per bucket, as retention
+  advances across it
+- A segment counts as reclaimable only when its successor starts at or below the
+  boundary, which is what proves every offset inside it has been consumed. The
+  newest segment has no successor and is kept — the same rule the listing-based
+  sweep applied, so retention does not become more aggressive
+- The size and time policies still list. They select on segment size and
+  last-modified time, which the index does not carry. They are kept separate from
+  the index path deliberately: a partition whose listing cannot complete still
+  loses the data no consumer needs, instead of losing the size and time
+  behaviour as well
+
+### Fixed
+
+- Retention no longer reclaims nothing when the index is empty but segments are
+  not. It fell back to a listing, bounded by how much unindexed data exists.
+  Without that fallback this release would have leaked storage silently and
+  forever, which is what the first draft of it did and what the existing
+  retention tests caught
+- A loaded bucket is no longer merged into the open window. Merging doubled the
+  window on every cold read, so the checkpoint grew again, and retention deleted
+  the same segment once through the bucket and again through the window. Loaded
+  references are now searched directly; the window stays the newest segments
+
+### Known limitations
+
+- The sealed-bucket path has not yet run in production. On knode3 the window is
+  at roughly 250 of 4096, so no bucket has been sealed, reclaimed, or rewritten.
+  It is covered by unit tests only, including the straddling rewrite
+- The size and time policies remain listing-bound. Carrying size and
+  last-modified in `SegmentRef` would close that at the cost of a larger index
+  entry
+
 ## 1.0.5
 
 Every graceful shutdown was destroying the segment index.
