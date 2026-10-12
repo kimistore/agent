@@ -132,6 +132,10 @@ type StorageEngine struct {
 
 	retentionCfg RetentionConfig
 
+	// compactorCfg is applied before any goroutine starts, like the lease, so
+	// the first tick cannot race the configuration being read.
+	compactorCfg CompactorConfig
+
 	// leaseCfg is the requested writer lease, applied before any goroutine
 	// starts so the claim is held before recovery reads durable state.
 	leaseCfg LeaseConfig
@@ -400,10 +404,16 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 	if se.assignment.Enabled {
 		loops++
 	}
+	if se.compactorCfg.Enabled {
+		loops++
+	}
 	se.wg.Add(loops)
 	go se.uploaderLoop()
 	go se.offsetFlusherLoop()
 	go se.retentionLoop()
+	if se.compactorCfg.Enabled {
+		go se.compactorLoop()
+	}
 	if se.assignment.Enabled {
 		go se.rebalanceLoop(se.closedCtx)
 	}

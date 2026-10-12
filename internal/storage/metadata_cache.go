@@ -672,3 +672,102 @@ func (mc *MetadataCache) IndexSnapshot(topic string, partition int32) ([]Segment
 	}
 	return append([]SegmentRef(nil), ps.Recent...), append([]BucketRef(nil), ps.Sealed...)
 }
+
+// SeenFor reports the segment that covers offset, checking the open window only.
+//
+// It exists for assertions about what the index names. A cold offset resolves
+// through a bucket instead, which requires reading the bucket's object, and a
+// test that wants to know whether the index still points at something should not
+// have to depend on that.
+func (ps *PartitionState) SeenFor(offset int64) *SegmentRef {
+	i := sort.Search(len(ps.Recent), func(i int) bool { return ps.Recent[i].Base > offset })
+	if i == 0 {
+		return nil
+	}
+	return &ps.Recent[i-1]
+}
+
+// SwapBucket replaces one sealed bucket reference with another, and reports
+// whether the expected one was still there.
+//
+// This is the commit point of a merge. Before it the index names the source
+// segments, which exist; after it the index names the merged segment, which the
+// caller has already written. Deleting the sources can therefore only ever
+// happen after the index has stopped referring to them, so a crash at any point
+// leaves duplicate data rather than a hole.
+//
+// expectKey guards against acting on a bucket that changed underneath. The only
+// other writer of a sealed bucket is retention's straddling-bucket trim, and
+// merging a bucket retention has since dropped would delete segments the index
+// no longer describes in a way this call could not see.
+func (mc *MetadataCache) SwapBucket(topic string, partition int32, expectKey string, next BucketRef) bool {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	ts, ok := mc.Topics[topic]
+	if !ok {
+		return false
+	}
+	ps, ok := ts.Partitions[partition]
+	if !ok {
+		return false
+	}
+	for i := range ps.Sealed {
+		if ps.Sealed[i].Key == expectKey {
+			ps.Sealed[i] = next
+			return true
+		}
+	}
+	return false
+}
+
+// SealedRange returns a contiguous span of sealed buckets covering
+// [first, last], or false if the range is not covered by whole buckets.
+//
+// Compaction works a bucket at a time rather than an arbitrary span because a
+// bucket is the unit that can be rewritten: its contents live in an immutable
+// object, so replacing one is a matter of writing a new object and swapping the
+// reference. Part of a bucket would mean rewriting the whole thing anyway.
+func (mc *MetadataCache) SealedRange(topic string, partition int32, first, last int64) ([]BucketRef, bool) {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+
+	ts, ok := mc.Topics[topic]
+	if !ok {
+		return nil, false
+	}
+	ps, ok := ts.Partitions[partition]
+	if !ok {
+		return nil, false
+	}
+
+	start := -1
+	for i, b := range ps.Sealed {
+		if b.First == first {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return nil, false
+	}
+
+	var out []BucketRef
+	covered := first
+	for i := start; i < len(ps.Sealed); i++ {
+		b := ps.Sealed[i]
+		if b.First != covered {
+			// A gap, or the start of a bucket that does not continue the run.
+			break
+		}
+		out = append(out, b)
+		covered = b.Last + 1
+		if covered > last {
+			break
+		}
+	}
+	if len(out) == 0 || covered <= last {
+		return nil, false
+	}
+	return out, true
+}
