@@ -19,9 +19,28 @@ import (
 
 // CompactorConfig configures background segment consolidation.
 type CompactorConfig struct {
-	// Enabled turns the compactor on. Off by default: it rewrites objects that
-	// are otherwise immutable, and an operator should choose that for a bucket.
+	// Enabled turns the compactor on. It is on by default, which is a change
+	// from the first version: leaving it off meant the object count a partition
+	// accumulated was governed by the flush interval and nothing else, and no
+	// amount of waiting brought it down.
+	//
+	// Compaction is conservative by construction, which is what makes the
+	// default defensible. It only ever merges sealed buckets, never the open
+	// window and never the newest sealed bucket, so the range a reader is
+	// working in is untouched. It refuses entries recorded before the index
+	// carried sizes rather than merging them blind. And it commits the index
+	// before deleting anything, so an interrupted merge leaves duplicate data
+	// rather than a hole.
 	Enabled bool
+	// Disabled inverts Enabled, for a caller that wants compaction off without
+	// having to distinguish "unset" from "explicitly false".
+	//
+	// The zero value of a bool cannot mean "on by default", so the two cannot
+	// both be had. Compaction being opt-out is the deliberate choice: leaving it
+	// opt-in meant the object count was governed by the flush interval and
+	// nothing reduced it, and an operator who wants it off can say so
+	// unambiguously.
+	Disabled bool
 	// Interval is how often a partition is considered for compaction.
 	Interval time.Duration
 	// MinSegments is how many segments must be covered before a merge is worth
@@ -59,7 +78,7 @@ func WithCompactor(cfg CompactorConfig) Option {
 func (s *StorageEngine) compactorLoop() {
 	defer s.wg.Done()
 	cfg := s.compactorCfg.withDefaults()
-	if !cfg.Enabled {
+	if cfg.Disabled {
 		// Nothing to do. The goroutine was counted in the WaitGroup when it was
 		// started, so returning here is correct -- what is not correct is
 		// starting it at all, which is what the guard in NewStorageEngine does.

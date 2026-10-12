@@ -11,6 +11,37 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.8
+
+The compactor is on by default and the segment size is settled.
+
+### Changed
+
+- Background compaction of sealed buckets is now on unless an operator sets
+  `CompactorConfig.Disabled`. It was opt-in, which meant the object count a
+  partition accumulated was governed by the flush interval and nothing brought
+  it down. The flag is inverted to `Disabled` because the zero value of a bool
+  cannot mean "on by default", and an opt-in flag is exactly how the previous
+  version ended up off
+- `MaxSegmentSize` is raised from 64MB to 256MB. The old value was never the
+  binding constraint: a partition carrying `acks=all` traffic is sealed by the
+  flush interval rather than by size, and segments measured at 45KB against a
+  64MB threshold. What the threshold actually decided was the size of a merged
+  segment, which is what the object count converges to. A read seeks with the
+  sidecar and stops at the fetch budget, so a larger segment does not make a
+  read proportional to the segment -- only to the position within it
+
+### Known limitations
+
+- A merge that committed its index update and then died before deleting its
+  sources leaves those sources orphaned. They are unreferenced, so they cost
+  storage and nothing else, and no listing could find them again. The marker
+  written just after the commit exists to recover this and nothing reads it yet.
+  It is left as an explicit gap rather than a stub reporting success
+- Segments recorded before the index carried sizes are refused by the
+  compactor, because the cap on merged size cannot be applied to entries of
+  unknown size. They are compacted once the window has rolled past them
+
 ## 1.0.7
 
 Retention could not be enabled safely. Switching it on would have deleted about

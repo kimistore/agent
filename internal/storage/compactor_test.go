@@ -59,7 +59,6 @@ func newCompactingEngine(t *testing.T, store ObjectStore) *StorageEngine {
 	t.Helper()
 	engine, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{},
 		WithCompactor(CompactorConfig{
-			Enabled:        true,
 			Interval:       time.Hour,
 			MinSegments:    4,
 			MaxMergedBytes: 1 << 30,
@@ -293,4 +292,32 @@ func readAll(t *testing.T, rc io.ReadCloser) []byte {
 		t.Fatalf("read: %v", err)
 	}
 	return out
+}
+
+// Compaction must run unless an operator explicitly turns it off.
+//
+// The zero value of a bool cannot mean "on by default", so the flag was
+// inverted to Disabled. This pins that, because the previous opt-in shape
+// meant a caller passing a zero CompactorConfig silently disabled compaction
+// and the object count never came down.
+func TestCompactor_RunsUnlessDisabled(t *testing.T) {
+	store := newCASStore()
+	engine, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer engine.Close()
+	if engine.compactorCfg.Disabled {
+		t.Error("compaction is disabled for a zero config; it must be on by default")
+	}
+
+	off, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{},
+		WithCompactor(CompactorConfig{Disabled: true}))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer off.Close()
+	if !off.compactorCfg.Disabled {
+		t.Error("WithCompactor(Disabled) did not disable compaction")
+	}
 }

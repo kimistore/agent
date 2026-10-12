@@ -404,14 +404,14 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 	if se.assignment.Enabled {
 		loops++
 	}
-	if se.compactorCfg.Enabled {
+	if !se.compactorCfg.Disabled {
 		loops++
 	}
 	se.wg.Add(loops)
 	go se.uploaderLoop()
 	go se.offsetFlusherLoop()
 	go se.retentionLoop()
-	if se.compactorCfg.Enabled {
+	if !se.compactorCfg.Disabled {
 		go se.compactorLoop()
 	}
 	if se.assignment.Enabled {
