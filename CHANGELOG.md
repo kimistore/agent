@@ -51,6 +51,14 @@ Retention could not be enabled safely. Switching it on would have deleted about
 - Reclaiming the unindexed legacy path applies the age policy and a cumulative
   byte budget as well, rather than the consumer bound alone
 
+- A size the index does not know is counted against the budget rather than as
+  free. Entries recorded before `SegmentRef` carried sizes have none, and
+  summing them as zero accounted 4.2 MB against roughly 500 MB of real segments
+  on knode3, so a budget set from actual disk usage would never have fired and
+  retention would have looked configured while doing nothing. Treating an
+  unknown size as over budget errs towards reclaiming, and the consumer bound
+  still applies on top of it
+
 ### Known limitations
 
 - The age policy assumes segments were written in offset order, so age rises

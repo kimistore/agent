@@ -473,7 +473,18 @@ func (s *StorageEngine) policyBoundary(topic string, partition int32) int64 {
 	}
 
 	if budget := s.retentionCfg.RetentionBytes; budget > 0 {
+		// Entries recorded before the index carried sizes do not have one, and
+		// summing them as zero undercounts the partition by however much they
+		// hold. On knode3 that was 4.2 MB accounted against roughly 500 MB of
+		// real segments, so a budget set from actual disk usage would never have
+		// fired and retention would have looked configured but done nothing.
+		//
+		// An entry of unknown size is therefore treated as over budget rather
+		// than free. That errs towards reclaiming, which is the direction a
+		// size limit asks for, and the consumer bound still applies on top so
+		// nothing a reader needs is removed.
 		var total int64
+		var unknown bool
 		// Newest-first: the budget is spent from the newest end, and the
 		// boundary falls where it runs out.
 		//
@@ -485,8 +496,11 @@ func (s *StorageEngine) policyBoundary(topic string, partition int32) int64 {
 		// only honest answer. Indexing past the end would panic, which is what
 		// the first version of this did.
 		for i := len(buckets) - 1; i >= 0; i-- {
+			if buckets[i].Bytes == 0 {
+				unknown = true
+			}
 			total += buckets[i].Bytes
-			if total > budget {
+			if unknown || total > budget {
 				if i+1 < len(buckets) {
 					boundary = buckets[i+1].First
 				} else if len(window) > 0 {
@@ -496,8 +510,11 @@ func (s *StorageEngine) policyBoundary(topic string, partition int32) int64 {
 			}
 		}
 		for i := len(window) - 1; i >= 0; i-- {
+			if window[i].Size == 0 {
+				unknown = true
+			}
 			total += window[i].Size
-			if total > budget {
+			if unknown || total > budget {
 				if i+1 < len(window) {
 					boundary = window[i+1].Base
 				} else {

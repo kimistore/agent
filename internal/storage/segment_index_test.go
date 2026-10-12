@@ -582,3 +582,45 @@ func TestReclaimByIndex_AgePolicy(t *testing.T) {
 		t.Errorf("policy boundary = %d, want 200 (the last segment past the age limit)", got)
 	}
 }
+
+// Index entries recorded before SegmentRef carried sizes have none, and must not
+// be treated as free.
+//
+// This is knode3's actual state after upgrading: 2,647 window entries with no
+// size and 23 with one. Summing the unknown entries as zero accounted 4.2 MB
+// against roughly 500 MB of real segments, so a budget set from actual disk
+// usage would never have fired and retention would have looked configured while
+// doing nothing at all.
+func TestPolicyBoundary_SizeUnknownCountsAgainstTheBudget(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{
+		RetentionBytes: 1 << 30, // 1 GiB, far more than the sized entries use
+	})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer engine.Close()
+
+	now := time.Now().Unix()
+	// Legacy entries first, with no size and no timestamp.
+	for _, b := range []int64{0, 100, 200} {
+		engine.metadataCache.AddSegment("orders", 0, SegmentRef{Base: b, Modified: now})
+	}
+	// Then entries this agent wrote, which do carry a size.
+	engine.metadataCache.AddSegment("orders", 0, SegmentRef{Base: 300, Size: 1000, Modified: now})
+	engine.metadataCache.AddSegment("orders", 0, SegmentRef{Base: 400, Size: 1000, Modified: now})
+
+	// 2 KB of known size against a 1 GiB budget is comfortably inside it, so the
+	// only reason anything can be selected is the three entries whose size is
+	// unknown. Summing those as zero would return -1 and retention would sit
+	// idle forever while the partition grew; treating them as over budget stops
+	// at 300, the first entry known to carry a size.
+	//
+	// The consumer bound still applies on top of this, so what gets reclaimed is
+	// bounded by what readers have passed -- reclaimByIndex takes the older of
+	// the two boundaries, never this one alone.
+	got := engine.policyBoundary("orders", 0)
+	if got != 300 {
+		t.Errorf("policy boundary = %d, want 300 (the first entry of known size)", got)
+	}
+}
