@@ -241,3 +241,110 @@ func TestCheckpoint_StaysBoundedAsSegmentsAccumulate(t *testing.T) {
 	t.Logf("peak checkpoint %d bytes across %d segments (was ~%d with a flat index)",
 		peak, segments, segments*106)
 }
+
+// A restart must not shrink the checkpoint. It used to: a claim that failed for
+// a transient reason made claimKnownPartitions log and continue, and
+// dropUnownedPartitions then removed the partition, so the next checkpoint
+// persisted an empty topic set over the good one. The agent following that
+// found no index, no log position, and no idea the partition existed -- seen on
+// knode3 as a checkpoint collapsing from 35 KB to 259 bytes.
+//
+// This drives the path directly: the partition is unowned, startup runs, and
+// the durable state must survive it.
+func TestRestart_DoesNotErasePartitionStateWhenUnowned(t *testing.T) {
+	store := newCASStore()
+	engine := newOwningEngine(t, store, "agent-a")
+	engine.CreateTopic("orders", 1)
+	engine.Append("orders", 0, batchOfN(40), 40, true)
+	engine.walMgr.FlushPartition("orders", 0)
+	waitForClaimedSegment(t, store, "orders/0/"+walSegmentName(0, 1))
+	for i := 0; i < 40; i++ {
+		engine.recordSegmentUploaded(context.Background(), "orders", 0, int64(i)*10, int64(i)*10+10,
+			fmt.Sprintf("orders/0/%s", walSegmentName(int64(i)*10, 1)))
+	}
+	before, err := engine.metadataCache.ToJSON()
+	if err != nil {
+		t.Fatalf("serialise: %v", err)
+	}
+	leo := engine.metadataCache.LogEndOffset("orders", 0)
+	engine.Close()
+
+	// Another agent now holds the lease, so agent-a restarts fenced but unowned.
+	store.expireClaim(t, "orders", 0)
+	next := newOwningEngine(t, store, "agent-b")
+	defer next.Close()
+	_ = leo
+
+	if !next.metadataCache.Has("orders", 0) {
+		t.Fatal("a restart under a different agent erased the partition from the " +
+			"durable state; the index and log position are gone with it")
+	}
+	if got := next.metadataCache.LogEndOffset("orders", 0); got == 0 {
+		t.Error("log end offset was erased by a restart under another agent")
+	}
+	after, err := next.metadataCache.ToJSON()
+	if err != nil {
+		t.Fatalf("serialise after: %v", err)
+	}
+	if len(after) < len(before)/2 {
+		t.Errorf("checkpoint shrank from %d to %d bytes across a restart", len(before), len(after))
+	}
+}
+
+// A graceful shutdown must not erase the durable index. It used to, and this
+// is the shape of what happened on knode3:
+//
+//	Draining 1 owned partition(s) before shutdown, budget 25s
+//	Ownership: released mimir-distributor/0 at epoch 21405
+//	Drain: drained 1 of 1 partition(s); 0 kept their claim
+//	Saved metadata checkpoint to _agents/knode3/checkpoint.json (259 bytes)
+//
+// The drain released the claim and then dropped the partition from the view,
+// which removed its position and index, and the next checkpoint persisted that
+// empty state over the good one. The segments were still in object storage; only
+// the index describing them was gone, and rebuilding it needs the listing the
+// index exists to avoid.
+func TestShutdownDrain_KeepsIndexAndPosition(t *testing.T) {
+	store := newCASStore()
+	engine := newOwningEngine(t, store, "agent-a")
+	if err := engine.CreateTopic("orders", 1); err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	if _, err := engine.Append("orders", 0, batchOfN(40), 40, true); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	engine.walMgr.FlushPartition("orders", 0)
+	waitForClaimedSegment(t, store, "orders/0/"+walSegmentName(0, 1))
+	for i := 0; i < 40; i++ {
+		engine.recordSegmentUploaded(context.Background(), "orders", 0, int64(i)*10, int64(i)*10+10,
+			fmt.Sprintf("orders/0/%s", walSegmentName(int64(i)*10, 1)))
+	}
+	before, err := engine.metadataCache.ToJSON()
+	if err != nil {
+		t.Fatalf("serialise: %v", err)
+	}
+	if len(before) < 300 {
+		t.Fatalf("test setup: checkpoint is only %d bytes", len(before))
+	}
+
+	// The shutdown drain: everything released, nothing handed to a peer.
+	if _, err := engine.DrainOwned(t.Context(), DefaultHandoverBudget); err != nil {
+		t.Logf("drain reported: %v", err)
+	}
+
+	after, err := engine.metadataCache.ToJSON()
+	if err != nil {
+		t.Fatalf("serialise after drain: %v", err)
+	}
+	if len(after) < len(before)/2 {
+		t.Errorf("checkpoint shrank from %d to %d bytes across a shutdown drain; "+
+			"the index and position were erased", len(before), len(after))
+	}
+	if !engine.metadataCache.Has("orders", 0) {
+		t.Error("a shutdown drain removed the partition entirely; nothing takes " +
+			"over on shutdown, so this agent is the next reader")
+	}
+	if got := engine.metadataCache.LogEndOffset("orders", 0); got == 0 {
+		t.Error("a shutdown drain erased the log end offset")
+	}
+}

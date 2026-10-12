@@ -77,6 +77,14 @@ const DefaultHandoverBudget = 30 * time.Second
 // partition stays writable here and the caller is told why. The alternative --
 // releasing anyway -- is what turns a slow object store into silent data loss.
 func (s *StorageEngine) DrainPartition(ctx context.Context, topic string, partition int32, budget time.Duration) (HandoverReport, error) {
+	return s.drainPartition(ctx, topic, partition, budget, true)
+}
+
+// drainPartition seals, waits for durability and releases the claim.
+// handoff is false when the drain is for shutdown: the claim is still released,
+// because nothing will renew it, but no peer is taking over, so the durable
+// position and index are kept rather than erased.
+func (s *StorageEngine) drainPartition(ctx context.Context, topic string, partition int32, budget time.Duration, handoff bool) (HandoverReport, error) {
 	start := time.Now()
 	if budget <= 0 {
 		budget = DefaultHandoverBudget
@@ -153,7 +161,7 @@ func (s *StorageEngine) DrainPartition(ctx context.Context, topic string, partit
 
 	// The local WAL for a partition this agent no longer owns must not be read:
 	// its contents predate the handover and the new owner has moved on.
-	s.dropPartitionFromView(topic, partition)
+	s.dropPartitionFromView(topic, partition, handoff)
 
 	report.Released = true
 	report.Elapsed = time.Since(start)
@@ -181,13 +189,25 @@ func remaining(budget time.Duration, start time.Time) time.Duration {
 // Its WAL directory is left on disk deliberately: it is the handover's only copy
 // of anything that was written but never flushed, and deleting it on the drain
 // path would turn a recoverable situation into a lost one.
-func (s *StorageEngine) dropPartitionFromView(topic string, partition int32) {
-	s.metadataCache.RemovePartition(topic, partition)
+//
+// durableState is false for a shutdown drain. A real handover means a peer takes
+// over and this agent is finished with the partition, so erasing its position
+// and index is correct -- the new owner recovers them from the manifest. A
+// shutdown drain releases the claim too, but nobody takes over: this same agent
+// is the next reader, and the segments are still in object storage with only
+// the index describing them. Erasing there destroys state nothing can rebuild,
+// because rebuilding it needs the very listing the index exists to avoid. On
+// knode3 a single restart collapsed the checkpoint from 35 KB to 259 bytes and
+// left the partition unreadable until it had been re-uploaded from scratch.
+func (s *StorageEngine) dropPartitionFromView(topic string, partition int32, durableState bool) {
+	if durableState {
+		s.metadataCache.RemovePartition(topic, partition)
+		s.forgetManifestDirty(topic)
+	}
 	s.durableMu.Lock()
 	delete(s.durable, partitionDurabilityKey(topic, partition))
 	delete(s.waiters, partitionDurabilityKey(topic, partition))
 	s.durableMu.Unlock()
-	s.forgetManifestDirty(topic)
 }
 
 // ownedCount is how many partitions this agent currently holds.
@@ -322,7 +342,9 @@ func (s *StorageEngine) DrainOwned(ctx context.Context, budget time.Duration) ([
 			share = left
 		}
 
-		report, drainErr := s.DrainPartition(ctx, ref.Topic, ref.Partition, share)
+		// A shutdown drain is not a handover: the claim is released so a peer
+		// may take over, but this agent is the next reader of these partitions.
+		report, drainErr := s.drainPartition(ctx, ref.Topic, ref.Partition, share, false)
 		reports = append(reports, report)
 		if drainErr != nil {
 			errs = append(errs, fmt.Errorf("%s/%d: %w", ref.Topic, ref.Partition, drainErr))

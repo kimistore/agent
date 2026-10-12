@@ -688,19 +688,33 @@ func (s *StorageEngine) claimKnownPartitions(ctx context.Context) {
 // dropUnownedPartitions removes from the in-memory view every partition this
 // agent has no claim on.
 //
-// The checkpoint is agent-private but bucket-wide: it lists every partition in
-// the log, including ones another agent is responsible for. Keeping those would
-// let this agent serve a log end offset it cannot append to, and would let
-// Metadata advertise a leader for a partition whose data it does not hold.
+// The partition state is deliberately NOT removed here. It used to be, on the
+// reasoning that an agent must not carry a position for a partition it does not
+// own. That reasoning holds for what it serves, and both paths already guard
+// themselves without it: HighWaterMark answers 0 for an unowned partition, and
+// Metadata emits LEADER_NOT_AVAILABLE with Leader = -1 when routing.Owner finds
+// no claim.
+//
+// Removing the state was destroying durable data. A claim that failed for a
+// transient reason -- one S3 error at startup -- made claimKnownPartitions log
+// and continue, and the removal that followed was then checkpointed over the
+// good state. The next agent to start found an empty checkpoint: no index, no
+// log position, and no idea the partition existed. On knode3 that showed up as
+// a checkpoint collapsing from 35 KB to 259 bytes across a restart.
+//
+// Knowing a partition's position and index is not claiming it. The claim is
+// what makes an agent responsible, and that is tracked separately.
 func (s *StorageEngine) dropUnownedPartitions() {
 	if s.ownership == nil || !s.ownership.fenced {
 		return
 	}
 	for _, topic := range s.metadataCache.GetTopics() {
 		for _, pid := range s.metadataCache.GetPartitions(topic) {
-			if !s.ownership.Owns(topic, pid) {
-				s.metadataCache.RemovePartition(topic, pid)
+			if s.ownership.Owns(topic, pid) {
+				continue
 			}
+			log.Printf("Ownership: %s/%d is not ours; keeping its position and index "+
+				"but it will not be served or advertised as ours", topic, pid)
 		}
 	}
 }
@@ -1372,7 +1386,7 @@ func (s *StorageEngine) resolveDurablePosition(ctx context.Context, topic string
 func (s *StorageEngine) forgetLostPartition(topic string, partition int32) {
 	log.Printf("Storage: dropping %s/%d from this agent's view; the partition is no longer ours to describe",
 		topic, partition)
-	s.dropPartitionFromView(topic, partition)
+	s.dropPartitionFromView(topic, partition, true)
 }
 
 // LogStartOffset is the oldest offset still retrievable. It is what
