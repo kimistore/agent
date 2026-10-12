@@ -467,3 +467,43 @@ func putBucket(t *testing.T, store *listFailStore, key string, refs []SegmentRef
 		t.Fatalf("seed bucket: %v", err)
 	}
 }
+
+// Reclaiming must never delete the segment that contains the boundary offset.
+// A consumer resuming at exactly the boundary still has to read from it, and
+// the entry whose base sits below the boundary can be the one spanning it --
+// a trim keyed purely on "base >= start" deletes it and the resume finds
+// nothing.
+//
+// This is the live shape from knode3: bases 777763, 777764, [777765], 777766,
+// with the committed offset landing between two entries.
+func TestReclaimIndex_KeepsSegmentSpanningTheBoundary(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine := newEngine(t, store)
+	defer engine.Close()
+
+	bases := []int64{777763, 777764, 777766, 777767}
+	for _, b := range bases {
+		engine.metadataCache.AddSegment("orders", 0, SegmentRef{Base: b, Epoch: 1})
+		if err := store.inner.Put(context.Background(),
+			fmt.Sprintf("orders/0/%s", wal.SegmentName(b, 1)), strings.NewReader("x")); err != nil {
+			t.Fatalf("seed segment %d: %v", b, err)
+		}
+	}
+
+	const boundary = 777765
+	deleted := engine.reclaimIndex(context.Background(), "orders", 0, boundary)
+
+	// Only 777763 is provably consumed: 777764 spans the boundary, so it has to
+	// stay for a consumer resuming at 777765.
+	if deleted != 1 {
+		t.Errorf("deleted %d segment(s), want 1 (777763 only)", deleted)
+	}
+
+	key, err := engine.segmentKeyFor(context.Background(), "orders", 0, boundary)
+	if err != nil {
+		t.Fatalf("a consumer resuming at the boundary could not resolve a segment: %v", err)
+	}
+	if want := fmt.Sprintf("orders/0/%s", wal.SegmentName(777764, 1)); key != want {
+		t.Errorf("offset %d resolved to %q, want %q -- the segment spanning the boundary was reclaimed", boundary, key, want)
+	}
+}

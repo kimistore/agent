@@ -465,7 +465,19 @@ func (mc *MetadataCache) DropSegmentsBefore(topic string, partition int32, start
 	}
 	ps.Sealed = keep
 
-	trim := sort.Search(len(ps.Recent), func(i int) bool { return ps.Recent[i].Base >= start })
+	// The window is trimmed by the same rule the straddling bucket uses: a
+	// segment is reclaimable only once its successor is known to start at or
+	// below the boundary, which is what proves every offset inside it has been
+	// consumed. Trimming on "base >= start" alone looks equivalent and is not.
+	// A consumer resumes at the boundary, and the segment it needs may be the
+	// one whose base sits just below it -- bases 777764 and 777766 either side
+	// of a committed offset of 777765 is the shape that occurs in production.
+	// Deleting 777764 leaves that resume pointing at a segment that does not
+	// exist, so the read fails instead of resuming.
+	trim := 0
+	for trim+1 < len(ps.Recent) && ps.Recent[trim+1].Base <= start {
+		trim++
+	}
 	reclaimed = append([]SegmentRef(nil), ps.Recent[:trim]...)
 	ps.Recent = append([]SegmentRef(nil), ps.Recent[trim:]...)
 	return dropped, straddle, reclaimed
