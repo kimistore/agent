@@ -11,6 +11,56 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.7
+
+Retention could not be enabled safely. Switching it on would have deleted about
+11,000 objects on the first sweep and broken the one consumer on the partition.
+
+### Fixed
+
+- Retention no longer treats the consumer bound as permission to delete. Setting
+  any retention value at all made every segment a consumer had passed
+  reclaimable, so a log inside its budget lost everything. The age and byte
+  policies now decide what goes, and the consumer bound only raises the
+  resulting boundary. A healthy log inside budget deletes nothing, which is the
+  normal state and what an operator switching retention on expects
+- Retention no longer deletes the segment a consumer resumes from. The window
+  trim dropped every entry whose base was below the boundary, on the reasoning
+  that such an entry was entirely below it. A segment covers a range, so the one
+  holding the committed offset almost always has a base just below it. The live
+  shape was bases `777763`, `777764`, `[777765]`, `777766`: reclaiming at
+  777765 removed 777764, and the consumer's next read resolved to no segment at
+  all. The rule the straddling-bucket path already used is now used for the
+  window too -- reclaimable only once its successor starts at or below the
+  boundary
+- Retention no longer indexes past the end of the index when the newest entry is
+  itself over budget. That panicked; the existing tests had no sealed buckets
+  and never reached it
+
+### Changed
+
+- `SegmentRef` carries segment size and modification time, recorded by the
+  uploader from the PUT it had already made. `BucketRef` carries the byte total
+  and newest time of what it covers, so a bucket is judged without being read
+  back. Both policies previously needed a listing to evaluate, which is the one
+  operation on this bucket that does not scale: a page of keys takes about 17
+  seconds and a full pass does not finish, so a sweep that listed reclaimed
+  nothing on a partition of any size. The listing-based size and time sweep is
+  removed rather than left alongside, since two implementations of one policy
+  is how they drift apart
+- Reclaiming the unindexed legacy path applies the age policy and a cumulative
+  byte budget as well, rather than the consumer bound alone
+
+### Known limitations
+
+- The age policy assumes segments were written in offset order, so age rises
+  with base offset. That holds for anything this agent wrote. A segment
+  re-uploaded later with a newer timestamp stops the scan early and holds back
+  everything after it, which keeps data rather than deleting it
+- A partition whose index is empty still falls back to a listing. That is the
+  legacy case and does not grow, but on this bucket a listing cannot complete,
+  so such a partition is reclaimed by neither path until its index is rebuilt
+
 ## 1.0.6
 
 Retention reclaimed nothing. It could not: its sweep began by listing every
