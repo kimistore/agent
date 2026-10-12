@@ -191,3 +191,53 @@ func (f *listFailStore) List(ctx context.Context, prefix string) ([]ObjectMetada
 	f.lists.Add(1)
 	return nil, fmt.Errorf("LIST is not available")
 }
+
+// The checkpoint must stay bounded as a partition accumulates segments. This is
+// the guard for the regression where the new index was added but recovery kept
+// repopulating the old flat one, so the checkpoint carried every segment ever
+// written and grew exactly as before -- with a test suite that still passed.
+//
+// The bound is the open window: a checkpoint holds at most RecentWindow
+// entries plus one directory entry per sealed bucket, so its size is set by
+// RecentWindow and not by history. It therefore oscillates within the window
+// cycle rather than growing monotonically, which is why this samples across a
+// whole cycle and takes the largest, not the last.
+func TestCheckpoint_StaysBoundedAsSegmentsAccumulate(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine := newEngine(t, store)
+	defer engine.Close()
+
+	sizeAt := func(n int) int {
+		for i := 0; i < n; i++ {
+			base := int64(i) * 100
+			engine.recordSegmentUploaded(context.Background(), "orders", 0, base, base+100,
+				fmt.Sprintf("orders/0/%020d-e1.log", base))
+		}
+		raw, err := engine.metadataCache.ToJSON()
+		if err != nil {
+			t.Fatalf("serialise: %v", err)
+		}
+		return len(raw)
+	}
+
+	// Sample across a full window cycle so the peak is seen, not a phase.
+	peak := 0
+	segments := 0
+	for i := 0; i < 24; i++ {
+		segments += RecentWindow / 3
+		if n := sizeAt(RecentWindow / 3); n > peak {
+			peak = n
+		}
+	}
+
+	// A flat index would be ~106 bytes per segment; at this many segments that
+	// is several megabytes. Bounded by the window it is a few tens of KB.
+	const perEntryBudget = 24
+	budget := RecentWindow*perEntryBudget + 4096
+	if peak > budget {
+		t.Errorf("checkpoint peaked at %d bytes after %d segments, budget %d; "+
+			"it is carrying the whole index again", peak, segments, budget)
+	}
+	t.Logf("peak checkpoint %d bytes across %d segments (was ~%d with a flat index)",
+		peak, segments, segments*106)
+}

@@ -2563,7 +2563,7 @@ func (s *StorageEngine) recoverManifest(ctx context.Context) error {
 			manifestStart := s.metadataCache.LogStartOffset(topic, partition)
 
 			if leo > manifestEnd || start < manifestStart {
-				s.metadataCache.SetPartitionState(topic, partition, leo, start, segments)
+				s.metadataCache.SetPartitionState(topic, partition, leo, start)
 				// Persist the repaired position so the next restart does not
 				// pay for the same segment read.
 				s.markManifestDirty(topic, partition)

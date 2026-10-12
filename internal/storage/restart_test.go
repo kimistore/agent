@@ -266,7 +266,7 @@ func TestListOffsetsLogStartAfterRetention(t *testing.T) {
 	if _, err := se.Append("orders", 0, batchOfN(40), 40, true); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	se.metadataCache.SetPartitionState("orders", 0, 40, 20, nil)
+	se.metadataCache.SetPartitionState("orders", 0, 40, 20)
 
 	if got := se.LogStartOffset("orders", 0); got != 20 {
 		t.Errorf("log start = %d, want 20", got)

@@ -11,6 +11,26 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.4
+
+1.0.3 added the window-and-bucket index but left recovery repopulating the flat
+one, so the checkpoint still carried every segment ever written and still grew
+with history. Measured on knode3 after deploying 1.0.3: 4.0 MB and 37,983
+segments, with the new shape correctly present alongside the old one.
+
+### Fixed
+
+- The flat segment list is gone from the checkpoint and from the per-partition
+  manifest. Recovery and retention no longer rebuild it by listing, which is
+  what kept putting the whole log back on disk every checkpoint. The index is
+  the open window and the sealed-bucket directory, maintained by the uploader
+- A test now samples the checkpoint across a full window cycle and asserts a
+  peak bounded by RecentWindow rather than by history. The previous suite
+  passed while the checkpoint was still 4 MB
+
+Measured peak across 32,760 segments: 24,937 bytes, against roughly 3.4 MB for
+a flat index at the same point.
+
 ## 1.0.3
 
 A consumer that could not resume, and a checkpoint that grew without bound.

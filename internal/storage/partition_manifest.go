@@ -171,10 +171,10 @@ func (s *StorageEngine) savePartitionManifests(ctx context.Context) error {
 				}
 			}
 
-			segments := ps.Segments
-			if segments == nil {
-				segments = []*SegmentMetadata{}
-			}
+			// The per-partition manifest carries position only. The segment
+			// index lives in the checkpoint as Recent and Sealed; duplicating
+			// it here is what kept a copy of the whole log on disk per
+			// partition.
 			data, err := json.MarshalIndent(perPartitionManifest{
 				Epoch:          s.partitionEpoch(topic, pid),
 				WriterEpoch:    s.lease.Epoch(),
@@ -183,7 +183,6 @@ func (s *StorageEngine) savePartitionManifests(ctx context.Context) error {
 				Partition:      pid,
 				LogEndOffset:   ps.LogEndOffset,
 				LogStartOffset: ps.LogStartOffset,
-				Segments:       segments,
 			}, "", "  ")
 			if err != nil {
 				if firstErr == nil {
@@ -280,7 +279,7 @@ func (s *StorageEngine) loadPartitionManifests(ctx context.Context) (restored in
 				errSuperseded, obj.Key, stored, m.Writer, s.partitionEpoch(m.Topic, m.Partition))
 		}
 
-		s.metadataCache.SetPartitionState(m.Topic, m.Partition, m.LogEndOffset, m.LogStartOffset, m.Segments)
+		s.metadataCache.SetPartitionState(m.Topic, m.Partition, m.LogEndOffset, m.LogStartOffset)
 		restored++
 	}
 	return restored, found, nil
@@ -328,7 +327,7 @@ func (s *StorageEngine) loadLegacyManifest(ctx context.Context) (int, error) {
 
 	restored := 0
 	for _, e := range parsed.Partitions {
-		s.metadataCache.SetPartitionState(e.Topic, e.Partition, e.LogEndOffset, e.LogStartOffset, e.Segments)
+		s.metadataCache.SetPartitionState(e.Topic, e.Partition, e.LogEndOffset, e.LogStartOffset)
 		// Rewrite it in the new shape at the next checkpoint, so the upgrade
 		// is a one-time cost rather than a permanent dependency on the old key.
 		s.markManifestDirty(e.Topic, e.Partition)

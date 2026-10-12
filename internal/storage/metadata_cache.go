@@ -86,10 +86,12 @@ type PartitionState struct {
 	// report as the earliest offset.
 	LogStartOffset int64 `json:"log_start_offset"`
 
-	// Segments is the ordered segment inventory, oldest first.
-	Segments []*SegmentMetadata `json:"segments"`
-	Recent   []SegmentRef       `json:"recent,omitempty"`
-	Sealed   []BucketRef        `json:"sealed,omitempty"`
+	// Recent is the open window: the newest segments, inline in the checkpoint.
+	// Sealed is the directory of immutable buckets covering everything older.
+	// Together they are the partition's segment index, and neither grows with
+	// the write rate.
+	Recent []SegmentRef `json:"recent,omitempty"`
+	Sealed []BucketRef  `json:"sealed,omitempty"`
 }
 
 // SegmentRef names one uploaded segment by its base offset and ownership
@@ -181,9 +183,6 @@ func (mc *MetadataCache) touchLocked(topic string, partition int32) *PartitionSt
 		ps = &PartitionState{}
 		mc.Topics[topic].Partitions[partition] = ps
 	}
-	if ps.Segments == nil {
-		ps.Segments = make([]*SegmentMetadata, 0)
-	}
 	return ps
 }
 
@@ -258,16 +257,17 @@ func (mc *MetadataCache) AdvancePartition(topic string, partition int32, newEnd 
 
 // SetPartitionState overwrites the durable position of a partition, used when
 // restoring from the checkpoint or object storage.
-func (mc *MetadataCache) SetPartitionState(topic string, partition int32, leo, lso int64, segments []*SegmentMetadata) {
+// A nil segment list no longer means anything: the index is Recent and Sealed,
+// and they are maintained by the uploader rather than by a listing. Recovery
+// used to pass a listed segment set here, which put the whole index back into
+// the checkpoint and undid the bounding the window and buckets exist to give.
+func (mc *MetadataCache) SetPartitionState(topic string, partition int32, leo, lso int64) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 	ps := mc.touchLocked(topic, partition)
 	ps.LogEndOffset = leo
 	ps.HighWatermark = leo
 	ps.LogStartOffset = lso
-	if segments != nil {
-		ps.Segments = segments
-	}
 }
 
 // GetPartitions returns the known partitions for a topic. Retention and
@@ -316,44 +316,6 @@ func (mc *MetadataCache) LogStartOffset(topic string, partition int32) int64 {
 		return 0
 	}
 	return ps.LogStartOffset
-}
-
-// SegmentFor returns the key of the uploaded segment covering offset, found by
-// binary search over the ordered inventory the manifest carries.
-//
-// It exists so a read never has to list object storage. The inventory is
-// ordered oldest first, so the segment covering an offset is the last one
-// whose start is at or below it. Returning "" means the inventory does not
-// cover the offset, and the caller has to fall back to a listing.
-//
-// EndOffset is deliberately not consulted. It is -1 for any segment this
-// agent cannot prove an end for, and treating that as the end of the range
-// would make a reader conclude the offset falls past it and look in the wrong
-// place. The start offsets alone already order the inventory unambiguously.
-func (mc *MetadataCache) SegmentFor(topic string, partition int32, offset int64) string {
-	mc.mu.RLock()
-	defer mc.mu.RUnlock()
-	ts, ok := mc.Topics[topic]
-	if !ok {
-		return ""
-	}
-	ps, ok := ts.Partitions[partition]
-	if !ok || len(ps.Segments) == 0 {
-		return ""
-	}
-
-	segs := ps.Segments
-	i := sort.Search(len(segs), func(i int) bool { return segs[i].StartOffset > offset })
-	if i == 0 {
-		// Every segment starts after the requested offset, so the offset
-		// predates the oldest segment still on record.
-		return ""
-	}
-	seg := segs[i-1]
-	if seg == nil || seg.S3Key == "" {
-		return ""
-	}
-	return seg.S3Key
 }
 
 // AddSegment records an uploaded segment in a partition's index.
@@ -555,11 +517,10 @@ func (mc *MetadataCache) TopicsSnapshot() map[string]map[int32]*PartitionState {
 		parts := make(map[int32]*PartitionState, len(ts.Partitions))
 		for pid, ps := range ts.Partitions {
 			clone := *ps
-			clone.Segments = make([]*SegmentMetadata, len(ps.Segments))
-			for i, seg := range ps.Segments {
-				c := *seg
-				clone.Segments[i] = &c
-			}
+			// The index slices are copied too: the snapshot is serialised
+			// without the lock held, and the uploader mutates both.
+			clone.Recent = append([]SegmentRef(nil), ps.Recent...)
+			clone.Sealed = append([]BucketRef(nil), ps.Sealed...)
 			parts[pid] = &clone
 		}
 		out[name] = parts
@@ -612,8 +573,8 @@ func (mc *MetadataCache) FromJSON(data []byte) error {
 			ts.Partitions = make(map[int32]*PartitionState)
 		}
 		for _, ps := range ts.Partitions {
-			if ps.Segments == nil {
-				ps.Segments = make([]*SegmentMetadata, 0)
+			if ps.Recent == nil {
+				ps.Recent = []SegmentRef{}
 			}
 		}
 	}

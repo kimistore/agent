@@ -334,8 +334,11 @@ func (s *StorageEngine) processPartitionRetention(ctx context.Context, topic str
 		// consumer that resets to "earliest" is sent to an offset that no
 		// longer exists and loops on OffsetOutOfRange forever.
 		remaining := s.oldestRetainedOffset(ctx, topic, partition)
+		// The index is not rebuilt here. Listing it is what the window and
+		// buckets replaced, and retention prunes by dropping whole buckets, so
+		// a partition's index is left to DropSegmentsBefore.
 		s.metadataCache.SetPartitionState(topic, partition,
-			s.metadataCache.LogEndOffset(topic, partition), remaining, s.currentSegments(ctx, topic, partition))
+			s.metadataCache.LogEndOffset(topic, partition), remaining)
 		s.markManifestDirty(topic, partition)
 		log.Printf("Retention: deleted %d segment(s) from %s; log start now %d", deleted, cacheKey, remaining)
 	}
