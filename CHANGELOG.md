@@ -11,6 +11,33 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.10
+
+Corrects the segment size chosen in 1.0.8, which was raised when it should have
+been lowered.
+
+### Fixed
+
+- `MaxSegmentSize` is 16MB, not the 256MB set in 1.0.8. The reasoning given then
+  was that a read "seeks with the sidecar and stops at the fetch budget, so a
+  larger segment does not make a read proportional to the segment -- only to the
+  position within it". That first claim is true; the conclusion did not follow,
+  because it left out the sidecar itself. The index is written every 4KB at 8
+  bytes per entry, so it grows linearly with the segment -- 32KB at 16MB, 128KB at
+  64MB, 512KB at 256MB -- and every read fetches it in full before returning the
+  first record. The fetch budget bounds only the record data, so raising the
+  threshold fourfold made the fixed cost of every read grow fourfold as well.
+  A test now holds the sidecar under a 64KB ceiling and fails at 256MB
+
+### Known limitations
+
+- A merge reads every source and writes the result, so the merged size is also
+  the per-pass cost of compaction on a single-threaded loop sharing the box with
+  the uploader. 16MB keeps a pass to seconds rather than minutes
+- Recovery cannot reclaim a merged segment written but not yet committed: no
+  marker covers it, and its key is derived from the same offsets, so a later
+  merge overwrites it
+
 ## 1.0.9
 
 Recovers a merge that a crash interrupted, and fixes two bugs in the merge path

@@ -35,36 +35,31 @@ import (
 // MaxSegmentSize is the threshold to roll a segment, and the default bound on
 // how large a merged segment may be.
 //
-// It was raised from 64MB to 256MB. The reasoning is worth recording, because
-// the old comment -- "increased to 64MB to reduce invalid S3 PUT costs" --
-// described a cost that does not apply here.
+// It was raised from 64MB to 256MB in 1.0.8 and that was wrong. The reasoning
+// given then was that a read "seeks with the sidecar and stops at the fetch
+// budget, so a larger segment does not make a read proportional to the segment
+// -- only to the position within it". The first half is true and the conclusion
+// drawn from it was not, because it left out the sidecar itself.
 //
-// A segment carrying acks=all traffic is not rolled on size at all. The flush
-// interval seals the active segment so the producer can be acknowledged, and at
-// this workload that fires roughly once a second. Measured on knode3, segments
-// averaged 45KB against the old 64MB threshold, about 1,400x below it, so the
-// threshold was never the binding constraint: changing it changed nothing about
-// how many objects a partition accumulated. What it did decide was the size of a
-// *merged* segment, since that is what the compactor bounds its output by, and
-// the merged segment is what the object count converges to.
+// The sidecar is indexed every 4KB and holds 8 bytes per entry, so it grows
+// linearly with the segment: a 16MB segment needs a 32KB sidecar, 64MB needs
+// 128KB, 256MB needs 512KB. Every read fetches that sidecar in full before it
+// returns the first record, and it is not covered by the fetch budget, which
+// bounds only the record data. So raising the threshold fourfold made the fixed
+// cost of every read grow fourfold as well, to return a few KB of records.
 //
-// 256MB is chosen against two pressures that pull opposite ways.
+// 16MB keeps the sidecar at 32KB, which is small enough not to dominate a read
+// and small enough to fetch cheaply on a 30-second operation timeout. It still
+// delivers the object-count reduction that motivated the change in the first
+// place: against the ~45KB segments this workload actually produces, 16MB is
+// roughly 350x fewer objects, so the problem that prompted the change is solved
+// long before the size becomes a problem itself.
 //
-// Larger means fewer objects, and object count is not cosmetic on this bucket:
-// it lists at roughly 17 seconds per 1000 keys, and each object also costs an
-// index entry, a PUT and a sidecar. At 45KB per segment the partition held
-// about 22,000 objects per GB.
-//
-// Smaller means a cheaper cold read. A read seeks with the sidecar and then
-// streams from that position, stopping at the fetch budget (1MB by default), so
-// a larger segment does not make a read proportional to the segment size -- it
-// makes it proportional to the position within it. The cost is that a read
-// landing early in a large segment transfers from that point forward.
-//
-// 256MB bounds that in practice: reads at this workload land within a few
-// segments of the log end, where the reader is at the far end of the object and
-// transfers almost nothing.
-var MaxSegmentSize = int64(256 * 1024 * 1024) // 256MB
+// Bigger segments would also make a merge more expensive than it needs to be. A
+// merge reads every source and writes the result, so a 256MB target moves 256MB
+// per pass on a single-threaded loop competing with the uploader, on a
+// Raspberry Pi. 16MB keeps each pass to a few seconds.
+var MaxSegmentSize = int64(16 * 1024 * 1024) // 16MB
 
 // maxEntrySize bounds a single WAL entry. A size field larger than this is
 // treated as corruption rather than a legitimate (if very large) record.
