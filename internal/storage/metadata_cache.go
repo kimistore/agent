@@ -20,12 +20,14 @@ package storage
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
+
+	"kimistore/internal/storage/wal"
 )
 
 // MetadataCache is the broker's authoritative view of what exists: which
@@ -86,7 +88,33 @@ type PartitionState struct {
 
 	// Segments is the ordered segment inventory, oldest first.
 	Segments []*SegmentMetadata `json:"segments"`
+	Recent   []SegmentRef       `json:"recent,omitempty"`
+	Sealed   []BucketRef        `json:"sealed,omitempty"`
 }
+
+// SegmentRef names one uploaded segment by its base offset and ownership
+// epoch. The object key is derived from those two numbers and the partition
+// prefix, so storing the key itself spends ~90 bytes to say what 16 say.
+type SegmentRef struct {
+	Base  int64 `json:"b"`
+	Epoch int64 `json:"e"`
+}
+
+// BucketRef names a sealed run of segments. A sealed bucket is immutable, so
+// the run it covers cannot change after it is written.
+type BucketRef struct {
+	First int64  `json:"first"`
+	Last  int64  `json:"last"`
+	Key   string `json:"key"`
+}
+
+// RecentWindow is how many segments stay inline in the checkpoint before they
+// are sealed into a bucket.
+//
+// Reads are hot at this workload -- the consumer sits one offset behind the log
+// end -- so the window absorbs that. It is sized to keep the checkpoint small:
+// at 4096 the inline window is ~64 KB and the directory grows at history/4096.
+const RecentWindow = 4096
 
 type SegmentMetadata struct {
 	StartOffset int64  `json:"start_offset"`
@@ -328,40 +356,167 @@ func (mc *MetadataCache) SegmentFor(topic string, partition int32, offset int64)
 	return seg.S3Key
 }
 
-// AddSegment records an uploaded segment in a partition's ordered inventory.
+// AddSegment records an uploaded segment in a partition's index.
 //
-// The order is by start offset because that is the order the manifest
-// documents and the order SegmentFor's binary search needs. There is exactly
-// one entry per start offset: a re-claimed partition writes the same base
-// offset again under a newer ownership epoch, and both objects exist in the
-// bucket. Keeping both leaves the binary search choosing between two entries
-// with an identical start offset by position rather than by epoch, and it picks
-// the superseded one -- serving a consumer a segment the current owner has
-// replaced, which is the read-side twin of the corruption the claim exists to
-// prevent. The listing path already prefers the higher epoch at a tie, so the
-// two paths have to agree.
-func (mc *MetadataCache) AddSegment(topic string, partition int32, seg *SegmentMetadata) {
-	if seg == nil || seg.S3Key == "" {
-		return
-	}
+// It goes into the open window, which is inline in the checkpoint. The window
+// is sealed into an immutable bucket only when it fills, so the total bytes
+// written for the index is O(total segments) rather than
+// O(total segments x checkpoints) -- which is the whole point of the split.
+// A sealed bucket is never rewritten, because the run it covers is finished by
+// construction.
+//
+// There is exactly one entry per base offset. A re-claimed partition writes the
+// same base offset again under a newer ownership epoch, and both objects exist
+// in the bucket; keeping both would leave the lookup choosing between them by
+// position rather than by epoch, and it would pick the superseded one.
+//
+// A full window is dropped rather than sealed here: sealing writes an object,
+// and this holds no object store. The caller seals through SealWindow.
+func (mc *MetadataCache) AddSegment(topic string, partition int32, ref SegmentRef) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
 	ps := mc.touchLocked(topic, partition)
-	i := sort.Search(len(ps.Segments), func(i int) bool {
-		return ps.Segments[i].StartOffset >= seg.StartOffset
-	})
-
-	if i < len(ps.Segments) && ps.Segments[i] != nil && ps.Segments[i].StartOffset == seg.StartOffset {
-		if segmentEpoch(seg.S3Key) >= segmentEpoch(ps.Segments[i].S3Key) {
-			ps.Segments[i] = seg
+	i := sort.Search(len(ps.Recent), func(i int) bool { return ps.Recent[i].Base >= ref.Base })
+	if i < len(ps.Recent) && ps.Recent[i].Base == ref.Base {
+		if ref.Epoch >= ps.Recent[i].Epoch {
+			ps.Recent[i] = ref
 		}
 		return
 	}
+	ps.Recent = append(ps.Recent, SegmentRef{})
+	copy(ps.Recent[i+1:], ps.Recent[i:])
+	ps.Recent[i] = ref
+}
 
-	ps.Segments = append(ps.Segments, nil)
-	copy(ps.Segments[i+1:], ps.Segments[i:])
-	ps.Segments[i] = seg
+// SealWindow moves a full open window into an immutable bucket and returns the
+// bucket with the segments it covers, or nil when the window is not yet full.
+// The caller persists the returned segments under the returned key.
+//
+// Oldest first, and the window holds a contiguous run, so the bucket's range is
+// simply its first and last entry.
+func (mc *MetadataCache) SealWindow(topic string, partition int32) (*BucketRef, []SegmentRef) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	ps := mc.touchLocked(topic, partition)
+	if len(ps.Recent) < RecentWindow {
+		return nil, nil
+	}
+	refs := append([]SegmentRef(nil), ps.Recent...)
+	bucket := BucketRef{
+		First: refs[0].Base,
+		Last:  refs[len(refs)-1].Base,
+		Key:   bucketKey(topic, partition, refs[0].Base, refs[len(refs)-1].Base),
+	}
+	ps.Sealed = append(ps.Sealed, bucket)
+	ps.Recent = nil
+	return &bucket, refs
+}
+
+// BucketFor returns the sealed bucket covering offset, or nil when the offset
+// falls in no bucket. It is the lookup a cold read performs before fetching.
+func (mc *MetadataCache) BucketFor(topic string, partition int32, offset int64) *BucketRef {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	ts, ok := mc.Topics[topic]
+	if !ok {
+		return nil
+	}
+	ps, ok := ts.Partitions[partition]
+	if !ok {
+		return nil
+	}
+	i := sort.Search(len(ps.Sealed), func(i int) bool { return ps.Sealed[i].Last >= offset })
+	if i >= len(ps.Sealed) || ps.Sealed[i].First > offset {
+		return nil
+	}
+	b := ps.Sealed[i]
+	return &b
+}
+
+// RecentFor returns the segment in the open window covering offset, or nil.
+// A hit here costs nothing: the window is already in memory.
+func (mc *MetadataCache) RecentFor(topic string, partition int32, offset int64) *SegmentRef {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	ts, ok := mc.Topics[topic]
+	if !ok {
+		return nil
+	}
+	ps, ok := ts.Partitions[partition]
+	if !ok || len(ps.Recent) == 0 {
+		return nil
+	}
+	i := sort.Search(len(ps.Recent), func(i int) bool { return ps.Recent[i].Base > offset })
+	if i == 0 {
+		return nil
+	}
+	ref := ps.Recent[i-1]
+	return &ref
+}
+
+// LoadBucket installs a fetched bucket's segments into the open window's
+// sibling lookup, by merging them into Recent.
+//
+// They are merged rather than kept apart because the read path does a single
+// binary search, and because a bucket covering the tail is contiguous with the
+// window anyway. Segments the window already holds win, so a bucket fetched
+// twice does not undo newer entries.
+func (mc *MetadataCache) LoadBucket(topic string, partition int32, refs []SegmentRef) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	ps := mc.touchLocked(topic, partition)
+	merged := make([]SegmentRef, 0, len(ps.Recent)+len(refs))
+	merged = append(merged, ps.Recent...)
+	merged = append(merged, refs...)
+	sort.Slice(merged, func(i, j int) bool { return merged[i].Base < merged[j].Base })
+
+	out := merged[:0]
+	for i, r := range merged {
+		if i > 0 && merged[i-1].Base == r.Base {
+			// The window entry is newer, so it is the one already present.
+			continue
+		}
+		out = append(out, r)
+	}
+	ps.Recent = out
+}
+
+// DropSegmentsBefore removes index entries covering offsets below start, and
+// reports the sealed buckets that became entirely reclaimable so the caller
+// can delete them.
+//
+// Retention deletes whole buckets rather than editing them, so this is O(buckets
+// dropped) plus O(window trimmed) rather than a scan of the whole index.
+func (mc *MetadataCache) DropSegmentsBefore(topic string, partition int32, start int64) []BucketRef {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	ts, ok := mc.Topics[topic]
+	if !ok {
+		return nil
+	}
+	ps, ok := ts.Partitions[partition]
+	if !ok {
+		return nil
+	}
+
+	var dropped []BucketRef
+	keep := ps.Sealed[:0]
+	for _, b := range ps.Sealed {
+		if b.Last < start {
+			dropped = append(dropped, b)
+			continue
+		}
+		keep = append(keep, b)
+	}
+	ps.Sealed = keep
+
+	trim := sort.Search(len(ps.Recent), func(i int) bool { return ps.Recent[i].Base >= start })
+	ps.Recent = append([]SegmentRef(nil), ps.Recent[trim:]...)
+	return dropped
 }
 
 // segmentEpoch reads the ownership epoch out of a segment key, reporting -1
@@ -373,44 +528,21 @@ func segmentEpoch(key string) int64 {
 	return -1
 }
 
-// CommittedOffsetsFor returns a group's durable committed offsets grouped by
-// topic, then partition.
-func (mc *MetadataCache) CommittedOffsetsFor(groupID string) map[string]map[int32]int64 {
-	mc.mu.RLock()
-	defer mc.mu.RUnlock()
-
-	out := make(map[string]map[int32]int64)
-	for key, offset := range mc.Committed[groupID] {
-		slash := strings.LastIndex(key, "/")
-		if slash <= 0 || slash == len(key)-1 {
-			continue
-		}
-		p, err := strconv.ParseInt(key[slash+1:], 10, 32)
-		if err != nil {
-			continue
-		}
-		topic := key[:slash]
-		if out[topic] == nil {
-			out[topic] = make(map[int32]int64)
-		}
-		out[topic][int32(p)] = offset
-	}
-	return out
+// segmentKey renders the object key a segment reference names.
+//
+// The name is built with wal.SegmentName rather than formatted here, because
+// that is what the writer used and the two have to agree exactly: an epoch of
+// zero or less omits the suffix entirely, so rendering "-e0" would point at an
+// object that does not exist for every pre-ownership segment. Deriving the key
+// is what keeps an index entry at 16 bytes, and it is only safe because the
+// name is a pure function of these two numbers.
+func segmentKey(topic string, partition int32, ref SegmentRef) string {
+	return fmt.Sprintf("%s/%d/%s", topic, partition, wal.SegmentName(ref.Base, ref.Epoch))
 }
 
-// SetCommitted records a group's committed offset in the durable map. It is
-// how a position recovered from a checkpoint becomes visible again.
-func (mc *MetadataCache) SetCommitted(groupID, topic string, partition int32, offset int64) {
-	key := topic + "/" + strconv.Itoa(int(partition))
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-	if mc.Committed == nil {
-		mc.Committed = make(map[string]map[string]int64)
-	}
-	if mc.Committed[groupID] == nil {
-		mc.Committed[groupID] = make(map[string]int64)
-	}
-	mc.Committed[groupID][key] = offset
+// bucketKey renders a sealed bucket's key from the range it covers.
+func bucketKey(topic string, partition int32, first, last int64) string {
+	return fmt.Sprintf("%s/%d/%020d-%020d.idx", topic, partition, first, last)
 }
 
 // TopicsSnapshot returns a deep copy of the durable state, suitable for
@@ -490,4 +622,22 @@ func (mc *MetadataCache) FromJSON(data []byte) error {
 	mc.WriterEpoch = state.WriterEpoch
 	mc.Writer = state.Writer
 	return nil
+}
+
+// SeededBucket installs a bucket into the index as if it had been sealed and
+// written. It exists for tests and for recovery, which reads bucket objects
+// back rather than reconstructing them.
+func (mc *MetadataCache) SeededBucket(topic string, partition int32, b BucketRef, body []byte) {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	ps := mc.touchLocked(topic, partition)
+	ps.Sealed = append(ps.Sealed, b)
+	sort.Slice(ps.Sealed, func(i, j int) bool { return ps.Sealed[i].Last < ps.Sealed[j].Last })
+	if len(body) > 0 {
+		var refs []SegmentRef
+		if err := json.Unmarshal(body, &refs); err == nil {
+			ps.Recent = append(ps.Recent, refs...)
+			sort.Slice(ps.Recent, func(i, j int) bool { return ps.Recent[i].Base < ps.Recent[j].Base })
+		}
+	}
 }

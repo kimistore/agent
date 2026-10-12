@@ -939,7 +939,11 @@ func (s *StorageEngine) ReadBatchContext(ctx context.Context, topic string, part
 	//
 	// The listing is kept as a fallback for the one case the inventory cannot
 	// answer: a partition this agent has no inventory for yet.
-	bestKey := s.metadataCache.SegmentFor(topic, partition, offset)
+	bestKey, keyErr := s.segmentKeyFor(ctx, topic, partition, offset)
+	if keyErr != nil {
+		return nil, 0, keyErr
+	}
+
 	if bestKey == "" {
 		keys, err := s.cachedSegments(ctx, prefix, cacheKey)
 		if err != nil {
@@ -1783,7 +1787,7 @@ func (s *StorageEngine) handleUpload(ctx context.Context, task wal.UploadTask) {
 	// inventory and every read for a cold offset fell back to the same listing
 	// and failed. Recording each upload here makes the manifest the durable
 	// source of the index instead.
-	s.recordSegmentUploaded(task.Topic, task.Partition, task.BaseOffset, task.EndOffset, key)
+	s.recordSegmentUploaded(ctx, task.Topic, task.Partition, task.BaseOffset, task.EndOffset, key)
 
 	cacheKey := fmt.Sprintf("%s/%d", task.Topic, task.Partition)
 	s.cacheMu.Lock()
@@ -1797,24 +1801,38 @@ func (s *StorageEngine) handleUpload(ctx context.Context, task wal.UploadTask) {
 	s.cacheMu.Unlock()
 }
 
-// recordSegmentUploaded adds one uploaded segment to a partition's ordered
-// inventory and marks its manifest dirty.
+// recordSegmentUploaded adds one uploaded segment to a partition's index and
+// marks its manifest dirty.
 //
-// The inventory is kept ordered by start offset because that is the order the
-// manifest documents and the order a binary search over it needs. A segment
-// whose start is below every known segment is inserted at the front; one that
-// is already present is replaced, which is what a re-upload of the same segment
-// after a reconciliation pass does.
-func (s *StorageEngine) recordSegmentUploaded(topic string, partition int32, base, end int64, key string) {
+// When the open window fills it is sealed into an immutable bucket here, which
+// is the only write the index makes per run of segments. Leaving the whole
+// index in the checkpoint instead is what made it O(total segments x
+// checkpoints) to write.
+func (s *StorageEngine) recordSegmentUploaded(ctx context.Context, topic string, partition int32, base, end int64, key string) {
 	if key == "" {
 		return
 	}
-	s.metadataCache.AddSegment(topic, partition, &SegmentMetadata{
-		StartOffset: base,
-		EndOffset:   end,
-		S3Key:       key,
-	})
+	s.metadataCache.AddSegment(topic, partition, SegmentRef{Base: base, Epoch: segmentEpoch(key)})
 	s.markManifestDirty(topic, partition)
+	s.maybeSealWindow(ctx, topic, partition)
+}
+
+// maybeSealWindow persists a full open window as an immutable bucket.
+func (s *StorageEngine) maybeSealWindow(ctx context.Context, topic string, partition int32) {
+	bucket, refs := s.metadataCache.SealWindow(topic, partition)
+	if bucket == nil {
+		return
+	}
+	body, err := json.Marshal(refs)
+	if err != nil {
+		log.Printf("sealing window for %s/%d: %v", topic, partition, err)
+		return
+	}
+	putCtx, cancel := s.objCtx(ctx)
+	defer cancel()
+	if err := s.objStore.Put(putCtx, bucket.Key, bytes.NewReader(body)); err != nil {
+		log.Printf("sealing window for %s/%d: %v", topic, partition, err)
+	}
 }
 
 func (s *StorageEngine) uploaderLoop() {
@@ -2779,4 +2797,56 @@ func (s *StorageEngine) CommittedOffsetsFor(groupID string) map[string]map[int32
 		out[key[:slash]][int32(p)] = offset
 	}
 	return out
+}
+
+// segmentKeyFor resolves the object key of the segment covering offset from the
+// partition's index, without listing object storage.
+//
+// The open window is already in memory, so a read at the tail -- which is where
+// essentially every read lands, since consumers sit near the log end -- costs a
+// binary search and nothing else. A cold read costs one bucket GET, which is
+// bounded and small rather than proportional to the partition's history.
+//
+// Listing remains the fallback for a partition whose index knows nothing about
+// the offset, so an agent that has just started can still serve a read.
+func (s *StorageEngine) segmentKeyFor(ctx context.Context, topic string, partition int32, offset int64) (string, error) {
+	if ref := s.metadataCache.RecentFor(topic, partition, offset); ref != nil {
+		return segmentKey(topic, partition, *ref), nil
+	}
+
+	bucket := s.metadataCache.BucketFor(topic, partition, offset)
+	if bucket == nil {
+		return "", nil
+	}
+
+	// Re-check the window: another read may have loaded this bucket already.
+	if ref := s.metadataCache.RecentFor(topic, partition, offset); ref != nil {
+		return segmentKey(topic, partition, *ref), nil
+	}
+
+	body, err := s.objGetWhole(ctx, bucket.Key)
+	if err != nil {
+		return "", fmt.Errorf("failed to read index bucket %s: %w", bucket.Key, err)
+	}
+	var refs []SegmentRef
+	if err := json.Unmarshal(body, &refs); err != nil {
+		return "", fmt.Errorf("index bucket %s is not readable: %w", bucket.Key, err)
+	}
+	s.metadataCache.LoadBucket(topic, partition, refs)
+
+	if ref := s.metadataCache.RecentFor(topic, partition, offset); ref != nil {
+		return segmentKey(topic, partition, *ref), nil
+	}
+	return "", nil
+}
+
+// objGetWhole reads a whole object into memory. Used only for index buckets,
+// which are bounded by RecentWindow entries.
+func (s *StorageEngine) objGetWhole(ctx context.Context, key string) ([]byte, error) {
+	rc, err := s.objGet(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }()
+	return io.ReadAll(rc)
 }
