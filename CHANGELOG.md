@@ -11,6 +11,44 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.9
+
+Recovers a merge that a crash interrupted, and fixes two bugs in the merge path
+that only a full-bucket compaction would have reached.
+
+### Fixed
+
+- A merge that committed its index update and then died before deleting its
+  sources left them orphaned: unreferenced, so nothing could read them, and
+  unreachable by any listing, so nothing could reclaim them. The marker written
+  just after the commit is now read at startup and its sources deleted. Markers
+  are named after the bucket that replaced them, so recovery finds them through
+  the checkpoint's own bucket directory -- one probe per sealed bucket, against a
+  listing that cannot complete on this bucket at all. A marker whose bucket the
+  index does not name belongs to a merge that never committed, and its sources
+  are still live, so it is left alone
+- A merged bucket's `Last` was computed as the first base offset plus the entry
+  count. Offsets do not advance one per entry -- a segment's base is the offset
+  its first record carries, and entries skip -- so on any real partition the
+  range was overstated, which would make `BucketFor` resolve an offset to the
+  wrong bucket. It now takes the last source entry's base, as `SealWindow` does
+- A merge that consumed an entire bucket produced a bucket with the same key as
+  the one it replaced, because the key derives from the first and last offsets.
+  The old bucket was then deleted, removing the very bucket the index had just
+  been pointed at, and every read in that range would have failed to resolve.
+  The delete is now skipped when the key is unchanged
+
+### Known limitations
+
+- Recovery is limited to the partition's own markers. A merge interrupted after
+  writing its bucket but before committing the index leaves an unreferenced
+  merged segment that no marker covers, and nothing reclaims it. It costs storage
+  and nothing else, and a later merge overwrites it, because the merged key is
+  derived from the same offsets
+- Segments recorded before the index carried sizes are refused by the
+  compactor, because the cap on merged size cannot be applied to entries of
+  unknown size. They are compacted once the window has rolled past them
+
 ## 1.0.8
 
 The compactor is on by default and the segment size is settled.

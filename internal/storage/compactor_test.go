@@ -321,3 +321,128 @@ func TestCompactor_RunsUnlessDisabled(t *testing.T) {
 		t.Error("WithCompactor(Disabled) did not disable compaction")
 	}
 }
+
+// A merge that committed its index update and then died before deleting its
+// sources must leave those sources reclaimable, or they are storage nothing can
+// ever reach again.
+//
+// This is the crash window the marker exists for. The test reproduces it by
+// writing the marker and stopping short of the delete, which is exactly the
+// state a process death between those two steps leaves behind.
+func TestResumeInterruptedMerges_ReclaimsOrphanedSources(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine := newCompactingEngine(t, store)
+
+	_, refs := seedBucket(t, engine, store.inner, "orders", 0, 1000, 12, 40)
+	seedBucket(t, engine, store.inner, "orders", 0, 2000, 12, 40)
+
+	// Perform the merge, but restore the sources afterwards and leave a marker
+	// naming the bucket that replaced them -- the state after a crash between
+	// the index commit and the delete.
+	if _, err := engine.compactPartition(context.Background(), "orders", 0); err != nil {
+		t.Fatalf("compactPartition: %v", err)
+	}
+	_, sealed := engine.metadataCache.IndexSnapshot("orders", 0)
+	if len(sealed) == 0 {
+		t.Fatal("no sealed buckets after compaction")
+	}
+	mergedBucket := sealed[0]
+
+	for _, ref := range refs {
+		key := segmentKey("orders", 0, ref)
+		if err := store.inner.Put(context.Background(), key, bytesReader([]byte("orphan"))); err != nil {
+			t.Fatalf("restore orphan %s: %v", key, err)
+		}
+	}
+	marker := engine.markerKey("orders", 0, mergedBucket.Key)
+	raw, err := json.Marshal(refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.inner.Put(context.Background(), marker, bytesReader(raw)); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	// The staged orphan must be present before recovery, or the test would pass
+	// without proving anything.
+	if rc, err := store.inner.Get(context.Background(), segmentKey("orders", 0, refs[0])); err != nil {
+		t.Fatalf("orphan was not staged (%v); the test would prove nothing", err)
+	} else {
+		_ = rc.Close()
+	}
+
+	deleted := engine.resumeInterruptedMerges(context.Background(), "orders", 0)
+	if deleted == 0 {
+		t.Fatal("recovery reclaimed nothing")
+	}
+
+	for _, ref := range refs {
+		if rc, err := store.inner.Get(context.Background(), segmentKey("orders", 0, ref)); err == nil {
+			_ = rc.Close()
+			t.Errorf("orphan %d survived recovery", ref.Base)
+		}
+	}
+	if rc, err := store.inner.Get(context.Background(), marker); err == nil {
+		_ = rc.Close()
+		t.Error("the marker was not cleared after recovery")
+	}
+}
+
+// A marker whose bucket the index does not name belongs to a merge that never
+// committed. Its sources are still the live data, so acting on it would delete
+// records the index depends on.
+func TestResumeInterruptedMerges_IgnoresUncommittedMarker(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine := newCompactingEngine(t, store)
+
+	_, refs := seedBucket(t, engine, store.inner, "orders", 0, 1000, 12, 40)
+	seedBucket(t, engine, store.inner, "orders", 0, 2000, 12, 40)
+
+	// A marker naming a bucket the index knows nothing about.
+	marker := engine.markerKey("orders", 0, "orders/0/99999999999999999999-99999999999999999999.idx")
+	raw, err := json.Marshal(refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.inner.Put(context.Background(), marker, bytesReader(raw)); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	if deleted := engine.resumeInterruptedMerges(context.Background(), "orders", 0); deleted != 0 {
+		t.Errorf("recovery deleted %d segment(s) for a merge that never committed", deleted)
+	}
+	for _, ref := range refs {
+		if rc, err := store.inner.Get(context.Background(), segmentKey("orders", 0, ref)); err != nil {
+			t.Errorf("source %d was deleted by an uncommitted marker: %v", ref.Base, err)
+		} else {
+			_ = rc.Close()
+		}
+	}
+}
+
+// A marker that cannot be read must not be treated as permission to delete. The
+// sources it would name are still referenced until a merge commits.
+func TestResumeInterruptedMerges_IgnoresUnreadableMarker(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine := newCompactingEngine(t, store)
+
+	_, refs := seedBucket(t, engine, store.inner, "orders", 0, 1000, 12, 40)
+	seedBucket(t, engine, store.inner, "orders", 0, 2000, 12, 40)
+
+	_, sealed := engine.metadataCache.IndexSnapshot("orders", 0)
+	marker := engine.markerKey("orders", 0, sealed[0].Key)
+	if err := store.inner.Put(context.Background(), marker, bytesReader([]byte("{not json"))); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	if deleted := engine.resumeInterruptedMerges(context.Background(), "orders", 0); deleted != 0 {
+		t.Errorf("recovery deleted %d segment(s) on an unreadable marker", deleted)
+	}
+	for _, ref := range refs {
+		if rc, err := store.inner.Get(context.Background(), segmentKey("orders", 0, ref)); err != nil {
+			t.Errorf("source %d was deleted on an unreadable marker: %v", ref.Base, err)
+		} else {
+			_ = rc.Close()
+		}
+	}
+}

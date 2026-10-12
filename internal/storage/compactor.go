@@ -92,6 +92,22 @@ func (s *StorageEngine) compactorLoop() {
 		return
 	}
 
+	// Finish any merge a previous process committed but did not finish deleting
+	// before this one ran. It runs once, before the first compaction pass, and
+	// only after the index has been restored -- the marker is found through the
+	// bucket directory, so an empty index would find nothing and the sources
+	// would stay orphaned.
+	go func() {
+		ctx := context.Background()
+		for _, topic := range s.metadataCache.GetTopics() {
+			for _, partition := range s.metadataCache.GetPartitions(topic) {
+				if n := s.resumeInterruptedMerges(ctx, topic, partition); n > 0 {
+					log.Printf("Compactor: recovered %d orphaned source segment(s) in %s/%d", n, topic, partition)
+				}
+			}
+		}
+	}()
+
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -207,10 +223,17 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 		return 0, fmt.Errorf("write merged segment: %w", err)
 	}
 	kept := append([]SegmentRef(nil), refs[len(sources):]...)
+	// Last is the base offset of the last source entry, not base plus a count.
+	// Offsets do not advance one per entry -- a segment's base is the offset its
+	// first record carries, and entries can skip -- so the two differ on any
+	// real partition. SealWindow derives it the same way, and a bucket whose
+	// range overstated by even one would make BucketFor resolve an offset to the
+	// wrong bucket.
+	mergedLast := sources[len(sources)-1].Base
 	next := BucketRef{
 		First:  mergedRef.Base,
-		Last:   mergedRef.Base + merged.Entries,
-		Key:    bucketKey(topic, partition, mergedRef.Base, mergedRef.Base+merged.Entries),
+		Last:   mergedLast,
+		Key:    bucketKey(topic, partition, mergedRef.Base, mergedLast),
 		Bytes:  merged.BytesOut,
 		Newest: mergedRef.Modified,
 	}
@@ -247,8 +270,14 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 			deleted++
 		}
 	}
-	if err := s.objDelete(ctx, b.Key); err != nil {
-		log.Printf("Compactor: cannot delete old bucket %s: %v", b.Key, err)
+	// The old bucket is deleted only when the merge produced a different one. A
+	// merge that consumed the whole bucket produces the same key -- same first
+	// and last offset -- so deleting it would remove the very bucket the index
+	// now names, and every read in the range would fail to resolve.
+	if b.Key != next.Key {
+		if err := s.objDelete(ctx, b.Key); err != nil {
+			log.Printf("Compactor: cannot delete old bucket %s: %v", b.Key, err)
+		}
 	}
 	if err := s.objDelete(ctx, marker); err != nil {
 		log.Printf("Compactor: cannot remove merge marker %s: %v", marker, err)
@@ -448,4 +477,62 @@ func moveFile(src, dst string) error {
 	}
 	_ = out.Close()
 	return os.Remove(src)
+}
+
+// resumeInterruptedMerges finishes deletions left half-done by a crash.
+//
+// A merge writes its marker after committing the index and deletes the sources
+// after that. A crash in between leaves the sources unreferenced: the index
+// names the merged segment, so nothing will read them again, and no listing
+// could find them either. They are storage that is never reclaimed and never
+// visible again.
+//
+// The marker is found through the checkpoint rather than by listing, which is
+// what makes recovery possible on this bucket at all. Markers are named after
+// the bucket that replaced them, so every marker belongs to a bucket the index
+// now names -- one probe per sealed bucket, and a missing marker is the normal
+// case. A partition with a few hundred sealed buckets costs a few hundred GETs
+// at startup, against a listing that cannot complete here at all.
+//
+// A marker whose bucket the index does not name belongs to a merge that never
+// committed. Its sources are still live, so it is left alone rather than acted
+// on: deleting them would remove data nothing else refers to.
+func (s *StorageEngine) resumeInterruptedMerges(ctx context.Context, topic string, partition int32) int {
+	_, sealed := s.metadataCache.IndexSnapshot(topic, partition)
+
+	deleted := 0
+	for _, b := range sealed {
+		marker := s.markerKey(topic, partition, b.Key)
+		body, err := s.objGetWhole(ctx, marker)
+		if err != nil {
+			// No marker: this bucket is not the result of an interrupted merge.
+			continue
+		}
+
+		var sources []SegmentRef
+		if err := json.Unmarshal(body, &sources); err != nil || len(sources) == 0 {
+			// An unreadable marker is not permission to delete anything. The
+			// sources it would name are still referenced by the index until the
+			// merge commits, so guessing here is how recovery becomes loss.
+			log.Printf("Compactor: marker %s is not readable (%v); leaving its sources in place", marker, err)
+			continue
+		}
+
+		// The index names this bucket, so the merge committed and these sources
+		// are the ones it replaced.
+		removed := 0
+		for _, ref := range sources {
+			if s.deleteSegmentObjects(ctx, topic, partition, ref) {
+				removed++
+			}
+		}
+		deleted += removed
+		metrics.RetentionSegmentsDeleted.Add(float64(removed))
+		if err := s.objDelete(ctx, marker); err != nil {
+			log.Printf("Compactor: cannot remove recovered marker %s: %v", marker, err)
+		}
+		log.Printf("Compactor: resumed an interrupted merge for %s/%d (%d source segment(s) reclaimed)",
+			topic, partition, removed)
+	}
+	return deleted
 }
