@@ -29,6 +29,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2846,12 +2847,16 @@ func (s *StorageEngine) segmentKeyFor(ctx context.Context, topic string, partiti
 	if err := json.Unmarshal(body, &refs); err != nil {
 		return "", fmt.Errorf("index bucket %s is not readable: %w", bucket.Key, err)
 	}
-	s.metadataCache.LoadBucket(topic, partition, refs)
-
-	if ref := s.metadataCache.RecentFor(topic, partition, offset); ref != nil {
-		return segmentKey(topic, partition, *ref), nil
+	// The loaded refs are searched directly rather than merged into the window.
+	// Merging them doubled the window, so a cold read made the checkpoint grow,
+	// and retention then deleted the same segment once via the bucket and again
+	// via the window. The window is for the newest segments; older ones stay
+	// where they are, behind their bucket.
+	i := sort.Search(len(refs), func(i int) bool { return refs[i].Base > offset })
+	if i == 0 {
+		return "", nil
 	}
-	return "", nil
+	return segmentKey(topic, partition, refs[i-1]), nil
 }
 
 // objGetWhole reads a whole object into memory. Used only for index buckets,
@@ -2863,4 +2868,133 @@ func (s *StorageEngine) objGetWhole(ctx context.Context, key string) ([]byte, er
 	}
 	defer func() { _ = rc.Close() }()
 	return io.ReadAll(rc)
+}
+
+// reclaimIndex removes index entries covering offsets below start and deletes
+// the segment objects they name, so retention reclaims storage through the
+// index rather than by listing the partition.
+//
+// A sealed bucket wholly below the boundary is one DELETE for the bucket plus
+// one per segment it covers, and the index shrinks by that whole bucket. The
+// open window is trimmed in place.
+//
+// A bucket that straddles the boundary is the one place a sealed bucket is not
+// immutable: it is rewritten without the reclaimed entries. That happens at
+// most once per bucket, as retention advances across it, and leaving it alone
+// would be worse -- the index would keep naming segments that no longer exist,
+// so a read of a reclaimed offset would resolve to a key whose object is gone
+// instead of falling back to a listing.
+func (s *StorageEngine) reclaimIndex(ctx context.Context, topic string, partition int32, start int64) int {
+	dropped, straddle, reclaimed := s.metadataCache.DropSegmentsBefore(topic, partition, start)
+
+	deleted := 0
+	for _, ref := range reclaimed {
+		if s.deleteSegmentObjects(ctx, topic, partition, ref) {
+			deleted++
+		}
+	}
+	metrics.RetentionSegmentsDeleted.Add(float64(len(reclaimed)))
+
+	for _, bucket := range dropped {
+		refs, err := s.readBucket(ctx, bucket)
+		if err != nil {
+			// Without the contents the segments cannot be named. Leave the
+			// bucket in place rather than orphaning its segments: a leaked
+			// bucket is recoverable, orphaned segments are invisible.
+			log.Printf("Retention: cannot read index bucket %s to reclaim it: %v", bucket.Key, err)
+			continue
+		}
+		for _, ref := range refs {
+			if s.deleteSegmentObjects(ctx, topic, partition, ref) {
+				deleted++
+			}
+		}
+		if err := s.objDelete(ctx, bucket.Key); err != nil {
+			log.Printf("Retention: failed to delete index bucket %s: %v", bucket.Key, err)
+			continue
+		}
+		metrics.RetentionSegmentsDeleted.Add(float64(len(refs)))
+		log.Printf("Retention: reclaimed index bucket %s covering %d..%d", bucket.Key, bucket.First, bucket.Last)
+	}
+
+	if straddle != nil {
+		deleted += s.rewriteStraddlingBucket(ctx, topic, partition, *straddle, start)
+	}
+	return deleted
+}
+
+// readBucket fetches a sealed bucket's contents.
+func (s *StorageEngine) readBucket(ctx context.Context, b BucketRef) ([]SegmentRef, error) {
+	body, err := s.objGetWhole(ctx, b.Key)
+	if err != nil {
+		return nil, err
+	}
+	var refs []SegmentRef
+	if err := json.Unmarshal(body, &refs); err != nil {
+		return nil, fmt.Errorf("index bucket %s is not readable: %w", b.Key, err)
+	}
+	return refs, nil
+}
+
+// rewriteStraddlingBucket drops the reclaimed prefix from a bucket that the
+// retention boundary passes through, and rewrites it with what remains.
+//
+// A segment is reclaimable only when the next one still starts at or below the
+// boundary, which is what proves every offset inside it is consumed. The newest
+// segment of a run has no successor, so it is never provably reclaimable and is
+// kept -- the same rule the listing-based sweep already applies.
+func (s *StorageEngine) rewriteStraddlingBucket(ctx context.Context, topic string, partition int32, b BucketRef, start int64) int {
+	refs, err := s.readBucket(ctx, b)
+	if err != nil {
+		log.Printf("Retention: cannot read index bucket %s to trim it: %v", b.Key, err)
+		return 0
+	}
+
+	keepFrom := 0
+	for keepFrom < len(refs) {
+		if keepFrom+1 >= len(refs) {
+			break // newest segment: no successor to prove it consumed
+		}
+		if refs[keepFrom+1].Base > start {
+			break
+		}
+		keepFrom++
+	}
+	if keepFrom == 0 {
+		return 0
+	}
+
+	deleted := 0
+	for _, ref := range refs[:keepFrom] {
+		if s.deleteSegmentObjects(ctx, topic, partition, ref) {
+			deleted++
+		}
+	}
+	metrics.RetentionSegmentsDeleted.Add(float64(keepFrom))
+
+	body, err := json.Marshal(refs[keepFrom:])
+	if err != nil {
+		log.Printf("Retention: cannot rewrite index bucket %s: %v", b.Key, err)
+		return deleted
+	}
+	putCtx, cancel := s.objCtx(ctx)
+	defer cancel()
+	if err := s.objStore.Put(putCtx, b.Key, bytes.NewReader(body)); err != nil {
+		log.Printf("Retention: failed to rewrite index bucket %s: %v", b.Key, err)
+	}
+	return deleted
+}
+
+// deleteSegmentObjects removes a segment and its index sidecar, reporting
+// whether the segment object went.
+func (s *StorageEngine) deleteSegmentObjects(ctx context.Context, topic string, partition int32, ref SegmentRef) bool {
+	key := segmentKey(topic, partition, ref)
+	ok := true
+	for _, k := range []string{key, strings.TrimSuffix(key, ".log") + ".index"} {
+		if err := s.objDelete(ctx, k); err != nil {
+			log.Printf("Retention: failed to delete %s: %v", k, err)
+			ok = false
+		}
+	}
+	return ok
 }

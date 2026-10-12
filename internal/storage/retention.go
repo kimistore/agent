@@ -88,21 +88,19 @@ func (s *StorageEngine) applyRetention() {
 
 	for _, topic := range s.metadataCache.GetTopics() {
 		for _, partition := range s.metadataCache.GetPartitions(topic) {
-			prefix := partitionPrefix(topic, partition)
-
-			objects, err := s.objStore.List(ctx, prefix)
-			if err != nil {
-				log.Printf("Retention: failed to list %s: %v", prefix, err)
-				continue
-			}
 			topicsChecked++
 
-			segments := filterSegments(objects)
-			if len(segments) == 0 {
-				continue
+			// The consumer bound comes from committed offsets and costs
+			// nothing, so it is reclaimed straight off the index. The size and
+			// time policies still need a listing: they select on segment size
+			// and last-modified time, and the index carries neither. That is a
+			// separate change -- putting them in SegmentRef -- not something to
+			// smuggle in here, so this path keeps its listing and reports when
+			// it cannot complete.
+			if s.retentionCfg.RetentionTime > 0 || s.retentionCfg.RetentionBytes > 0 {
+				segmentsDeleted += s.reclaimByPolicy(ctx, topic, partition)
 			}
-
-			segmentsDeleted += s.reclaimPartition(ctx, topic, partition, segments)
+			segmentsDeleted += s.reclaimByIndex(ctx, topic, partition)
 		}
 	}
 
@@ -329,38 +327,16 @@ func (s *StorageEngine) processPartitionRetention(ctx context.Context, topic str
 		// The cached key list is now stale, and the index sidecars for the
 		// deleted segments are gone with them.
 		s.invalidateCache(cacheKey)
-
-		// The log start has moved. ListOffsets has to report it, otherwise a
-		// consumer that resets to "earliest" is sent to an offset that no
-		// longer exists and loops on OffsetOutOfRange forever.
-		remaining := s.oldestRetainedOffset(ctx, topic, partition)
-		// The index is not rebuilt here. Listing it is what the window and
-		// buckets replaced, and retention prunes by dropping whole buckets, so
-		// a partition's index is left to DropSegmentsBefore.
-		s.metadataCache.SetPartitionState(topic, partition,
-			s.metadataCache.LogEndOffset(topic, partition), remaining)
 		s.markManifestDirty(topic, partition)
-		log.Printf("Retention: deleted %d segment(s) from %s; log start now %d", deleted, cacheKey, remaining)
 	}
 	return deleted
 }
 
-// oldestRetainedOffset reports the start offset of the oldest segment still
-// present, or the log end offset if the partition has been fully reclaimed.
-func (s *StorageEngine) oldestRetainedOffset(ctx context.Context, topic string, partition int32) int64 {
-	segments := s.currentSegments(ctx, topic, partition)
-	if len(segments) == 0 {
-		return s.metadataCache.LogEndOffset(topic, partition)
-	}
-	return segments[0].StartOffset
-}
-
-func (s *StorageEngine) currentSegments(ctx context.Context, topic string, partition int32) []*SegmentMetadata {
-	segs, err := s.objectSegments(ctx, topic, partition)
-	if err != nil {
-		return nil
-	}
-	return segs
+// oldestIndexedOffset reports the base offset of the oldest segment the index
+// still holds, or -1 when it holds none. It replaces a listing to answer the
+// same question about what remains.
+func (s *StorageEngine) oldestIndexedOffset(topic string, partition int32) (int64, bool) {
+	return s.metadataCache.OldestIndexed(topic, partition)
 }
 
 // FirstAllowedOffset is the lowest offset still needed by any consumer group,
@@ -412,4 +388,126 @@ func parseOffsetFromKey(key string) int64 {
 func parseSegmentKey(key string) (baseOffset, epoch int64, ok bool) {
 	parts := strings.Split(key, "/")
 	return wal.ParseSegmentName(parts[len(parts)-1])
+}
+
+// reclaimByIndex removes everything below the lowest offset any consumer still
+// needs, driving from the index rather than from a listing.
+//
+// A listing here is the operation that does not scale: it grows with the
+// partition's whole history, and on knode3 it could not complete inside the
+// operation timeout, so the sweep logged a failure and reclaimed nothing on
+// every pass.
+func (s *StorageEngine) reclaimByIndex(ctx context.Context, topic string, partition int32) int {
+	firstAllowed := s.FirstAllowedOffset(topic, partition)
+	if firstAllowed < 0 {
+		return 0 // nothing has committed against this partition yet
+	}
+
+	// An index that holds nothing may mean the partition is empty, or that its
+	// segments predate the index. Those need different handling: reclaiming
+	// nothing when segments are present leaks storage silently and forever, so
+	// the listing is used as a fallback. It is bounded by how much unindexed
+	// data there is, which is the legacy case and does not grow.
+	if _, ok := s.oldestIndexedOffset(topic, partition); !ok {
+		return s.reclaimUnindexed(ctx, topic, partition, firstAllowed)
+	}
+
+	deleted := s.reclaimIndex(ctx, topic, partition, firstAllowed)
+	if deleted == 0 {
+		return 0
+	}
+
+	// The log start has moved. ListOffsets has to report it, otherwise a
+	// consumer that resets to "earliest" is sent to an offset that no longer
+	// exists and loops on OffsetOutOfRange forever.
+	remaining, _ := s.oldestIndexedOffset(topic, partition)
+	if remaining < 0 {
+		remaining = s.metadataCache.LogEndOffset(topic, partition)
+	}
+	s.metadataCache.SetPartitionState(topic, partition,
+		s.metadataCache.LogEndOffset(topic, partition), remaining)
+	s.markManifestDirty(topic, partition)
+	log.Printf("Retention: reclaimed %d segment(s) from %s via the index; log start now %d",
+		deleted, cacheKeyFor(topic, partition), remaining)
+	return deleted
+}
+
+// reclaimUnindexed reclaims a partition the index knows nothing about, by
+// listing it. This is the legacy path: segments written before the index
+// existed, or before this agent saw them uploaded.
+func (s *StorageEngine) reclaimUnindexed(ctx context.Context, topic string, partition int32, firstAllowed int64) int {
+	segments, err := s.objectSegments(ctx, topic, partition)
+	if err != nil {
+		log.Printf("Retention: cannot list %s/%d to reclaim it: %v", topic, partition, err)
+		return 0
+	}
+	if len(segments) == 0 {
+		return 0
+	}
+
+	// Same rule the index path uses: a segment is reclaimable only when its
+	// successor starts at or below the bound, which is what proves every offset
+	// inside it is consumed. The newest has no successor and is kept.
+	drop := make([]*SegmentMetadata, 0, len(segments))
+	for i := 0; i+1 < len(segments); i++ {
+		if segments[i+1].StartOffset <= firstAllowed {
+			drop = append(drop, segments[i])
+		}
+	}
+	if len(drop) == 0 {
+		return 0
+	}
+
+	deleted := 0
+	for _, seg := range drop {
+		key := seg.S3Key
+		ok := true
+		for _, k := range []string{key, strings.TrimSuffix(key, ".log") + ".index"} {
+			if err := s.objDelete(ctx, k); err != nil {
+				log.Printf("Retention: failed to delete %s: %v", k, err)
+				ok = false
+			}
+		}
+		if ok {
+			deleted++
+			metrics.RetentionSegmentsDeleted.Inc()
+		}
+	}
+	if deleted == 0 {
+		return 0
+	}
+
+	remaining := segments[0].StartOffset
+	if len(drop) == len(segments)-1 {
+		remaining = s.metadataCache.LogEndOffset(topic, partition)
+	} else if len(drop) < len(segments) {
+		remaining = segments[len(drop)].StartOffset
+	}
+	s.metadataCache.SetPartitionState(topic, partition,
+		s.metadataCache.LogEndOffset(topic, partition), remaining)
+	s.markManifestDirty(topic, partition)
+	log.Printf("Retention: reclaimed %d unindexed segment(s) from %s/%d; log start now %d",
+		deleted, topic, partition, remaining)
+	return deleted
+}
+
+// reclaimByPolicy applies the size and time retention policies, which select on
+// segment size and last-modified time. The index carries neither, so this still
+// lists the partition.
+//
+// It is kept separate from reclaimByIndex on purpose: the consumer bound is
+// reclaimed listing-free on every sweep, so a partition whose listing cannot
+// complete still loses the data no consumer needs. This path degrades on its
+// own rather than taking the other down with it.
+func (s *StorageEngine) reclaimByPolicy(ctx context.Context, topic string, partition int32) int {
+	objects, err := s.objStore.List(ctx, partitionPrefix(topic, partition))
+	if err != nil {
+		log.Printf("Retention: size/time policy cannot list %s/%d: %v", topic, partition, err)
+		return 0
+	}
+	segments := filterSegments(objects)
+	if len(segments) == 0 {
+		return 0
+	}
+	return s.reclaimPartition(ctx, topic, partition, segments)
 }

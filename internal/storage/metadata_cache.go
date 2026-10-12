@@ -425,60 +425,50 @@ func (mc *MetadataCache) RecentFor(topic string, partition int32, offset int64) 
 // binary search, and because a bucket covering the tail is contiguous with the
 // window anyway. Segments the window already holds win, so a bucket fetched
 // twice does not undo newer entries.
-func (mc *MetadataCache) LoadBucket(topic string, partition int32, refs []SegmentRef) {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
-	ps := mc.touchLocked(topic, partition)
-	merged := make([]SegmentRef, 0, len(ps.Recent)+len(refs))
-	merged = append(merged, ps.Recent...)
-	merged = append(merged, refs...)
-	sort.Slice(merged, func(i, j int) bool { return merged[i].Base < merged[j].Base })
-
-	out := merged[:0]
-	for i, r := range merged {
-		if i > 0 && merged[i-1].Base == r.Base {
-			// The window entry is newer, so it is the one already present.
-			continue
-		}
-		out = append(out, r)
-	}
-	ps.Recent = out
-}
-
-// DropSegmentsBefore removes index entries covering offsets below start, and
-// reports the sealed buckets that became entirely reclaimable so the caller
-// can delete them.
+// DropSegmentsBefore removes index entries covering offsets below start.
 //
-// Retention deletes whole buckets rather than editing them, so this is O(buckets
-// dropped) plus O(window trimmed) rather than a scan of the whole index.
-func (mc *MetadataCache) DropSegmentsBefore(topic string, partition int32, start int64) []BucketRef {
+// It returns the sealed buckets that became wholly reclaimable, and the one
+// bucket the boundary passes through if any. A straddling bucket is kept in the
+// index: its reclaimed prefix is removed by rewriting it, because the entries
+// it drops name segments that are about to be deleted and leaving them would
+// send a read to an object that is gone.
+//
+// The open window is trimmed in place. Entries are returned rather than deleted
+// so the caller can name and remove the objects they refer to.
+func (mc *MetadataCache) DropSegmentsBefore(topic string, partition int32, start int64) (dropped []BucketRef, straddle *BucketRef, reclaimed []SegmentRef) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
 	ts, ok := mc.Topics[topic]
 	if !ok {
-		return nil
+		return nil, nil, nil
 	}
 	ps, ok := ts.Partitions[partition]
 	if !ok {
-		return nil
+		return nil, nil, nil
 	}
 
-	var dropped []BucketRef
 	keep := ps.Sealed[:0]
-	for _, b := range ps.Sealed {
-		if b.Last < start {
+	for i, b := range ps.Sealed {
+		switch {
+		case b.Last < start:
 			dropped = append(dropped, b)
-			continue
+		case b.First < start:
+			// The boundary falls inside this one.
+			s := b
+			straddle = &s
+			keep = append(keep, b)
+		default:
+			keep = append(keep, b)
+			_ = i
 		}
-		keep = append(keep, b)
 	}
 	ps.Sealed = keep
 
 	trim := sort.Search(len(ps.Recent), func(i int) bool { return ps.Recent[i].Base >= start })
+	reclaimed = append([]SegmentRef(nil), ps.Recent[:trim]...)
 	ps.Recent = append([]SegmentRef(nil), ps.Recent[trim:]...)
-	return dropped
+	return dropped, straddle, reclaimed
 }
 
 // segmentEpoch reads the ownership epoch out of a segment key, reporting -1
@@ -588,17 +578,32 @@ func (mc *MetadataCache) FromJSON(data []byte) error {
 // SeededBucket installs a bucket into the index as if it had been sealed and
 // written. It exists for tests and for recovery, which reads bucket objects
 // back rather than reconstructing them.
-func (mc *MetadataCache) SeededBucket(topic string, partition int32, b BucketRef, body []byte) {
+func (mc *MetadataCache) SeededBucket(topic string, partition int32, b BucketRef) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 	ps := mc.touchLocked(topic, partition)
 	ps.Sealed = append(ps.Sealed, b)
 	sort.Slice(ps.Sealed, func(i, j int) bool { return ps.Sealed[i].Last < ps.Sealed[j].Last })
-	if len(body) > 0 {
-		var refs []SegmentRef
-		if err := json.Unmarshal(body, &refs); err == nil {
-			ps.Recent = append(ps.Recent, refs...)
-			sort.Slice(ps.Recent, func(i, j int) bool { return ps.Recent[i].Base < ps.Recent[j].Base })
-		}
+}
+
+// OldestIndexed reports the base offset of the oldest segment the index still
+// holds, and whether it holds any at all.
+func (mc *MetadataCache) OldestIndexed(topic string, partition int32) (int64, bool) {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	ts, ok := mc.Topics[topic]
+	if !ok {
+		return 0, false
 	}
+	ps, ok := ts.Partitions[partition]
+	if !ok {
+		return 0, false
+	}
+	if len(ps.Sealed) > 0 {
+		return ps.Sealed[0].First, true
+	}
+	if len(ps.Recent) > 0 {
+		return ps.Recent[0].Base, true
+	}
+	return 0, false
 }

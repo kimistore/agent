@@ -19,12 +19,16 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync/atomic"
 	"testing"
+
+	"kimistore/internal/storage/wal"
 )
 
 // SegmentFor must pick the last segment starting at or below the offset, over
@@ -90,10 +94,11 @@ func TestSegmentKeyFor_ColdReadFetchesOneBucket(t *testing.T) {
 
 	// A sealed bucket covering 100..200, with the window empty.
 	engine.metadataCache.AddSegment("orders", 0, SegmentRef{Base: 100, Epoch: 1})
-	body, _ := json.Marshal([]SegmentRef{{Base: 100, Epoch: 1}, {Base: 200, Epoch: 1}})
+	putBucket(t, store, "orders/0/00000000000000000100-00000000000000000200.idx",
+		[]SegmentRef{{Base: 100, Epoch: 1}, {Base: 200, Epoch: 1}})
 	engine.metadataCache.SeededBucket("orders", 0, BucketRef{
 		First: 100, Last: 200, Key: "orders/0/00000000000000000100-00000000000000000200.idx",
-	}, body)
+	})
 
 	// LIST fails throughout, so a resolved key can only have come from the
 	// bucket that was fetched.
@@ -126,12 +131,12 @@ func TestAddSegment_NewerEpochSupersedes(t *testing.T) {
 // history is a few DELETEs and not a scan of the index.
 func TestDropSegmentsBefore_RemovesWholeBuckets(t *testing.T) {
 	mc := NewMetadataCache()
-	mc.SeededBucket("orders", 0, BucketRef{First: 0, Last: 99, Key: "a.idx"}, nil)
-	mc.SeededBucket("orders", 0, BucketRef{First: 100, Last: 199, Key: "b.idx"}, nil)
-	mc.SeededBucket("orders", 0, BucketRef{First: 200, Last: 299, Key: "c.idx"}, nil)
+	mc.SeededBucket("orders", 0, BucketRef{First: 0, Last: 99, Key: "a.idx"})
+	mc.SeededBucket("orders", 0, BucketRef{First: 100, Last: 199, Key: "b.idx"})
+	mc.SeededBucket("orders", 0, BucketRef{First: 200, Last: 299, Key: "c.idx"})
 	mc.AddSegment("orders", 0, SegmentRef{Base: 300, Epoch: 1})
 
-	dropped := mc.DropSegmentsBefore("orders", 0, 200)
+	dropped, _, reclaimed := mc.DropSegmentsBefore("orders", 0, 200)
 	if len(dropped) != 2 {
 		t.Fatalf("dropped %d buckets, want 2", len(dropped))
 	}
@@ -141,6 +146,11 @@ func TestDropSegmentsBefore_RemovesWholeBuckets(t *testing.T) {
 	}
 	if len(ps.Recent) != 1 || ps.Recent[0].Base != 300 {
 		t.Errorf("window = %v, want only base 300", ps.Recent)
+	}
+	// Base 300 is above the boundary, so it stays in the window; only entries
+	// below it would come back for the caller to delete.
+	if len(reclaimed) != 0 {
+		t.Errorf("reclaimed = %v, want nothing: every window entry is above the boundary", reclaimed)
 	}
 }
 
@@ -346,5 +356,114 @@ func TestShutdownDrain_KeepsIndexAndPosition(t *testing.T) {
 	}
 	if got := engine.metadataCache.LogEndOffset("orders", 0); got == 0 {
 		t.Error("a shutdown drain erased the log end offset")
+	}
+}
+
+// Reclaiming through the index removes whole buckets and their segments, and
+// keeps the surviving window entries. This is the path that has to work without
+// a listing, since a listing of a real partition cannot complete.
+func TestReclaimIndex_RemovesBucketAndItsSegments(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine := newEngine(t, store)
+	defer engine.Close()
+
+	bucketKey := "orders/0/00000000000000000000-00000000000000000200.idx"
+	refs := []SegmentRef{{Base: 0, Epoch: 1}, {Base: 100, Epoch: 1}, {Base: 200, Epoch: 1}}
+	putBucket(t, store, bucketKey, refs)
+	engine.metadataCache.SeededBucket("orders", 0, BucketRef{First: 0, Last: 200, Key: bucketKey})
+	for _, r := range refs {
+		key := fmt.Sprintf("orders/0/%s", wal.SegmentName(r.Base, r.Epoch))
+		if err := store.inner.Put(context.Background(), key, strings.NewReader("x")); err != nil {
+			t.Fatalf("seed segment: %v", err)
+		}
+	}
+	engine.metadataCache.AddSegment("orders", 0, SegmentRef{Base: 300, Epoch: 1})
+	if err := store.inner.Put(context.Background(), "orders/0/"+wal.SegmentName(300, 1), strings.NewReader("x")); err != nil {
+		t.Fatalf("seed tail segment: %v", err)
+	}
+
+	deleted := engine.reclaimIndex(context.Background(), "orders", 0, 250)
+
+	if deleted != 3 {
+		t.Errorf("deleted %d segments, want the 3 the bucket covered", deleted)
+	}
+	// No LIST is consulted on this path. The store's List always fails, so a
+	// reclaim that depended on one would have deleted nothing -- the three
+	// deletions above are the proof. A counter would be racy here, because the
+	// engine's background loops list independently.
+	ps := engine.metadataCache.Topics["orders"].Partitions[0]
+	if len(ps.Sealed) != 0 {
+		t.Errorf("bucket still in the index: %v", ps.Sealed)
+	}
+	if len(ps.Recent) != 1 || ps.Recent[0].Base != 300 {
+		t.Errorf("window = %v, want only the segment above the boundary", ps.Recent)
+	}
+	// The bucket and its segments must actually be gone from the store.
+	if rc, err := store.inner.Get(context.Background(), bucketKey); err == nil {
+		_ = rc.Close()
+		t.Error("the index bucket object was not deleted")
+	}
+	for _, r := range refs {
+		key := fmt.Sprintf("orders/0/%s", wal.SegmentName(r.Base, r.Epoch))
+		if rc, err := store.inner.Get(context.Background(), key); err == nil {
+			_ = rc.Close()
+			t.Errorf("segment %s was not deleted", key)
+		}
+	}
+}
+
+// A bucket the boundary passes through is rewritten rather than dropped. Leaving
+// it alone would leave the index naming segments that no longer exist, so a read
+// of a reclaimed offset would resolve to a missing object instead of falling
+// back.
+func TestReclaimIndex_RewritesStraddlingBucket(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine := newEngine(t, store)
+	defer engine.Close()
+
+	bucketKey := "orders/0/00000000000000000000-00000000000000000300.idx"
+	refs := []SegmentRef{{Base: 0, Epoch: 1}, {Base: 100, Epoch: 1}, {Base: 200, Epoch: 1}, {Base: 300, Epoch: 1}}
+	putBucket(t, store, bucketKey, refs)
+	engine.metadataCache.SeededBucket("orders", 0, BucketRef{First: 0, Last: 300, Key: bucketKey})
+	for _, r := range refs {
+		_ = store.inner.Put(context.Background(), fmt.Sprintf("orders/0/%s", wal.SegmentName(r.Base, r.Epoch)), strings.NewReader("x"))
+	}
+
+	deleted := engine.reclaimIndex(context.Background(), "orders", 0, 250)
+
+	// 0 and 100 are provably consumed (their successors start below 250); 200's
+	// successor starts at 300, above the bound, so it is kept.
+	if deleted != 2 {
+		t.Errorf("deleted %d, want the 2 provably consumed segments", deleted)
+	}
+
+	ps := engine.metadataCache.Topics["orders"].Partitions[0]
+	if len(ps.Sealed) != 1 || ps.Sealed[0].Key != bucketKey {
+		t.Fatalf("the straddling bucket was dropped instead of rewritten: %v", ps.Sealed)
+	}
+	rc, err := store.inner.Get(context.Background(), bucketKey)
+	if err != nil {
+		t.Fatalf("rewritten bucket is missing: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+	raw, _ := io.ReadAll(rc)
+	var kept []SegmentRef
+	if err := json.Unmarshal(raw, &kept); err != nil {
+		t.Fatalf("rewritten bucket is not readable: %v", err)
+	}
+	if len(kept) != 2 || kept[0].Base != 200 || kept[1].Base != 300 {
+		t.Errorf("bucket now holds %v, want the segments from base 200 up", kept)
+	}
+}
+
+// putBucket writes a sealed bucket's body where reclaim will read it back from.
+func putBucket(t *testing.T, store *listFailStore, key string, refs []SegmentRef) {
+	t.Helper()
+	body, err := json.Marshal(refs)
+	if err != nil {
+		t.Fatalf("marshal bucket: %v", err)
+	}
+	if err := store.inner.Put(context.Background(), key, bytes.NewReader(body)); err != nil {
+		t.Fatalf("seed bucket: %v", err)
 	}
 }
