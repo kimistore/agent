@@ -11,6 +11,49 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.3
+
+A consumer that could not resume, and a checkpoint that grew without bound.
+Both were found on knode3 while restoring a partition to health after the
+object-store listing a read used to rely on could no longer complete.
+
+### Fixed
+
+- An `OffsetFetch` naming no topics now answers with the group's committed
+  offsets. An empty topic list means "every topic this group has a position
+  for", which is how Mimir's ingester asks. The empty answer made it fall back
+  to `auto.offset.reset` and fetch from zero, ignoring a committed offset that
+  was durably stored the whole time. The failure is silent: the consumer
+  connects and produces normally, it just never catches up
+- The segment index keeps one entry per base offset, newest epoch winning. A
+  re-claimed partition writes the same offset again under a newer epoch, and
+  both objects exist in the bucket; keeping both made the lookup choose between
+  them by position and return the superseded one, serving a consumer data the
+  current owner had already replaced
+
+### Changed
+
+- The checkpoint no longer carries the whole segment index. It holds the
+  position, an open window of the newest 4096 segments, and a directory of
+  sealed buckets; a full window is sealed into an immutable bucket written
+  once. Total bytes written becomes O(total segments) rather than
+  O(total segments x checkpoints). Measured on knode3 at 3204 segments/hour the
+  flat index had reached 4 MB per checkpoint and was growing towards 80 GB/day
+- Retention deletes whole buckets and advances the log start, instead of
+  rebuilding a full segment list to decide what to remove
+- An index entry is a base offset and an epoch rather than a stored object key,
+  16 bytes against ~106
+
+### Known limitations
+
+- The index describes only what this release recorded. Segments uploaded before
+  it were never indexed and cannot be read back, because doing so needs the
+  listing this index exists to avoid. A consumer resumes from the oldest segment
+  recorded since the upgrade
+- The directory of sealed buckets still grows at history/4096. That is slow
+  enough to be a later problem, but the naming scheme should permit a second
+  level when it arrives
+
 ## 1.0.2
 
 The object-store listing that a read used to locate a segment is gone from the
