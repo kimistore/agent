@@ -89,17 +89,6 @@ func (s *StorageEngine) applyRetention() {
 	for _, topic := range s.metadataCache.GetTopics() {
 		for _, partition := range s.metadataCache.GetPartitions(topic) {
 			topicsChecked++
-
-			// The consumer bound comes from committed offsets and costs
-			// nothing, so it is reclaimed straight off the index. The size and
-			// time policies still need a listing: they select on segment size
-			// and last-modified time, and the index carries neither. That is a
-			// separate change -- putting them in SegmentRef -- not something to
-			// smuggle in here, so this path keeps its listing and reports when
-			// it cannot complete.
-			if s.retentionCfg.RetentionTime > 0 || s.retentionCfg.RetentionBytes > 0 {
-				segmentsDeleted += s.reclaimByPolicy(ctx, topic, partition)
-			}
 			segmentsDeleted += s.reclaimByIndex(ctx, topic, partition)
 		}
 	}
@@ -390,29 +379,45 @@ func parseSegmentKey(key string) (baseOffset, epoch int64, ok bool) {
 	return wal.ParseSegmentName(parts[len(parts)-1])
 }
 
-// reclaimByIndex removes everything below the lowest offset any consumer still
-// needs, driving from the index rather than from a listing.
+// reclaimByIndex enforces the configured policies against the index, with no
+// listing.
 //
-// A listing here is the operation that does not scale: it grows with the
-// partition's whole history, and on knode3 it could not complete inside the
-// operation timeout, so the sweep logged a failure and reclaimed nothing on
-// every pass.
+// Both inputs are needed and neither is sufficient alone. The policies -- age
+// and total bytes -- say what the operator asked to keep; the consumer bound
+// says what readers still need. A segment is reclaimable only where both agree,
+// and the consumer bound must never trigger deletion on its own: an agent whose
+// consumer sits near the log end would otherwise delete the whole log the moment
+// retention was switched on at all, which is what the first version of this did.
+//
+// The boundary is the older of the two, because the more conservative limit is
+// the one that has to survive.
 func (s *StorageEngine) reclaimByIndex(ctx context.Context, topic string, partition int32) int {
-	firstAllowed := s.FirstAllowedOffset(topic, partition)
-	if firstAllowed < 0 {
-		return 0 // nothing has committed against this partition yet
-	}
-
 	// An index that holds nothing may mean the partition is empty, or that its
-	// segments predate the index. Those need different handling: reclaiming
-	// nothing when segments are present leaks storage silently and forever, so
-	// the listing is used as a fallback. It is bounded by how much unindexed
-	// data there is, which is the legacy case and does not grow.
+	// segments predate the index. Reclaiming nothing when segments are present
+	// leaks storage silently and forever, so those fall back to a listing,
+	// bounded by how much unindexed data there is -- the legacy case, which
+	// does not grow. This is checked before the policy boundary because there is
+	// no index to compute one from, and this path applies the policies itself.
 	if _, ok := s.oldestIndexedOffset(topic, partition); !ok {
-		return s.reclaimUnindexed(ctx, topic, partition, firstAllowed)
+		return s.reclaimUnindexed(ctx, topic, partition, s.FirstAllowedOffset(topic, partition))
 	}
 
-	deleted := s.reclaimIndex(ctx, topic, partition, firstAllowed)
+	boundary := s.policyBoundary(topic, partition)
+	if boundary < 0 {
+		// No policy selects anything. Retention configured for bytes while the
+		// data is still inside the budget is the normal state of a healthy log,
+		// and must not delete anything.
+		return 0
+	}
+
+	// The consumer bound only ever raises the boundary. No group holding a
+	// position means nothing is being read, which is the one case where the
+	// policy alone decides.
+	if firstAllowed := s.FirstAllowedOffset(topic, partition); firstAllowed >= 0 && firstAllowed < boundary {
+		boundary = firstAllowed
+	}
+
+	deleted := s.reclaimIndex(ctx, topic, partition, boundary)
 	if deleted == 0 {
 		return 0
 	}
@@ -432,6 +437,80 @@ func (s *StorageEngine) reclaimByIndex(ctx context.Context, topic string, partit
 	return deleted
 }
 
+// policyBoundary reports the oldest offset the configured policies would keep,
+// or -1 when they select nothing at all.
+//
+// Time is answered from the modification times the index records. Bytes is
+// answered by accumulating sizes newest-first until the budget is spent, which
+// yields the oldest offset still inside it. Both come from the index, so
+// neither costs a listing -- which on this bucket takes 17s for a single page.
+func (s *StorageEngine) policyBoundary(topic string, partition int32) int64 {
+	window, buckets := s.metadataCache.IndexSnapshot(topic, partition)
+	if len(window) == 0 && len(buckets) == 0 {
+		return -1
+	}
+
+	boundary := int64(-1)
+
+	if d := s.retentionCfg.RetentionTime; d > 0 {
+		cutoff := time.Now().Add(-d).Unix()
+		// Oldest-first, so the first segment already inside the age limit ends
+		// the run of reclaimable ones. A segment with no recorded time counts
+		// as current: an unknown age is not evidence of an old one, and the
+		// alternative is deleting data because a field is missing.
+		for _, ref := range window {
+			if ref.Modified == 0 || ref.Modified >= cutoff {
+				break
+			}
+			boundary = ref.Base
+		}
+		for _, b := range buckets {
+			if b.Newest == 0 || b.Newest >= cutoff {
+				break
+			}
+			boundary = b.First
+		}
+	}
+
+	if budget := s.retentionCfg.RetentionBytes; budget > 0 {
+		var total int64
+		// Newest-first: the budget is spent from the newest end, and the
+		// boundary falls where it runs out.
+		//
+		// Running out on the newest entry is not a special case. When the
+		// newest segment or bucket is itself over budget there is nothing newer
+		// to fall back to, so the boundary stays below the oldest one and
+		// retention reclaims as much as the budget allows -- which for a budget
+		// smaller than a single segment means reclaiming everything, and is the
+		// only honest answer. Indexing past the end would panic, which is what
+		// the first version of this did.
+		for i := len(buckets) - 1; i >= 0; i-- {
+			total += buckets[i].Bytes
+			if total > budget {
+				if i+1 < len(buckets) {
+					boundary = buckets[i+1].First
+				} else if len(window) > 0 {
+					boundary = window[0].Base
+				}
+				break
+			}
+		}
+		for i := len(window) - 1; i >= 0; i-- {
+			total += window[i].Size
+			if total > budget {
+				if i+1 < len(window) {
+					boundary = window[i+1].Base
+				} else {
+					boundary = window[i].Base
+				}
+				break
+			}
+		}
+	}
+
+	return boundary
+}
+
 // reclaimUnindexed reclaims a partition the index knows nothing about, by
 // listing it. This is the legacy path: segments written before the index
 // existed, or before this agent saw them uploaded.
@@ -448,12 +527,31 @@ func (s *StorageEngine) reclaimUnindexed(ctx context.Context, topic string, part
 	// Same rule the index path uses: a segment is reclaimable only when its
 	// successor starts at or below the bound, which is what proves every offset
 	// inside it is consumed. The newest has no successor and is kept.
+	ageApplies := s.retentionCfg.RetentionTime > 0
 	drop := make([]*SegmentMetadata, 0, len(segments))
 	for i := 0; i+1 < len(segments); i++ {
-		if segments[i+1].StartOffset <= firstAllowed {
-			drop = append(drop, segments[i])
+		if firstAllowed >= 0 && segments[i+1].StartOffset > firstAllowed {
+			continue
 		}
+		if ageApplies && !s.policySelects(segments[i]) {
+			continue
+		}
+		drop = append(drop, segments[i])
 	}
+	if cut := s.unindexedBudgetBoundary(segments); cut > 0 {
+		allowed := make(map[string]bool, cut)
+		for _, seg := range segments[:cut] {
+			allowed[seg.S3Key] = true
+		}
+		kept := drop[:0]
+		for _, seg := range drop {
+			if allowed[seg.S3Key] {
+				kept = append(kept, seg)
+			}
+		}
+		drop = kept
+	}
+
 	if len(drop) == 0 {
 		return 0
 	}
@@ -491,23 +589,48 @@ func (s *StorageEngine) reclaimUnindexed(ctx context.Context, topic string, part
 	return deleted
 }
 
-// reclaimByPolicy applies the size and time retention policies, which select on
-// segment size and last-modified time. The index carries neither, so this still
-// lists the partition.
+// policySelects reports whether the configured age and size policies select one
+// segment for removal, given its size and last-modified time.
 //
-// It is kept separate from reclaimByIndex on purpose: the consumer bound is
-// reclaimed listing-free on every sweep, so a partition whose listing cannot
-// complete still loses the data no consumer needs. This path degrades on its
-// own rather than taking the other down with it.
-func (s *StorageEngine) reclaimByPolicy(ctx context.Context, topic string, partition int32) int {
-	objects, err := s.objStore.List(ctx, partitionPrefix(topic, partition))
-	if err != nil {
-		log.Printf("Retention: size/time policy cannot list %s/%d: %v", topic, partition, err)
+// This is the listing-path counterpart to policyBoundary, and it applies the
+// same two rules to a segment whose metadata came from a listing rather than
+// from the index.
+func (s *StorageEngine) policySelects(seg *SegmentMetadata) bool {
+	if d := s.retentionCfg.RetentionTime; d > 0 && seg.Modified > 0 {
+		if seg.Modified < time.Now().Add(-d).Unix() {
+			return true
+		}
+	}
+	return false
+}
+
+// unindexedBudgetBoundary reports how many of the oldest listed segments have to
+// go for the partition to fit its byte budget, or 0 when it already fits.
+//
+// The size policy is cumulative rather than per-segment: a partition made of
+// segments that are each individually inside the budget can still be over it,
+// and deleting only the individually-oversized ones would never converge.
+func (s *StorageEngine) unindexedBudgetBoundary(segments []*SegmentMetadata) int {
+	budget := s.retentionCfg.RetentionBytes
+	if budget <= 0 {
 		return 0
 	}
-	segments := filterSegments(objects)
-	if len(segments) == 0 {
+	var total int64
+	for _, seg := range segments {
+		total += seg.Size
+	}
+	if total <= budget {
 		return 0
 	}
-	return s.reclaimPartition(ctx, topic, partition, segments)
+	// Walk newest-first accumulating until the budget is spent; everything older
+	// than that point is what has to go.
+	var acc int64
+	for i := len(segments) - 1; i >= 0; i-- {
+		acc += segments[i].Size
+		if acc > budget {
+			// Everything at or below this one has to go to fit.
+			return i + 1
+		}
+	}
+	return 0
 }

@@ -127,11 +127,20 @@ func putSegment(t *testing.T, store *recordingStore, topic string, partition int
 
 // TestRetention_ListsPerPartitionNotWholeBucket is the core efficiency fix.
 // Retention used to call List("") every interval, which lists every object in
-// the bucket regardless of how much was being reclaimed.
-func TestRetention_ListsPerPartitionNotWholeBucket(t *testing.T) {
+// Retention must not list. A listing is the one operation on this bucket that
+// does not scale with the partition: a single page of keys takes 17 seconds and
+// a full pass does not finish, so a sweep that lists cannot reclaim anything on
+// a partition of any size. The index carries the size and modification time the
+// age and size policies need, which is what makes the sweep answerable without
+// one.
+//
+// This replaces an earlier test that asserted retention listed each partition
+// once. That was the behaviour to remove, and asserting it would have kept the
+// scaling blocker in place.
+func TestRetention_NeverLists(t *testing.T) {
 	store := newRecordingStore()
 	se, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{
-		RetentionTime: time.Hour,
+		RetentionBytes: 10,
 	})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
@@ -144,48 +153,34 @@ func TestRetention_ListsPerPartitionNotWholeBucket(t *testing.T) {
 
 	se.metadataCache.AddTopic("orders")
 	se.metadataCache.AddPartition("orders", 0)
-	se.metadataCache.AddPartition("orders", 1)
-	se.metadataCache.AddTopic("payments")
-	se.metadataCache.AddPartition("payments", 0)
 
+	// 300 bytes against a 10-byte budget, recorded in the index the way the
+	// uploader records a real upload.
 	for i := int64(0); i < 3; i++ {
-		putSegment(t, store, "orders", 0, i*100, 10)
-		putSegment(t, store, "orders", 1, i*100, 10)
-		putSegment(t, store, "payments", 0, i*100, 10)
+		putSegment(t, store, "orders", 0, i*100, 100)
+		se.metadataCache.AddSegment("orders", 0, SegmentRef{
+			Base: i * 100, Size: 100, Modified: time.Now().Unix(),
+		})
 	}
 
 	se.applyRetention()
 
-	calls := store.listCallsSnapshot()
-	if len(calls) == 0 {
-		t.Fatal("retention performed no listings")
-	}
-	for _, prefix := range calls {
-		if prefix == "" {
-			t.Fatalf("retention listed the entire bucket (prefix \"\"); calls=%v", calls)
+	for _, prefix := range store.listCallsSnapshot() {
+		if prefix == "_offsets/" || prefix == "_topics/" {
+			continue // startup rehydration, not the sweep
 		}
-		if !strings.HasSuffix(prefix, "/") {
-			t.Errorf("listing prefix %q is not partition-scoped", prefix)
-		}
+		t.Errorf("retention listed %q; the sweep must run off the index", prefix)
 	}
 
-	// Rehydration lists _offsets/ at startup; filter that out.
-	seen := map[string]int{}
-	for _, c := range calls {
-		if c == "_offsets/" {
-			continue
-		}
-		seen[c]++
+	deleted := map[string]bool{}
+	for _, k := range store.deletedSnapshot() {
+		deleted[k] = true
 	}
-	for _, want := range []string{"orders/0/", "orders/1/", "payments/0/"} {
-		if seen[want] != 1 {
-			t.Errorf("prefix %q listed %d time(s), want 1 (all=%v)", want, seen[want], seen)
-		}
+	if !deleted[segKey("orders", 0, 0)] {
+		t.Error("the oldest segment was not reclaimed despite being over budget")
 	}
 }
 
-// TestRetention_SkipsUnknownTopics makes sure the sweep is bounded to what the
-// agent actually knows about.
 func TestRetention_SkipsUnknownTopics(t *testing.T) {
 	store := newRecordingStore()
 	se, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{

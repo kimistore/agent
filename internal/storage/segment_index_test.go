@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"kimistore/internal/storage/wal"
 )
@@ -66,7 +67,7 @@ func TestSealWindow_WritesOneBucketAndBoundsCheckpoint(t *testing.T) {
 
 	for i := 0; i < RecentWindow; i++ {
 		engine.recordSegmentUploaded(context.Background(), "orders", 0, int64(i)*100, int64(i)*100+100,
-			fmt.Sprintf("orders/0/%020d-e1.log", i*100))
+			fmt.Sprintf("orders/0/%020d-e1.log", i*100), 0)
 	}
 	ps := engine.metadataCache.Topics["orders"].Partitions[0]
 	if len(ps.Recent) != 0 {
@@ -221,7 +222,7 @@ func TestCheckpoint_StaysBoundedAsSegmentsAccumulate(t *testing.T) {
 		for i := 0; i < n; i++ {
 			base := int64(i) * 100
 			engine.recordSegmentUploaded(context.Background(), "orders", 0, base, base+100,
-				fmt.Sprintf("orders/0/%020d-e1.log", base))
+				fmt.Sprintf("orders/0/%020d-e1.log", base), 0)
 		}
 		raw, err := engine.metadataCache.ToJSON()
 		if err != nil {
@@ -270,7 +271,7 @@ func TestRestart_DoesNotErasePartitionStateWhenUnowned(t *testing.T) {
 	waitForClaimedSegment(t, store, "orders/0/"+walSegmentName(0, 1))
 	for i := 0; i < 40; i++ {
 		engine.recordSegmentUploaded(context.Background(), "orders", 0, int64(i)*10, int64(i)*10+10,
-			fmt.Sprintf("orders/0/%s", walSegmentName(int64(i)*10, 1)))
+			fmt.Sprintf("orders/0/%s", walSegmentName(int64(i)*10, 1)), 0)
 	}
 	before, err := engine.metadataCache.ToJSON()
 	if err != nil {
@@ -327,7 +328,7 @@ func TestShutdownDrain_KeepsIndexAndPosition(t *testing.T) {
 	waitForClaimedSegment(t, store, "orders/0/"+walSegmentName(0, 1))
 	for i := 0; i < 40; i++ {
 		engine.recordSegmentUploaded(context.Background(), "orders", 0, int64(i)*10, int64(i)*10+10,
-			fmt.Sprintf("orders/0/%s", walSegmentName(int64(i)*10, 1)))
+			fmt.Sprintf("orders/0/%s", walSegmentName(int64(i)*10, 1)), 0)
 	}
 	before, err := engine.metadataCache.ToJSON()
 	if err != nil {
@@ -505,5 +506,79 @@ func TestReclaimIndex_KeepsSegmentSpanningTheBoundary(t *testing.T) {
 	}
 	if want := fmt.Sprintf("orders/0/%s", wal.SegmentName(777764, 1)); key != want {
 		t.Errorf("offset %d resolved to %q, want %q -- the segment spanning the boundary was reclaimed", boundary, key, want)
+	}
+}
+
+// Retention configured but not yet exceeded must delete nothing.
+//
+// The consumer bound alone used to be the trigger, which meant switching
+// retention on deleted everything the consumer had passed -- on knode3 that is
+// ~11,000 objects on the first sweep, because the consumer sits near the log
+// end. A healthy log inside its budget is the normal state and must be left
+// alone.
+func TestReclaimByIndex_InsideBudgetDeletesNothing(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{
+		RetentionBytes: 1 << 30, // 1 GiB
+	})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer engine.Close()
+
+	engine.committedMu.Lock()
+	engine.committedAuthoritative = true
+	engine.committedMu.Unlock()
+
+	now := time.Now().Unix()
+	for _, b := range []int64{0, 100, 200, 300} {
+		engine.metadataCache.AddSegment("orders", 0, SegmentRef{Base: b, Size: 1000, Modified: now})
+		if err := store.inner.Put(context.Background(),
+			fmt.Sprintf("orders/0/%s", wal.SegmentName(b, 0)), strings.NewReader("x")); err != nil {
+			t.Fatalf("seed segment %d: %v", b, err)
+		}
+	}
+
+	// The consumer is caught up, so every segment is below the bound.
+	engine.SaveOffset("mimir-trial-ingesters", "orders", 0, 300)
+	engine.applyRetention()
+
+	if got := engine.reclaimByIndex(context.Background(), "orders", 0); got != 0 {
+		t.Errorf("reclaimed %d segment(s) while inside the byte budget; want 0", got)
+	}
+	ps := engine.metadataCache.Topics["orders"].Partitions[0]
+	if len(ps.Recent) != 4 {
+		t.Errorf("window holds %d entries, want all 4 kept", len(ps.Recent))
+	}
+}
+
+// An age policy that has not elapsed must also delete nothing, and one that has
+// must delete only what is genuinely old.
+func TestReclaimByIndex_AgePolicy(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{
+		RetentionTime: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer engine.Close()
+
+	engine.committedMu.Lock()
+	engine.committedAuthoritative = true
+	engine.committedMu.Unlock()
+
+	now := time.Now()
+	// Segments are written in offset order, so age increases with base offset:
+	// the old ones are a prefix. An out-of-order timestamp cannot occur, and the
+	// scan relies on that -- it stops at the first segment inside the limit, so a
+	// re-uploaded segment with a newer time holds back everything after it.
+	// Erring that way keeps data rather than deleting it.
+	engine.metadataCache.AddSegment("orders", 0, SegmentRef{Base: 300, Size: 10, Modified: now.Unix()})
+	engine.metadataCache.AddSegment("orders", 0, SegmentRef{Base: 200, Size: 10, Modified: now.Add(-2 * time.Hour).Unix()})
+	engine.metadataCache.AddSegment("orders", 0, SegmentRef{Base: 100, Size: 10, Modified: now.Add(-3 * time.Hour).Unix()})
+
+	if got := engine.policyBoundary("orders", 0); got != 200 {
+		t.Errorf("policy boundary = %d, want 200 (the last segment past the age limit)", got)
 	}
 }

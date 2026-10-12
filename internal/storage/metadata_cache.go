@@ -97,9 +97,21 @@ type PartitionState struct {
 // SegmentRef names one uploaded segment by its base offset and ownership
 // epoch. The object key is derived from those two numbers and the partition
 // prefix, so storing the key itself spends ~90 bytes to say what 16 say.
+//
+// Size and Modified exist for retention. Both used to come from a listing, and
+// that is the operation retention cannot afford: on this bucket a single page
+// takes 17s and a full pass does not finish, so size- and time-based retention
+// had no way to run except by listing the whole partition. Carrying them here
+// costs 16 bytes per entry against a 106-byte key and makes both policies
+// answerable from the index alone.
+//
+// Modified is the segment's last-modified time as object storage reports it,
+// recorded at upload. Retention compares it against its cutoff.
 type SegmentRef struct {
-	Base  int64 `json:"b"`
-	Epoch int64 `json:"e"`
+	Base     int64 `json:"b"`
+	Epoch    int64 `json:"e"`
+	Size     int64 `json:"s,omitempty"`
+	Modified int64 `json:"m,omitempty"`
 }
 
 // BucketRef names a sealed run of segments. A sealed bucket is immutable, so
@@ -108,6 +120,13 @@ type BucketRef struct {
 	First int64  `json:"first"`
 	Last  int64  `json:"last"`
 	Key   string `json:"key"`
+	// Bytes and Newest are the bucket's total size and the newest segment
+	// modification time it covers. A bucket is reclaimed whole, so these two
+	// are what the size and time policies need in order to decide without
+	// reading the bucket back -- which would otherwise mean one GET per bucket
+	// per sweep, on the path that has to stay cheap.
+	Bytes  int64 `json:"bytes,omitempty"`
+	Newest int64 `json:"newest,omitempty"`
 }
 
 // RecentWindow is how many segments stay inline in the checkpoint before they
@@ -122,6 +141,11 @@ type SegmentMetadata struct {
 	StartOffset int64  `json:"start_offset"`
 	EndOffset   int64  `json:"end_offset"`
 	S3Key       string `json:"s3_key"`
+	// Size and Modified come from the listing that produced this entry. They
+	// are what the age and size policies select on when the index cannot answer
+	// for a segment.
+	Size     int64 `json:"size,omitempty"`
+	Modified int64 `json:"modified,omitempty"`
 }
 
 func NewMetadataCache() *MetadataCache {
@@ -371,6 +395,14 @@ func (mc *MetadataCache) SealWindow(topic string, partition int32) (*BucketRef, 
 		Last:  refs[len(refs)-1].Base,
 		Key:   bucketKey(topic, partition, refs[0].Base, refs[len(refs)-1].Base),
 	}
+	// Summarised once here, while the entries that make it up are in hand, so
+	// the size and time policies can judge the bucket without reading it back.
+	for _, r := range refs {
+		bucket.Bytes += r.Size
+		if r.Modified > bucket.Newest {
+			bucket.Newest = r.Modified
+		}
+	}
 	ps.Sealed = append(ps.Sealed, bucket)
 	ps.Recent = nil
 	return &bucket, refs
@@ -618,4 +650,25 @@ func (mc *MetadataCache) OldestIndexed(topic string, partition int32) (int64, bo
 		return ps.Recent[0].Base, true
 	}
 	return 0, false
+}
+
+// IndexSnapshot returns copies of a partition's open window and sealed bucket
+// directory, oldest first.
+//
+// Retention reads both to decide what may go without taking the lock across a
+// reclaim that deletes objects. The copies cost one allocation per sweep
+// rather than per segment.
+func (mc *MetadataCache) IndexSnapshot(topic string, partition int32) ([]SegmentRef, []BucketRef) {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+
+	ts, ok := mc.Topics[topic]
+	if !ok {
+		return nil, nil
+	}
+	ps, ok := ts.Partitions[partition]
+	if !ok {
+		return nil, nil
+	}
+	return append([]SegmentRef(nil), ps.Recent...), append([]BucketRef(nil), ps.Sealed...)
 }

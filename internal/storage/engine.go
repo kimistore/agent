@@ -1802,7 +1802,7 @@ func (s *StorageEngine) handleUpload(ctx context.Context, task wal.UploadTask) {
 	// inventory and every read for a cold offset fell back to the same listing
 	// and failed. Recording each upload here makes the manifest the durable
 	// source of the index instead.
-	s.recordSegmentUploaded(ctx, task.Topic, task.Partition, task.BaseOffset, task.EndOffset, key)
+	s.recordSegmentUploaded(ctx, task.Topic, task.Partition, task.BaseOffset, task.EndOffset, key, info.Size())
 
 	cacheKey := fmt.Sprintf("%s/%d", task.Topic, task.Partition)
 	s.cacheMu.Lock()
@@ -1823,11 +1823,22 @@ func (s *StorageEngine) handleUpload(ctx context.Context, task wal.UploadTask) {
 // is the only write the index makes per run of segments. Leaving the whole
 // index in the checkpoint instead is what made it O(total segments x
 // checkpoints) to write.
-func (s *StorageEngine) recordSegmentUploaded(ctx context.Context, topic string, partition int32, base, end int64, key string) {
+// recordSegmentUploaded adds an uploaded segment to the partition's index.
+//
+// size is the object's byte count, which the uploader already had in hand from
+// the PUT. Retention needs it, and it is the only moment the value exists
+// without a listing -- which retention cannot afford, since a page of this
+// bucket's keys takes 17s.
+func (s *StorageEngine) recordSegmentUploaded(ctx context.Context, topic string, partition int32, base, end int64, key string, size int64) {
 	if key == "" {
 		return
 	}
-	s.metadataCache.AddSegment(topic, partition, SegmentRef{Base: base, Epoch: segmentEpoch(key)})
+	s.metadataCache.AddSegment(topic, partition, SegmentRef{
+		Base:     base,
+		Epoch:    segmentEpoch(key),
+		Size:     size,
+		Modified: time.Now().Unix(),
+	})
 	s.markManifestDirty(topic, partition)
 	s.maybeSealWindow(ctx, topic, partition)
 }
@@ -2684,7 +2695,13 @@ func (s *StorageEngine) objectSegments(ctx context.Context, topic string, partit
 	out := make([]*SegmentMetadata, 0, len(live))
 	for _, o := range live {
 		off, _, _ := parseSegmentKey(o.Key)
-		out = append(out, &SegmentMetadata{StartOffset: off, S3Key: o.Key, EndOffset: -1})
+		out = append(out, &SegmentMetadata{
+			StartOffset: off,
+			S3Key:       o.Key,
+			EndOffset:   -1,
+			Size:        o.Size,
+			Modified:    o.LastModified,
+		})
 	}
 	return out, nil
 }
