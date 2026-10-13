@@ -227,8 +227,9 @@ func TestCompactPartition_SkipsBucketsWithoutSizes(t *testing.T) {
 	engine := newCompactingEngine(t, store)
 
 	bucket, refs := seedBucket(t, engine, store.inner, "orders", 0, 3000, 12, 40)
-	// A newer bucket so there is one to leave alone.
+	// A compactable bucket behind it, then a spare newest to leave alone.
 	seedBucket(t, engine, store.inner, "orders", 0, 4000, 12, 40)
+	seedBucket(t, engine, store.inner, "orders", 0, 5000, 12, 40)
 
 	// Rewrite the bucket with entries carrying no size, which is what entries
 	// recorded before SegmentRef gained the field look like. The cap on merged
@@ -246,14 +247,15 @@ func TestCompactPartition_SkipsBucketsWithoutSizes(t *testing.T) {
 		t.Fatalf("rewrite bucket: %v", err)
 	}
 
-	// Refusing the merge is reported rather than silent, so the caller can see
-	// why a bucket is being left alone.
+	// The unsized bucket is skipped, not merged. The pass itself still succeeds,
+	// because the bucket behind it is compactable -- which is the whole point of
+	// scanning forward.
 	n, err := engine.compactPartition(context.Background(), "orders", 0)
-	if err == nil {
-		t.Errorf("compaction reported success over unsized entries; want a refusal")
+	if err != nil {
+		t.Fatalf("compactPartition: %v", err)
 	}
-	if n != 0 {
-		t.Errorf("compacted %d segment(s) despite unsized entries", n)
+	if n == 0 {
+		t.Error("nothing was compacted; the unsized bucket blocked the queue")
 	}
 	for _, ref := range refs {
 		rc, err := store.inner.Get(context.Background(), segmentKey("orders", 0, ref))
@@ -444,5 +446,77 @@ func TestResumeInterruptedMerges_IgnoresUnreadableMarker(t *testing.T) {
 		} else {
 			_ = rc.Close()
 		}
+	}
+}
+
+// A bucket that cannot be merged must not block the buckets behind it.
+//
+// This is what knode3 did for 23 hours: three buckets recorded before the index
+// carried sizes sat at the front of the queue, the compactor took only the
+// oldest candidate and returned when it could not merge it, and fourteen
+// perfectly compactable buckets behind it were never reached. Every tick logged
+// the same skip and the object count did not move.
+func TestCompactPartition_SkipsPastAnUnmergeableBucket(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine := newCompactingEngine(t, store)
+
+	// The blocker: entries with no recorded size, oldest in the queue.
+	blocker, blockerRefs := seedBucket(t, engine, store.inner, "orders", 0, 1000, 12, 40)
+	rewriteUnsized(t, store, blocker, blockerRefs)
+
+	// Two compactable buckets behind it, then a spare newest to leave alone.
+	// The first of these is the one that must be merged: it is the oldest
+	// candidate the blocker is hiding.
+	_, behind := seedBucket(t, engine, store.inner, "orders", 0, 2000, 12, 40)
+	seedBucket(t, engine, store.inner, "orders", 0, 3000, 12, 40)
+	seedBucket(t, engine, store.inner, "orders", 0, 4000, 12, 40)
+
+	n, err := engine.compactPartition(context.Background(), "orders", 0)
+	if err != nil {
+		t.Fatalf("compactPartition: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("nothing was compacted; the blocker stopped the queue")
+	}
+
+	// The blocker must be untouched -- refusing it is correct.
+	for _, ref := range blockerRefs {
+		if rc, err := store.inner.Get(context.Background(), segmentKey("orders", 0, ref)); err != nil {
+			t.Errorf("blocker source %d was deleted despite being unmergeable: %v", ref.Base, err)
+		} else {
+			_ = rc.Close()
+		}
+	}
+
+	// The bucket behind it must have been consolidated.
+	merged := 0
+	for _, ref := range behind {
+		if rc, err := store.inner.Get(context.Background(), segmentKey("orders", 0, ref)); err == nil {
+			_ = rc.Close()
+		} else {
+			merged++
+		}
+	}
+	if merged != len(behind) {
+		t.Errorf("%d of %d source segments behind the blocker were reclaimed; want all",
+			merged, len(behind))
+	}
+}
+
+// rewriteUnsized rewrites a bucket's contents with sizes cleared, which is what
+// entries recorded before SegmentRef gained that field look like.
+func rewriteUnsized(t *testing.T, store *listFailStore, b BucketRef, refs []SegmentRef) {
+	t.Helper()
+	var unsized []SegmentRef
+	for _, ref := range refs {
+		ref.Size = 0
+		unsized = append(unsized, ref)
+	}
+	raw, err := json.Marshal(unsized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.inner.Put(context.Background(), b.Key, bytesReader(raw)); err != nil {
+		t.Fatalf("rewrite bucket: %v", err)
 	}
 }

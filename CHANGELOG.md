@@ -11,6 +11,40 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.11
+
+The compactor had never merged anything, and the reason was a bug rather than
+the data it was waiting for.
+
+### Fixed
+
+- A bucket that could not be merged no longer blocks every bucket behind it. The
+  compactor took only the oldest candidate and returned when it could not merge
+  it, so three buckets recorded before the index carried sizes sat at the front
+  of the queue and starved the fourteen compactable buckets behind them. Every
+  15-minute tick logged the same skip and the object count did not move:
+
+      Compactor: mimir-distributor/0: bucket ...00000000000000781330-00000000000000793734.idx
+      holds entries recorded before sizes were indexed; skipping
+
+  That ran 23 hours on knode3 with zero merges. Candidate selection now scans
+  forward to the first bucket that can actually be merged. The list is still
+  oldest-first and the oldest mergeable range is still compacted first, so
+  precedence is unchanged
+- Whether an entry has a recorded size is now decided while choosing a
+  candidate, not after. Testing it once a bucket had been chosen turned a skip
+  into an abort, and the abort ended the pass that had already found a workable
+  bucket further along
+
+### Known limitations
+
+- The three legacy buckets remain unmergeable until the window has rolled past
+  them, since a merged size cannot be capped for entries of unknown size. They
+  are skipped, not blocking, from this release
+- Recovery cannot reclaim a merged segment written but not yet committed: no
+  marker covers it, and its key derives from the same offsets, so a later merge
+  overwrites it
+
 ## 1.0.10
 
 Corrects the segment size chosen in 1.0.8, which was raised when it should have

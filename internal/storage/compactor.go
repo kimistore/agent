@@ -164,12 +164,46 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 		return 0, nil
 	}
 
-	b := buckets[0]
-	refs, err := s.readBucket(ctx, b)
-	if err != nil {
-		return 0, fmt.Errorf("read bucket %s: %w", b.Key, err)
+	// Scan forward to the first bucket that can actually be merged, rather than
+	// taking the oldest and giving up on it.
+	//
+	// Taking only the oldest meant one unmergeable bucket -- here, one recorded
+	// before the index carried sizes -- blocked every later one indefinitely. The
+	// compactor reported the same skip every 15 minutes for 23 hours while
+	// fourteen compactable buckets sat behind it.
+	//
+	// The candidate list is oldest-first and this stops at the first workable
+	// bucket, so precedence is unchanged: the oldest mergeable range is still
+	// compacted first, and a skipped bucket no longer starves the ones behind it.
+	var (
+		b       BucketRef
+		refs    []SegmentRef
+		found   bool
+		readErr error
+	)
+	for _, cand := range buckets {
+		candRefs, err := s.readBucket(ctx, cand)
+		if err != nil {
+			readErr = fmt.Errorf("read bucket %s: %w", cand.Key, err)
+			continue
+		}
+		if len(candRefs) < cfg.MinSegments {
+			continue
+		}
+		// Whether an entry has a recorded size is a property of the candidate,
+		// so it is decided here rather than after a bucket has been chosen.
+		// Testing it afterwards turns a skip into an abort, and the abort stops
+		// the pass that has already found a workable bucket further along.
+		if !allSized(candRefs) {
+			continue
+		}
+		b, refs, found = cand, candRefs, true
+		break
 	}
-	if len(refs) < cfg.MinSegments {
+	if !found {
+		if readErr != nil {
+			return 0, readErr
+		}
 		return 0, nil
 	}
 
@@ -189,13 +223,10 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 		return 0, nil
 	}
 
-	// An entry with no recorded size predates the index carrying sizes, so the
-	// cap cannot be applied. Merging it would produce an object of unknown size,
-	// which is how a single merge ends up costing more than it saves.
-	for _, ref := range sources {
-		if ref.Size == 0 {
-			return 0, fmt.Errorf("bucket %s holds entries recorded before sizes were indexed; skipping", b.Key)
-		}
+	// Re-checked on the run actually selected: it is a prefix of the candidate,
+	// and the cap is applied per prefix.
+	if !allSized(sources) {
+		return 0, fmt.Errorf("bucket %s holds entries recorded before sizes were indexed; skipping", b.Key)
 	}
 
 	merged, err := s.mergeRefs(ctx, topic, partition, sources, bytesIn, cfg)
@@ -366,6 +397,21 @@ func (s *StorageEngine) mergeRefs(ctx context.Context, topic string, partition i
 // one more than a single number. Taking the maximum across the sources rather
 // than the first matters when a re-claimed partition left entries from two
 // epochs in one bucket.
+// allSized reports whether every reference carries a recorded size.
+//
+// A zero size means the entry predates the index carrying sizes, and the cap on
+// merged size cannot be applied to it. Merging such an entry blind would produce
+// an object of unknown size, which is how a single merge ends up costing more
+// than it saves.
+func allSized(refs []SegmentRef) bool {
+	for _, ref := range refs {
+		if ref.Size == 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func mergedEpoch(sources []SegmentRef) int64 {
 	var max int64
 	for _, ref := range sources {
