@@ -103,6 +103,14 @@ func main() {
 			Settle:  cfg.Assignment.Settle,
 		}),
 		storage.WithOperationTimeout(cfg.S3Timeout),
+		// Compaction interval is tunable because the right value depends on
+		// the ingest rate, which is not knowable here: one pass consolidates
+		// MaxMergedBytes and takes seconds, so the interval has to be short
+		// enough for the budget to be spent faster than the partition fills.
+		storage.WithCompactor(storage.CompactorConfig{
+			Disabled: !cfg.Compaction.Enabled,
+			Interval: cfg.Compaction.Interval,
+		}),
 		storage.WithAgentID(cfg.AgentID),
 		storage.WithFlushInterval(cfg.FlushInterval),
 		storage.WithRegistry(storage.RegistryConfig{

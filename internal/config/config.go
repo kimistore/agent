@@ -69,6 +69,9 @@ type Config struct {
 
 	Retention RetentionConfig
 
+	// Compaction controls background consolidation of sealed segments.
+	Compaction CompactionConfig
+
 	// Lease configures the single-writer fence. The agent claims the log in
 	// object storage before it serves anything and refuses to start if
 	// another live writer holds it, because two writers on one bucket do not
@@ -166,6 +169,14 @@ type LeaseConfig struct {
 	TTL time.Duration
 }
 
+// CompactionConfig mirrors storage.CompactorConfig. It is read from the
+// environment so the interval can be tuned against a measured ingest rate
+// without a rebuild.
+type CompactionConfig struct {
+	Enabled  bool
+	Interval time.Duration
+}
+
 type RetentionConfig struct {
 	RetentionBytes int64
 	RetentionTime  time.Duration
@@ -192,6 +203,11 @@ func FromEnv() Config {
 		AgentID:      os.Getenv("KIMISTORE_AGENT_ID"),
 
 		FlushInterval: time.Duration(envInt64("KIMISTORE_FLUSH_INTERVAL_MS", 1_000)) * time.Millisecond,
+
+		Compaction: CompactionConfig{
+			Enabled:  !envBool("KIMISTORE_COMPACTION_DISABLED", false),
+			Interval: time.Duration(envInt64("KIMISTORE_COMPACTION_INTERVAL_MS", 60_000)) * time.Millisecond,
+		},
 
 		Lease: LeaseConfig{
 			// Only consulted when ownership is off, so this defaults to the

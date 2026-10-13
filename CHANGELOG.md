@@ -11,6 +11,49 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.13
+
+Compaction was losing the object-count race badly, and shortening the interval
+would not have fixed it.
+
+### Fixed
+
+- A merge pass takes segments until the size cap rather than stopping at the
+  minimum. The selection condition combined the two --
+  `len(sources) >= MinSegments && bytesIn >= MaxMergedBytes` -- so once a bucket's
+  first entry was itself a merged segment, the byte test was already satisfied on
+  the first iteration and every pass merged exactly eight segments. Against
+  3,200 segments an hour that is losing by two orders of magnitude
+
+- A partially compacted bucket no longer stalls after its first pass. A merged
+  segment lands just under the cap, because the loop stops before an entry would
+  overshoot, so an exact cap comparison let that segment through as the first
+  entry of the next pass -- where it consumed the entire budget and left the
+  pass with nothing to merge. Segments at least half the cap are now treated as
+  previous passes' products and stepped over. Measured on the test fixture: 8
+  segments per pass before, 57 after
+
+- Entries a pass did not merge stay in the rewritten bucket. They were being
+  dropped from the index: still present in object storage, unreachable, and a
+  read for their offsets would fail
+
+### Changed
+
+- The compaction interval defaults to 60s rather than 15 minutes, and is
+  configurable with `KIMISTORE_COMPACTION_INTERVAL_MS`. Set
+  `KIMISTORE_COMPACTION_DISABLED=true` to turn compaction off. The pass is
+  cheap -- it merges up to `MaxMergedBytes`, seconds of I/O -- so the interval
+  only decides whether the budget is spent faster than the partition fills
+
+### Known limitations
+
+- Compaction consolidates sealed buckets only. The open window and the newest
+  sealed bucket are never merged, so the steady-state object count is bounded by
+  the window rather than falling to the number of merged segments alone
+- A merge interrupted after writing its bucket but before committing the index
+  leaves an unreferenced merged segment that no marker covers. A later merge
+  overwrites it, since the merged key derives from the same offsets
+
 ## 1.0.12
 
 Fixes a log start that could rewind past the data still present.

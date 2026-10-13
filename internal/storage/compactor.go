@@ -42,6 +42,12 @@ type CompactorConfig struct {
 	// unambiguously.
 	Disabled bool
 	// Interval is how often a partition is considered for compaction.
+	//
+	// The default is a minute because the pass is cheap -- it merges up to
+	// MaxMergedBytes, a few seconds of I/O -- and the interval is what decides
+	// whether compaction keeps pace with ingest. At fifteen minutes against this
+	// workload's 3,200 segments an hour, one pass could not come close; the
+	// budget has to be spent in the time available or the backlog never clears.
 	Interval time.Duration
 	// MinSegments is how many segments must be covered before a merge is worth
 	// doing. Merging two segments into one halves the object count and costs a
@@ -58,7 +64,7 @@ type CompactorConfig struct {
 
 func (c CompactorConfig) withDefaults() CompactorConfig {
 	if c.Interval <= 0 {
-		c.Interval = 15 * time.Minute
+		c.Interval = time.Minute
 	}
 	if c.MinSegments <= 0 {
 		c.MinSegments = 8
@@ -212,8 +218,37 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 	// object far larger than any segment the writer emits.
 	var sources []SegmentRef
 	var bytesIn int64
+	// Take segments until the merged size reaches the cap.
+	//
+	// The cap and the minimum are independent. They were once combined into one
+	// condition, which meant a bucket whose first entry was already a merged
+	// segment satisfied the byte test on the first iteration and stopped the
+	// loop at exactly MinSegments -- eight. That is why compaction reclaimed 8
+	// segments every fifteen minutes while the partition took in 3,200: it was
+	// not losing the race on interval, it was barely entering it.
+	//
+	// Segments are taken in order from the oldest, so a partially compacted
+	// bucket keeps filling the same merged segment rather than starting a new
+	// one per pass.
 	for _, ref := range refs {
-		if len(sources) >= cfg.MinSegments && bytesIn >= cfg.MaxMergedBytes {
+		// A segment already at the cap is a previous pass's product. Taking it
+		// would spend the whole budget on one entry and leave the pass merging
+		// nothing, so it is stepped over rather than merged again.
+		//
+		// The test is most of the cap rather than exactly it. A merged segment
+		// lands just under, because the loop stops before an entry would
+		// overshoot -- so an exact comparison lets the first entry of every
+		// subsequent pass through, and that entry then consumes the entire
+		// budget, leaving the pass with nothing to do. That is what made a
+		// partially compacted bucket stall: every pass selected the one segment
+		// it had already merged.
+		if ref.Size >= cfg.MaxMergedBytes/2 {
+			continue
+		}
+		// Stop before an entry would carry the result past the cap, rather than
+		// after. Taking one that overshoots produces an object larger than
+		// anything the writer emits, which is the limit this exists to hold.
+		if bytesIn+ref.Size > cfg.MaxMergedBytes {
 			break
 		}
 		sources = append(sources, ref)
@@ -261,13 +296,22 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 	// range overstated by even one would make BucketFor resolve an offset to the
 	// wrong bucket.
 	mergedLast := sources[len(sources)-1].Base
+	// The range and the key span everything the bucket still holds, not just the
+	// merged prefix: entries after the prefix stay in this bucket.
+	nextLast := mergedLast
+	if len(kept) > 0 {
+		nextLast = refs[len(refs)-1].Base
+	}
 	next := BucketRef{
 		First:  mergedRef.Base,
-		Last:   mergedLast,
-		Key:    bucketKey(topic, partition, mergedRef.Base, mergedLast),
+		Last:   nextLast,
+		Key:    bucketKey(topic, partition, mergedRef.Base, nextLast),
 		Bytes:  merged.BytesOut,
 		Newest: mergedRef.Modified,
 	}
+	// The entries this pass did not merge stay in the bucket. Leaving them out
+	// drops them from the index: they would remain in object storage,
+	// unreachable, and a read for their offsets would fail.
 	body, err := json.Marshal(append([]SegmentRef{mergedRef}, kept...))
 	if err != nil {
 		return 0, err

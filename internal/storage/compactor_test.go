@@ -520,3 +520,103 @@ func rewriteUnsized(t *testing.T, store *listFailStore, b BucketRef, refs []Segm
 		t.Fatalf("rewrite bucket: %v", err)
 	}
 }
+
+// A merge must take segments until the size cap, not stop at the minimum.
+//
+// This is what stopped compaction winning the race. The selection condition was
+// `len(sources) >= MinSegments && bytesIn >= MaxMergedBytes`, and once a bucket's
+// first entry was itself a merged segment the byte test was satisfied on the
+// first iteration -- so every subsequent pass merged exactly MinSegments, eight.
+// Eight segments a pass cannot keep up with 3,200 an hour; the interval was not
+// the problem.
+func TestCompactPartition_TakesSegmentsUpToTheSizeCap(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	scratch := t.TempDir()
+	engine, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{},
+		WithCompactor(CompactorConfig{
+			Interval:       time.Hour,
+			MinSegments:    8,
+			MaxMergedBytes: 64 * 1024, // 64KB cap, entries of 1KB
+			ScratchDir:     scratch,
+		}))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer engine.Close()
+
+	const count = 120
+	bucket, refs := seedBucketSized(t, engine, store.inner, "orders", 0, 1000, count, 1024)
+	seedBucketSized(t, engine, store.inner, "orders", 0, 2000, count, 1024)
+	seedBucketSized(t, engine, store.inner, "orders", 0, 3000, count, 1024)
+
+	// First pass creates the merged segment. The second is the one that matters:
+	// the bucket now opens with a segment that is already at the cap, and that
+	// is what made the byte test true on the first iteration and stopped
+	// selection at MinSegments. A test that only compacts once cannot see it.
+	if _, err := engine.compactPartition(context.Background(), "orders", 0); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	n, err := engine.compactPartition(context.Background(), "orders", 0)
+	if err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	t.Logf("  second pass merged %d segment(s)", n)
+
+	if n < 32 {
+		t.Errorf("second pass merged %d segment(s); selection is still stopping at MinSegments "+
+			"because the bucket now opens with an already-merged segment", n)
+	}
+
+	merged := 0
+	for _, ref := range refs {
+		if rc, err := store.inner.Get(context.Background(), segmentKey("orders", 0, ref)); err == nil {
+			_ = rc.Close()
+		} else {
+			merged++
+		}
+	}
+	if merged < 32 {
+		t.Errorf("%d source segments were reclaimed, want the passes to clear the bucket", merged)
+	}
+	_ = bucket
+}
+
+// seedBucketSized is seedBucket with an explicit entry size, so the size cap can
+// be exercised against known input.
+func seedBucketSized(t *testing.T, engine *StorageEngine, store ObjectStore, topic string, partition int32, first int64, count int, bodySize int) (BucketRef, []SegmentRef) {
+	t.Helper()
+	var refs []SegmentRef
+	for i := int64(0); i < int64(count); i++ {
+		off := first + i
+		refs = append(refs, SegmentRef{Base: off, Epoch: 7, Size: int64(bodySize + 12)})
+		key := fmt.Sprintf("%s/%d/%s", topic, partition, wal.SegmentName(off, 7))
+
+		hdr := make([]byte, 12)
+		binary.BigEndian.PutUint64(hdr[0:8], uint64(off))
+		binary.BigEndian.PutUint32(hdr[8:12], uint32(bodySize))
+		body := append([]byte(nil), hdr...)
+		entry := make([]byte, bodySize)
+		binary.BigEndian.PutUint64(entry[0:8], uint64(off))
+		body = append(body, entry...)
+
+		if err := store.Put(context.Background(), key, bytesReader(body)); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+	}
+
+	b := BucketRef{
+		First: first, Last: first + int64(count) - 1,
+		Key:    bucketKey(topic, partition, first, first+int64(count)-1),
+		Bytes:  int64(count * (bodySize + 12)),
+		Newest: 1000,
+	}
+	raw, err := json.Marshal(refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(context.Background(), b.Key, bytesReader(raw)); err != nil {
+		t.Fatalf("put bucket: %v", err)
+	}
+	engine.metadataCache.SeededBucket(topic, partition, b)
+	return b, refs
+}
