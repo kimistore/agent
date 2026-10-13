@@ -624,3 +624,52 @@ func TestPolicyBoundary_SizeUnknownCountsAgainstTheBudget(t *testing.T) {
 		t.Errorf("policy boundary = %d, want 300 (the first entry of known size)", got)
 	}
 }
+
+// The log start must never fall below the oldest offset the index describes.
+//
+// This is the failure knode3 hit after its legacy buckets were dropped by hand:
+// the checkpoint said the log started at 781330, the per-partition manifest
+// still said 0, and manifest recovery ran after the checkpoint load and
+// overwrote it. Every consumer that resets to the start of the log is then sent
+// to offset 0, which resolves to nothing, and loops on OffsetOutOfRange.
+func TestSetPartitionState_LogStartNeverRewindsPastTheIndex(t *testing.T) {
+	mc := NewMetadataCache()
+
+	// The index as it stands after the legacy buckets were removed.
+	mc.SeededBucket("orders", 0, BucketRef{First: 781330, Last: 793734, Key: "a.idx"})
+
+	// A stale position from a manifest written before the drop.
+	mc.SetPartitionState("orders", 0, 800000, 0)
+
+	if got := mc.LogStartOffset("orders", 0); got != 781330 {
+		t.Errorf("log start = %d after restoring a stale position; want 781330", got)
+	}
+}
+
+// The same guard applies when the index is only an open window, which is what a
+// partition whose buckets have all been compacted looks like.
+func TestSetPartitionState_LogStartRespectsTheWindow(t *testing.T) {
+	mc := NewMetadataCache()
+	mc.AddSegment("orders", 0, SegmentRef{Base: 900000, Epoch: 1})
+
+	mc.SetPartitionState("orders", 0, 950000, 0)
+
+	if got := mc.LogStartOffset("orders", 0); got != 900000 {
+		t.Errorf("log start = %d, want 900000 (the oldest window entry)", got)
+	}
+}
+
+// A legitimate forward advance must still work. Retention moves the start up
+// when it reclaims, and refusing that would strand data.
+func TestSetPartitionState_LogStartStillAdvances(t *testing.T) {
+	mc := NewMetadataCache()
+	mc.AddSegment("orders", 0, SegmentRef{Base: 900000, Epoch: 1})
+	mc.AddSegment("orders", 0, SegmentRef{Base: 950000, Epoch: 1})
+
+	// Retention reclaims below 950000, which is above the oldest entry.
+	mc.SetPartitionState("orders", 0, 990000, 950000)
+
+	if got := mc.LogStartOffset("orders", 0); got != 950000 {
+		t.Errorf("log start = %d, want 950000: retention must still be able to advance it", got)
+	}
+}

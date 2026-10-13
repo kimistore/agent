@@ -11,6 +11,29 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.12
+
+Fixes a log start that could rewind past the data still present.
+
+### Fixed
+
+- The log start no longer falls below the oldest offset the segment index
+  describes. Two paths could rewind it. Restoring a per-partition manifest ran
+  after the checkpoint load and took the manifest's `log_start_offset` verbatim,
+  so a manifest left behind by a sweep rewound the start past data the index
+  still described. `SetPartitionState` now clamps it to the oldest indexed entry
+
+  The consequence was a consumer that resets to the start of the log being sent
+  to an offset that resolves to nothing, looping on `OffsetOutOfRange` with
+  nothing in the broker's logs to say why. Observed on knode3 after its legacy
+  buckets were dropped by hand: the checkpoint said 781330, the manifest still
+  said 0, and the manifest won
+
+- Lowering the start is never the safe direction. The index cannot name a
+  segment below its oldest entry, so a start above it is already conservative,
+  while one below it is a claim about data that is gone. Forward movement is
+  unaffected, so retention still advances the start when it reclaims
+
 ## 1.0.11
 
 The compactor had never merged anything, and the reason was a bug rather than

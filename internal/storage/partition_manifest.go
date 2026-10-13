@@ -279,7 +279,23 @@ func (s *StorageEngine) loadPartitionManifests(ctx context.Context) (restored in
 				errSuperseded, obj.Key, stored, m.Writer, s.partitionEpoch(m.Topic, m.Partition))
 		}
 
-		s.metadataCache.SetPartitionState(m.Topic, m.Partition, m.LogEndOffset, m.LogStartOffset)
+		// The log end takes the manifest's value, because a manifest that lags
+		// its own segments is the crash case this exists to repair.
+		//
+		// The log start takes the higher of the two instead. A manifest is a
+		// snapshot and can carry a stale start -- one written before a retention
+		// sweep, or before segments were dropped -- and taking it verbatim
+		// rewinds the log start past data the index still describes. ListOffsets
+		// reports this value to every consumer that resets to the start of the
+		// log, so a rewind sends it to an offset that no longer resolves, and it
+		// loops on OffsetOutOfRange. Lowering it is never the safe direction:
+		// the index cannot name anything below its oldest entry, so a start
+		// above the index is already conservative, while one below it is a lie.
+		if cur := s.metadataCache.LogStartOffset(m.Topic, m.Partition); cur > m.LogStartOffset {
+			s.metadataCache.SetPartitionState(m.Topic, m.Partition, m.LogEndOffset, cur)
+		} else {
+			s.metadataCache.SetPartitionState(m.Topic, m.Partition, m.LogEndOffset, m.LogStartOffset)
+		}
 		restored++
 	}
 	return restored, found, nil

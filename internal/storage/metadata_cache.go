@@ -291,7 +291,33 @@ func (mc *MetadataCache) SetPartitionState(topic string, partition int32, leo, l
 	ps := mc.touchLocked(topic, partition)
 	ps.LogEndOffset = leo
 	ps.HighWatermark = leo
+
+	// The log start never moves backwards past what the index still describes.
+	//
+	// The index is authoritative for what is retrievable: it cannot name a
+	// segment below its oldest entry, so a log start below that oldest entry
+	// points consumers at offsets that resolve to nothing. ListOffsets reports
+	// this value to every consumer that resets to the start of the log, which is
+	// exactly the consumer that would then loop on OffsetOutOfRange.
+	//
+	// Restoring a stale position from a manifest or a checkpoint could otherwise
+	// rewind it, and nothing else would notice: the log end keeps moving, the
+	// index keeps serving, and the damage only shows on a reset.
+	if oldest, ok := oldestIndexedLocked(ps); ok && oldest > lso {
+		lso = oldest
+	}
 	ps.LogStartOffset = lso
+}
+
+// oldestIndexedLocked is the base offset of the oldest segment the index holds.
+func oldestIndexedLocked(ps *PartitionState) (int64, bool) {
+	if len(ps.Sealed) > 0 {
+		return ps.Sealed[0].First, true
+	}
+	if len(ps.Recent) > 0 {
+		return ps.Recent[0].Base, true
+	}
+	return 0, false
 }
 
 // GetPartitions returns the known partitions for a topic. Retention and
