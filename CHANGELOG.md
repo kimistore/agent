@@ -11,6 +11,30 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.14
+
+An index entry naming a segment that no longer exists no longer stops compaction.
+
+### Fixed
+
+- A merge skips an index entry whose object is absent instead of aborting. The
+  absence cannot be cured by retrying, so retrying is what turned one bad entry
+  into a permanently stalled partition: on knode3 every pass failed on the same
+  segment, once a minute, for hours, and a log search for "Compactor" showed
+  activity throughout. The entry is dropped from the merge and the log start
+  moves past it, because a gap no object can fill is better reported by
+  ListOffsets than by a read that never resolves
+
+  This state was reached by the entry-dropping bug fixed in 1.0.13, which had
+  already damaged one bucket before it shipped. A repair run cleared it: 1 entry
+  of 61,000 named a missing object, now zero
+
+### Known limitations
+
+- An object that is absent cannot be recovered. The repair removes it from the
+  index, which turns a read failure into a visible gap rather than a silent
+  one, but the data at that offset is gone
+
 ## 1.0.13
 
 Compaction was losing the object-count race badly, and shortening the interval

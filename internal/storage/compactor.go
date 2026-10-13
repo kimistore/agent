@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -264,7 +266,7 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 		return 0, fmt.Errorf("bucket %s holds entries recorded before sizes were indexed; skipping", b.Key)
 	}
 
-	merged, err := s.mergeRefs(ctx, topic, partition, sources, bytesIn, cfg)
+	merged, err := s.mergeRefs(ctx, topic, partition, sources, cfg)
 	if err != nil {
 		return 0, err
 	}
@@ -396,7 +398,7 @@ func (s *StorageEngine) eligibleBuckets(topic string, partition int32, cfg Compa
 }
 
 // mergeRefs downloads the sources, merges them, and returns the result.
-func (s *StorageEngine) mergeRefs(ctx context.Context, topic string, partition int32, sources []SegmentRef, bytesIn int64, cfg CompactorConfig) (*stagedMerge, error) {
+func (s *StorageEngine) mergeRefs(ctx context.Context, topic string, partition int32, sources []SegmentRef, cfg CompactorConfig) (*stagedMerge, error) {
 	dir, err := os.MkdirTemp(cfg.ScratchDir, "compact-*")
 	if err != nil {
 		return nil, fmt.Errorf("scratch dir: %w", err)
@@ -404,12 +406,40 @@ func (s *StorageEngine) mergeRefs(ctx context.Context, topic string, partition i
 	defer func() { _ = os.RemoveAll(dir) }()
 
 	paths := make([]string, 0, len(sources))
+	have := make([]SegmentRef, 0, len(sources))
 	for i, ref := range sources {
 		dst := filepath.Join(dir, fmt.Sprintf("src-%06d", i))
 		if err := s.downloadSegment(ctx, topic, partition, ref, dst); err != nil {
+			// An index entry whose object is gone cannot be merged, and
+			// aborting on it would retry the same entry on every pass forever --
+			// which is exactly what knode3 did, silently, for hours.
+			//
+			// It is also not recoverable: nothing else names those offsets. The
+			// entry is dropped from the merge rather than blocking it, and the
+			// log start moves past it, because a gap that no object can fill is
+			// better reported by ListOffsets than by a read that never resolves.
+			if isNotFound(err) {
+				log.Printf("Compactor: %s/%d index names %s but the object is gone; dropping it from the merge",
+					topic, partition, segmentKey(topic, partition, ref))
+				s.markManifestDirty(topic, partition)
+				continue
+			}
 			return nil, fmt.Errorf("download %s: %w", segmentKey(topic, partition, ref), err)
 		}
 		paths = append(paths, dst)
+		have = append(have, ref)
+	}
+	if len(have) < cfg.MinSegments {
+		return nil, fmt.Errorf("fewer than %d of this bucket's segments exist in object storage", cfg.MinSegments)
+	}
+	sources = have
+	// The byte total is taken from what was actually taken. An entry dropped for
+	// being absent is no longer part of the merge, and counting it would fail the
+	// consistency check below for a reason that has nothing to do with the
+	// objects on hand.
+	var bytesIn int64
+	for _, ref := range sources {
+		bytesIn += ref.Size
 	}
 
 	out := filepath.Join(dir, "merged.log")
@@ -625,4 +655,23 @@ func (s *StorageEngine) resumeInterruptedMerges(ctx context.Context, topic strin
 			topic, partition, removed)
 	}
 	return deleted
+}
+
+// isNotFound reports whether an object-store error means the object is absent,
+// rather than the store being unreachable or timing out.
+//
+// The distinction decides whether a merge should drop an index entry or give up.
+// A missing object cannot be fetched by retrying, so retrying is what turns one
+// bad entry into a permanently stuck partition.
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "nosuchkey") ||
+		strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "statuscode: 404")
 }

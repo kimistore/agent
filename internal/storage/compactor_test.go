@@ -620,3 +620,67 @@ func seedBucketSized(t *testing.T, engine *StorageEngine, store ObjectStore, top
 	engine.metadataCache.SeededBucket(topic, partition, b)
 	return b, refs
 }
+
+// An index entry whose object is gone must not wedge the partition.
+//
+// knode3 had exactly this: one bucket entry named a segment that no longer
+// existed, and every pass failed on it in the same place, forever. The compactor
+// logged the same 404 once a minute for hours and merged nothing, which reads
+// as "compaction is running" in a log search.
+func TestCompactPartition_SkipsAnEntryWhoseObjectIsGone(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{},
+		WithCompactor(CompactorConfig{
+			Interval: time.Hour, MinSegments: 4,
+			MaxMergedBytes: 1 << 20, ScratchDir: t.TempDir(),
+		}))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer engine.Close()
+
+	bucket, refs := seedBucket(t, engine, store.inner, "orders", 0, 1000, 12, 40)
+	seedBucket(t, engine, store.inner, "orders", 0, 2000, 12, 40)
+	seedBucket(t, engine, store.inner, "orders", 0, 3000, 12, 40)
+
+	// Remove one object the bucket names, leaving the index pointing at it.
+	victim := refs[3]
+	if err := store.inner.Delete(context.Background(), segmentKey("orders", 0, victim)); err != nil {
+		t.Fatalf("delete victim: %v", err)
+	}
+	if err := store.inner.Delete(context.Background(),
+		strings.TrimSuffix(segmentKey("orders", 0, victim), ".log")+".index"); err != nil {
+		t.Fatalf("delete victim sidecar: %v", err)
+	}
+
+	n, err := engine.compactPartition(context.Background(), "orders", 0)
+	if err != nil {
+		t.Fatalf("compactPartition returned an error over one missing object: %v", err)
+	}
+	if n < 8 {
+		t.Errorf("merged %d segment(s); one absent object should not have stopped the pass", n)
+	}
+
+	// The survivors must still be readable.
+	ps := engine.metadataCache.Topics["orders"].Partitions[0]
+	if len(ps.Sealed) == 0 {
+		t.Fatal("no sealed buckets remain")
+	}
+	for _, ref := range refs {
+		if ref.Base == victim.Base {
+			continue
+		}
+		if ref.Base > 1010 {
+			continue
+		}
+		key, err := engine.segmentKeyFor(context.Background(), "orders", 0, ref.Base)
+		if err != nil {
+			t.Errorf("offset %d no longer resolves after the merge: %v", ref.Base, err)
+			continue
+		}
+		if key == "" {
+			t.Errorf("offset %d resolves to no segment", ref.Base)
+		}
+	}
+	_ = bucket
+}
