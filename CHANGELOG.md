@@ -11,6 +11,42 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.15
+
+Fixes a data-loss defect in the compactor. It destroyed seven offsets on knode3
+before this release.
+
+### Fixed
+
+- A merge no longer derives the rewritten bucket by position. Selection steps
+  over entries that are already merged products, so the sources it chooses are a
+  subset of the bucket rather than a prefix of it. The rewritten bucket was
+  built as `refs[len(sources):]`, which assumes the opposite, and so:
+
+  - listed entries that had been merged -- whose objects the pass then deleted,
+    leaving the index naming segments that no longer exist, and
+  - dropped entries that had been left alone, taking their index entries with
+    them
+
+  The surviving sources are now tracked by position and the rest selected by
+  membership
+
+- A merge no longer narrows its bucket's range. Taking the range from the
+  rewritten contents collapses it onto the merged segment's base offset whenever a
+  pass merges the whole bucket, which puts every offset above that base outside
+  every bucket and makes those reads unresolvable. A merge consolidates the
+  entries in a range; it does not change the range, which is the original
+  bucket's first and last base offsets, as `SealWindow` derives it
+
+- The rewritten bucket's contents are sorted explicitly. A stepped-over entry at
+  the head leaves the merged segment's base above the bucket's first, and
+  `BucketFor` binary-searches the list, so an unsorted one is silently missed
+
+### Known limitations
+
+- The seven offsets lost on knode3 are not recoverable; no object holds them.
+  They were each the tail of a compacted bucket, and reads for them fail
+
 ## 1.0.14
 
 An index entry naming a segment that no longer exists no longer stops compaction.

@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -218,7 +219,16 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 	// Merge only a whole-bucket prefix, capped at the merged size the writer
 	// would produce. Merging all 4096 entries of a bucket would produce a single
 	// object far larger than any segment the writer emits.
-	var sources []SegmentRef
+	// picked holds the position in refs of every entry this pass merges, and is
+	// the single source of truth for what the rewritten bucket must stop naming.
+	//
+	// It exists because the sources are not a prefix of the bucket. The loop
+	// below steps over entries that are already merged products, so the sources
+	// are a subset. Deriving the rest of the bucket by slicing on the length of
+	// the sources listed merged segments -- whose objects this pass then deletes
+	// -- and dropped entries that were left alone. On knode3 that destroyed seven
+	// offsets.
+	var picked []int
 	var bytesIn int64
 	// Take segments until the merged size reaches the cap.
 	//
@@ -232,7 +242,7 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 	// Segments are taken in order from the oldest, so a partially compacted
 	// bucket keeps filling the same merged segment rather than starting a new
 	// one per pass.
-	for _, ref := range refs {
+	for i, ref := range refs {
 		// A segment already at the cap is a previous pass's product. Taking it
 		// would spend the whole budget on one entry and leave the pass merging
 		// nothing, so it is stepped over rather than merged again.
@@ -253,23 +263,24 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 		if bytesIn+ref.Size > cfg.MaxMergedBytes {
 			break
 		}
-		sources = append(sources, ref)
+		picked = append(picked, i)
 		bytesIn += ref.Size
 	}
-	if len(sources) < cfg.MinSegments {
+	if len(picked) < cfg.MinSegments {
 		return 0, nil
 	}
 
-	// Re-checked on the run actually selected: it is a prefix of the candidate,
-	// and the cap is applied per prefix.
-	if !allSized(sources) {
+	// Re-checked on the run actually selected: it is a subset of the candidate,
+	// and the cap is applied per selection.
+	if !allSized(refsAt(refs, picked)) {
 		return 0, fmt.Errorf("bucket %s holds entries recorded before sizes were indexed; skipping", b.Key)
 	}
 
-	merged, err := s.mergeRefs(ctx, topic, partition, sources, cfg)
+	merged, picked, err := s.mergeRefs(ctx, topic, partition, refs, picked, cfg)
 	if err != nil {
 		return 0, err
 	}
+	sources := refsAt(refs, picked)
 	// The merged segment needs its own key. Giving it the first source's base
 	// and epoch would write over that source's object, and the delete that
 	// follows would then remove the only copy of the range.
@@ -290,31 +301,55 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 	if err := s.writeMergedSegment(ctx, topic, partition, mergedRef, merged.Path, merged.BytesOut); err != nil {
 		return 0, fmt.Errorf("write merged segment: %w", err)
 	}
-	kept := append([]SegmentRef(nil), refs[len(sources):]...)
+	// Everything this pass did not merge, selected by membership. Slicing
+	// refs[len(sources):] assumes the sources are a prefix, and they are not --
+	// the selection steps over entries that are already merged products.
+	takenSet := make([]bool, len(refs))
+	for _, i := range picked {
+		takenSet[i] = true
+	}
+	kept := make([]SegmentRef, 0, len(refs))
+	for i, ref := range refs {
+		if !takenSet[i] {
+			kept = append(kept, ref)
+		}
+	}
 	// Last is the base offset of the last source entry, not base plus a count.
 	// Offsets do not advance one per entry -- a segment's base is the offset its
 	// first record carries, and entries can skip -- so the two differ on any
 	// real partition. SealWindow derives it the same way, and a bucket whose
 	// range overstated by even one would make BucketFor resolve an offset to the
 	// wrong bucket.
-	mergedLast := sources[len(sources)-1].Base
-	// The range and the key span everything the bucket still holds, not just the
-	// merged prefix: entries after the prefix stay in this bucket.
-	nextLast := mergedLast
-	if len(kept) > 0 {
-		nextLast = refs[len(refs)-1].Base
-	}
+	// The rewritten bucket is described by its contents, not derived from the
+	// sources, so its range and key are whatever it actually holds.
+	contents := make([]SegmentRef, 0, len(kept)+1)
+	contents = append(contents, kept...)
+	contents = append(contents, mergedRef)
+	// Sorted explicitly: a stepped-over entry at the head leaves the merged
+	// segment's base above the bucket's first, and BucketFor binary-searches this
+	// list -- one that is out of order is silently missed.
+	sort.Slice(contents, func(i, j int) bool { return contents[i].Base < contents[j].Base })
+
+	// The bucket's range is unchanged by a merge: it still describes the same
+	// offsets it did before, with the same entries folded into fewer segments.
+	//
+	// Taking it from the contents instead is wrong whenever the pass merged the
+	// whole bucket -- the single merged entry sits at the first source's base,
+	// so the range would collapse onto that base and every offset above it would
+	// fall outside every bucket. SealWindow derives it the same way: the last
+	// entry's base offset, not the last entry's reach.
+	first, last := refs[0].Base, refs[len(refs)-1].Base
 	next := BucketRef{
-		First:  mergedRef.Base,
-		Last:   nextLast,
-		Key:    bucketKey(topic, partition, mergedRef.Base, nextLast),
+		First:  first,
+		Last:   last,
+		Key:    bucketKey(topic, partition, first, last),
 		Bytes:  merged.BytesOut,
 		Newest: mergedRef.Modified,
 	}
 	// The entries this pass did not merge stay in the bucket. Leaving them out
 	// drops them from the index: they would remain in object storage,
 	// unreachable, and a read for their offsets would fail.
-	body, err := json.Marshal(append([]SegmentRef{mergedRef}, kept...))
+	body, err := json.Marshal(contents)
 	if err != nil {
 		return 0, err
 	}
@@ -398,17 +433,19 @@ func (s *StorageEngine) eligibleBuckets(topic string, partition int32, cfg Compa
 }
 
 // mergeRefs downloads the sources, merges them, and returns the result.
-func (s *StorageEngine) mergeRefs(ctx context.Context, topic string, partition int32, sources []SegmentRef, cfg CompactorConfig) (*stagedMerge, error) {
+func (s *StorageEngine) mergeRefs(ctx context.Context, topic string, partition int32, refs []SegmentRef, picked []int, cfg CompactorConfig) (*stagedMerge, []int, error) {
 	dir, err := os.MkdirTemp(cfg.ScratchDir, "compact-*")
 	if err != nil {
-		return nil, fmt.Errorf("scratch dir: %w", err)
+		return nil, nil, fmt.Errorf("scratch dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 
-	paths := make([]string, 0, len(sources))
-	have := make([]SegmentRef, 0, len(sources))
-	for i, ref := range sources {
-		dst := filepath.Join(dir, fmt.Sprintf("src-%06d", i))
+	paths := make([]string, 0, len(picked))
+	have := make([]SegmentRef, 0, len(picked))
+	havePicked := make([]int, 0, len(picked))
+	for k, idx := range picked {
+		ref := refs[idx]
+		dst := filepath.Join(dir, fmt.Sprintf("src-%06d", k))
 		if err := s.downloadSegment(ctx, topic, partition, ref, dst); err != nil {
 			// An index entry whose object is gone cannot be merged, and
 			// aborting on it would retry the same entry on every pass forever --
@@ -424,15 +461,16 @@ func (s *StorageEngine) mergeRefs(ctx context.Context, topic string, partition i
 				s.markManifestDirty(topic, partition)
 				continue
 			}
-			return nil, fmt.Errorf("download %s: %w", segmentKey(topic, partition, ref), err)
+			return nil, nil, fmt.Errorf("download %s: %w", segmentKey(topic, partition, ref), err)
 		}
 		paths = append(paths, dst)
 		have = append(have, ref)
+		havePicked = append(havePicked, idx)
 	}
 	if len(have) < cfg.MinSegments {
-		return nil, fmt.Errorf("fewer than %d of this bucket's segments exist in object storage", cfg.MinSegments)
+		return nil, nil, fmt.Errorf("fewer than %d of this bucket's segments exist in object storage", cfg.MinSegments)
 	}
-	sources = have
+	sources := have
 	// The byte total is taken from what was actually taken. An entry dropped for
 	// being absent is no longer part of the merge, and counting it would fail the
 	// consistency check below for a reason that has nothing to do with the
@@ -445,13 +483,13 @@ func (s *StorageEngine) mergeRefs(ctx context.Context, topic string, partition i
 	out := filepath.Join(dir, "merged.log")
 	res, err := wal.MergeSegments(paths, out, sources[0].Base)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if res.BytesIn != bytesIn {
 		// The index and the objects disagree about how much data this range
 		// holds. Merging anyway would write a bucket whose recorded size is
 		// wrong, and the byte policy would then be reasoning from fiction.
-		return nil, fmt.Errorf("index records %d bytes for this range, objects hold %d", bytesIn, res.BytesIn)
+		return nil, nil, fmt.Errorf("index records %d bytes for this range, objects hold %d", bytesIn, res.BytesIn)
 	}
 
 	// The scratch directory is removed by the defer above, so the merged file is
@@ -459,9 +497,18 @@ func (s *StorageEngine) mergeRefs(ctx context.Context, topic string, partition i
 	merged := filepath.Join(cfg.ScratchDir, fmt.Sprintf("merged-%s-%d-%020d-%020d.log",
 		filepath.Base(dir), partition, sources[0].Base, sources[len(sources)-1].Base))
 	if err := moveFile(out, merged); err != nil {
-		return nil, fmt.Errorf("stage merged segment: %w", err)
+		return nil, nil, fmt.Errorf("stage merged segment: %w", err)
 	}
-	return &stagedMerge{MergeResult: res, Path: merged}, nil
+	return &stagedMerge{MergeResult: res, Path: merged}, havePicked, nil
+}
+
+// refsAt materialises the entries at the given positions in refs.
+func refsAt(refs []SegmentRef, idx []int) []SegmentRef {
+	out := make([]SegmentRef, 0, len(idx))
+	for _, i := range idx {
+		out = append(out, refs[i])
+	}
+	return out
 }
 
 // mergedEpoch picks an epoch above every source's, so the merged object cannot
