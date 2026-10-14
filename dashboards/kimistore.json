@@ -233,7 +233,7 @@
     {
       "type": "stat",
       "title": "Compactor idle",
-      "description": "Seconds since the last merge that consolidated anything. A large value while object count is rising means the compactor has stopped -- which is the failure that once ran silently for eight hours. Pairs with the passes/merges panel below.",
+      "description": "Seconds since the last merge that consolidated anything. A large value while the passes/merges panel is flat means the compactor has stopped -- the failure that once ran silently for eight hours. Shows nothing until the first merge of the process's life, because last_merge is 0 until then and time() minus 0 is the current unix time rather than a duration.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -246,7 +246,7 @@
       },
       "targets": [
         {
-          "expr": "time() - max(kimistore_compactor_last_merge_timestamp_seconds{instance=~\"$agent\"})",
+          "expr": "(time() - max(kimistore_compactor_last_merge_timestamp_seconds{instance=~\"$agent\"})) and (max(kimistore_compactor_last_merge_timestamp_seconds{instance=~\"$agent\"}) > 0)",
           "refId": "A",
           "instant": true
         }
@@ -270,7 +270,8 @@
                 "value": 900
               }
             ]
-          }
+          },
+          "noValue": "no merges yet this process"
         },
         "overrides": []
       },
@@ -518,7 +519,7 @@
     {
       "type": "timeseries",
       "title": "Request latency",
-      "description": "Mean, from the cumulative sum divided by the count. A mean hides tail behaviour, so watch the shape of the line rather than its average.",
+      "description": "Quantiles from the request-time histogram. p99 rather than a mean, because a mean hides exactly the tail that makes a broker slow. This metric is a histogram, so the query has to go through _bucket -- querying the bare name returns nothing at all.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -531,9 +532,19 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(kimistore_request_time_milliseconds_total{instance=~\"$agent\"}[5m])) / clamp_min(sum(rate(kimistore_request_count_total{instance=~\"$agent\"}[5m])), 1e-9)",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(kimistore_request_time_milliseconds_total_bucket{instance=~\"$agent\"}[5m])))",
           "refId": "A",
-          "legendFormat": "mean ms"
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(kimistore_request_time_milliseconds_total_bucket{instance=~\"$agent\"}[5m])))",
+          "refId": "B",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(kimistore_request_time_milliseconds_total_bucket{instance=~\"$agent\"}[5m])))",
+          "refId": "C",
+          "legendFormat": "p99"
         }
       ],
       "fieldConfig": {
@@ -680,7 +691,7 @@
     {
       "type": "timeseries",
       "title": "Object store IO",
-      "description": "Read and write volume against the backing store. This is what the compactor costs, so it is the place to see compaction competing with ingest.",
+      "description": "Read and write volume against the backing store. This is what the compactor costs, so it is the place to see compaction competing with ingest. The direction values are inbound and outbound; read and write return nothing and look identical to a dead target.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -693,14 +704,14 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(kimistore_network_io_bytes_total{instance=~\"$agent\", direction=\"read\"}[5m]))",
+          "expr": "sum(rate(kimistore_network_io_bytes_total{instance=~\"$agent\", direction=\"inbound\"}[5m]))",
           "refId": "A",
-          "legendFormat": "read"
+          "legendFormat": "inbound"
         },
         {
-          "expr": "sum(rate(kimistore_network_io_bytes_total{instance=~\"$agent\", direction=\"write\"}[5m]))",
+          "expr": "sum(rate(kimistore_network_io_bytes_total{instance=~\"$agent\", direction=\"outbound\"}[5m]))",
           "refId": "B",
-          "legendFormat": "write"
+          "legendFormat": "outbound"
         }
       ],
       "fieldConfig": {
@@ -770,9 +781,14 @@
       },
       "targets": [
         {
-          "expr": "max(kimistore_durable_wait_seconds{instance=~\"$agent\"})",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(kimistore_durable_wait_seconds_bucket{instance=~\"$agent\"}[5m])))",
           "refId": "A",
-          "legendFormat": "wait"
+          "legendFormat": "p99"
+        },
+        {
+          "expr": "rate(kimistore_durable_wait_seconds_sum{instance=~\"$agent\"}[5m]) / clamp_min(rate(kimistore_durable_wait_seconds_count{instance=~\"$agent\"}[5m]), 1e-9)",
+          "refId": "B",
+          "legendFormat": "mean"
         }
       ],
       "fieldConfig": {
@@ -780,7 +796,8 @@
           "unit": "s"
         },
         "overrides": []
-      }
+      },
+      "description": "How long an acks=all produce waited for its segment to reach object storage. Also a histogram: the mean is _sum over _count, and the tail comes from _bucket."
     },
     {
       "type": "row",

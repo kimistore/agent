@@ -1,0 +1,133 @@
+# Scrape kimistore's metrics endpoint from Grafana Alloy.
+#
+# Why this shape rather than editing the Alloy config directly:
+#
+# The custom-alloy ConfigMap is Helm-managed (managed-by: Helm, release
+# k8s-observability-monitoring), so any edit to it is reverted on the next
+# `helm upgrade`. Its ServiceMonitor discovery already selects ServiceMonitors
+# cluster-wide and excludes only app.kubernetes.io/name=kube-state-metrics, so a
+# ServiceMonitor added here is discovered with no change to the Helm release at
+# all. That is the difference between a scrape target that survives an upgrade
+# and one that does not.
+#
+# Why a selector-less Service rather than a static scrape block: the same reason,
+# one layer up. A static target list has to live inside the Alloy config, and
+# that is the file Helm owns.
+#
+# kimistore is a systemd service on a host, not a pod, so there is no pod to
+# discover. A Service with no selector plus a hand-written EndpointSlice is the
+# idiomatic way to describe "scrape this address" in a way a Prometheus-operator
+# style discovery mechanism will pick up.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kimistore-metrics
+  namespace: k8s-observability-monitoring
+  labels:
+    app.kubernetes.io/name: kimistore
+    app.kubernetes.io/component: metrics
+  annotations:
+    kimistore/why: >-
+      Selector-less on purpose. kimistore runs as a systemd service on knode3, so
+      there are no pods to select and the endpoint is written by hand below. Do
+      not add a selector: if one is added, Kubernetes will manage the endpoints
+      and overwrite the hand-written one with an empty set.
+spec:
+  ports:
+    - name: metrics
+      port: 9101
+      targetPort: 9101
+      protocol: TCP
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: kimistore-metrics
+  namespace: k8s-observability-monitoring
+  labels:
+    app.kubernetes.io/name: kimistore
+    kubernetes.io/service-name: kimistore-metrics
+    # The controller stamps this on every slice it owns. A hand-written slice
+    # without it is still valid and is still associated with the Service, but
+    # consumers that key off it skip the slice, and skipping it is invisible --
+    # the Service looks like it has endpoints and the target simply never
+    # appears. Set it to match what a controller-managed slice would carry.
+    endpointslice.kubernetes.io/managed-by: endpointslice-controller.k8s.io
+addressType: IPv4
+ports:
+  - name: metrics
+    port: 9101
+    protocol: TCP
+endpoints:
+  - addresses:
+      # knode3. IPv4 rather than knode3.loafoe.net, which resolves to IPv6 from
+      # inside the cluster and would make the target depend on which family the
+      # pod prefers.
+      - 192.168.2.236
+    conditions:
+      ready: true
+---
+# The legacy v1 Endpoints object, written by hand.
+#
+# This is not redundant with the EndpointSlice above, and leaving it out is why
+# nothing was scraped. The ServiceMonitor discovery in this Alloy reads the v1
+# Endpoints API -- its own logs say so, once per poll: "v1 Endpoints is
+# deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice". A Service with no
+# selector gets an empty Endpoints object, because the controller that populates
+# it only runs for Services that select pods, and there are no pods here: this
+# is a systemd service on a host. The EndpointSlice existed and was correct, and
+# was not what anything was reading.
+#
+# Both objects are needed, and they must agree. The EndpointSlice is what modern
+# clients see; the Endpoints object is what this one sees.
+#
+# No selector on the Service, so nothing will overwrite this.
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: kimistore-metrics
+  namespace: k8s-observability-monitoring
+  labels:
+    app.kubernetes.io/name: kimistore
+  annotations:
+    kimistore/why: >-
+      Hand-written because the Service is selector-less. Written to match the
+      EndpointSlice; if the address changes, both must change.
+subsets:
+  - addresses:
+      - ip: 192.168.2.236
+    ports:
+      - name: metrics
+        port: 9101
+        protocol: TCP
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kimistore
+  namespace: k8s-observability-monitoring
+  labels:
+    app.kubernetes.io/name: kimistore
+    app.kubernetes.io/component: metrics
+spec:
+  namespaceSelector:
+    matchNames:
+      - k8s-observability-monitoring
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kimistore
+  endpoints:
+    - port: metrics
+      path: /metrics
+      # Matches the agent's own flush cadence closely enough to see a stalled
+      # compactor, without adding noticeable load on a box that is also running
+      # Mimir's compactor.
+      interval: 30s
+      scrapeTimeout: 10s
+      scheme: http
+  # A stable job name, taken from the Service's own label rather than composed
+  # from namespace and name. Without it the job is named after the ServiceMonitor
+  # and renaming the Service would silently repoint every existing dashboard.
+  jobLabel: app.kubernetes.io/name
