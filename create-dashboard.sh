@@ -12,15 +12,20 @@ TOKFILE=${TOKFILE:-/tmp/gftok}
 [ -r "$TOKFILE" ] || { echo "no token at $TOKFILE"; exit 1; }
 TOKEN=$(cat "$TOKFILE")
 
-BODY=$(python3 - "$DASH" <<'PY'
+BODY=$(python3 - "$DASH" "${2:-}" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
 d.pop("id", None)
 d.pop("url", None)
 d.pop("version", None)
 d["id"] = None
-print(json.dumps({"dashboard": d, "folderUid": sys.argv[2] if len(sys.argv) > 2 else "kimistore",
-                  "overwrite": True}))
+payload = {"dashboard": d, "overwrite": True}
+# An empty or "none" folder argument means unfiled. Sending a folderUid that
+# does not exist is a 400, which is what happens when the folder was just
+# deleted but the argument is still on the command line.
+if sys.argv[2] and sys.argv[2].lower() != "none":
+    payload["folderUid"] = sys.argv[2]
+print(json.dumps(payload))
 PY
 )
 

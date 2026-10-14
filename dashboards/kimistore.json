@@ -1,11 +1,8 @@
 {
   "uid": "kimistore",
   "title": "Kimistore",
-  "description": "Operational view of the kimistore broker on knode3. Built one panel at a time -- a 24-panel version of this dashboard crashed the browser with a RangeError, so each panel is added only after it has been confirmed to load.",
-  "tags": ["kimistore", "mimir", "storage"],
-  "timezone": "browser",
+  "description": "Empty by design. Rebuilt one step at a time after a larger version crashed the browser.",
   "editable": true,
-  "graphTooltip": 1,
   "schemaVersion": 39,
   "version": 1,
   "refresh": "30s",
@@ -13,72 +10,7 @@
     "from": "now-6h",
     "to": "now"
   },
-  "panels": [
-    {
-      "type": "stat",
-      "title": "Agent live",
-      "description": "1 when the agent reports itself live. Anything else means the process is up but not serving.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dg0i3veoyn5z4b"
-      },
-      "gridPos": {
-        "h": 5,
-        "w": 6,
-        "x": 0,
-        "y": 0
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dg0i3veoyn5z4b"
-          },
-          "editorMode": "code",
-          "expr": "max(kimistore_agent_live)",
-          "instant": true,
-          "range": false,
-          "legendFormat": "live"
-        }
-      ],
-      "options": {
-        "reduceOptions": {
-          "calcs": ["lastNotNull"],
-          "fields": "",
-          "values": false
-        },
-        "orientation": "auto",
-        "textMode": "auto",
-        "colorMode": "background",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "wideLayout": true
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "0": { "text": "DOWN", "color": "red" },
-                "1": { "text": "UP", "color": "green" }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "green", "value": 1 }
-            ]
-          }
-        },
-        "overrides": []
-      }
-    }
-  ],
+  "panels": [],
   "annotations": {
     "list": [
       {
