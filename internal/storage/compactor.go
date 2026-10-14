@@ -46,11 +46,11 @@ type CompactorConfig struct {
 	Disabled bool
 	// Interval is how often a partition is considered for compaction.
 	//
-	// The default is a minute because the pass is cheap -- it merges up to
-	// MaxMergedBytes, a few seconds of I/O -- and the interval is what decides
-	// whether compaction keeps pace with ingest. At fifteen minutes against this
-	// workload's 3,200 segments an hour, one pass could not come close; the
-	// budget has to be spent in the time available or the backlog never clears.
+	// The default is a minute because the interval decides how often a partition
+	// is reconsidered, and at fifteen minutes against this workload a backlog
+	// took hours to clear. A pass now consolidates repeatedly until its own
+	// MaxPassDuration runs out or the queue empties, so the interval only sets
+	// the floor between sweeps, not the rate of work.
 	Interval time.Duration
 	// MinSegments is how many segments must be covered before a merge is worth
 	// doing. Merging two segments into one halves the object count and costs a
@@ -61,6 +61,16 @@ type CompactorConfig struct {
 	// writer's roll threshold: a merged segment that is larger than what the
 	// writer would produce is not what anything downstream expects.
 	MaxMergedBytes int64
+	// MaxPassDuration bounds how long one pass keeps consolidating before
+	// yielding to the next tick.
+	//
+	// It is wall-clock rather than a merge count because the useful bound is the
+	// one that stops the compactor monopolising the disk, and how many merges fit
+	// in that depends on the object store. Thirty seconds against a one minute
+	// interval leaves room for ingest between passes while still clearing a
+	// backlog in minutes rather than hours; once the queue is empty the loop exits
+	// on its own and the budget is never reached.
+	MaxPassDuration time.Duration
 	// ScratchDir is where segments are staged during a merge.
 	ScratchDir string
 }
@@ -74,6 +84,9 @@ func (c CompactorConfig) withDefaults() CompactorConfig {
 	}
 	if c.MaxMergedBytes <= 0 {
 		c.MaxMergedBytes = wal.MaxSegmentSize
+	}
+	if c.MaxPassDuration <= 0 {
+		c.MaxPassDuration = 30 * time.Second
 	}
 	return c
 }
@@ -146,20 +159,97 @@ func (s *StorageEngine) compactorLoop() {
 // first case and is flat in the second, and only the second is a fault.
 func (s *StorageEngine) compactorPass(topic string, partition int32) {
 	metrics.CompactorPasses.Inc()
-	n, err := s.compactPartition(context.Background(), topic, partition)
-	switch {
-	case err != nil:
-		metrics.CompactorPassErrors.Inc()
-		log.Printf("Compactor: %s/%d: %v", topic, partition, err)
-	case n > 0:
-		metrics.CompactorMerges.Inc()
-		metrics.CompactorSegmentsMerged.Add(float64(n))
-		// Set last, and only on a real merge. An idle pass leaves the value
-		// alone, so a stale timestamp means "no merge in a long time" -- which is
-		// the condition worth alerting on.
-		metrics.CompactorLastMergeTimestamp.SetToCurrentTime()
-		log.Printf("Compactor: %s/%d merged %d segment(s)", topic, partition, n)
+
+	// Keep merging until the queue is empty or the budget runs out.
+	//
+	// One merge per tick was an arbitrary cap, and an expensive one: each merge
+	// consolidates roughly 200 segments, and on knode3 a minute of ingest adds
+	// only about 60, so a single merge per interval is already a surplus. It just
+	// spends it slowly. Against a backlog of a dozen full buckets the pass had
+	// 49,000 segments to reclaim and could reach 198 of them a minute, which is
+	// hours of queueing to reclaim data that was never in doubt, while the
+	// compactor sat idle through 95% of every interval.
+	//
+	// Each merge is its own transaction -- merged segment, then bucket, then the
+	// index swap that commits it, then the marker, then the sources -- so
+	// repeating them changes throughput and nothing about what survives a crash
+	// mid-pass. The loop re-reads the index through compactPartition on every
+	// iteration rather than carrying state across merges, so it cannot merge
+	// against a view that a previous merge invalidated.
+	//
+	// The bound is wall-clock, not a count. A count would mean the same thing on
+	// a fast object store and a slow one; the time budget is what keeps the
+	// compactor from monopolising the disk it is compacting onto. Progress is
+	// guaranteed independently of it: a merge replaces its sources with one
+	// segment, and a segment at least half the cap is never itself a source, so
+	// each iteration strictly reduces the number of mergeable entries.
+	cfg := s.compactorCfg.withDefaults()
+	deadline := time.Now().Add(cfg.MaxPassDuration)
+	ctx := context.Background()
+
+	var merges, segments int
+	for {
+		n, err := s.compactPartition(ctx, topic, partition)
+		switch {
+		case err != nil:
+			// Stop rather than continue. A failure here is a store problem, and
+			// retrying it in a tight loop would turn one error into a spin.
+			metrics.CompactorPassErrors.Inc()
+			log.Printf("Compactor: %s/%d: %v", topic, partition, err)
+			if merges > 0 {
+				recordPass(work{merges: merges, segments: segments})
+				log.Printf("Compactor: %s/%d merged %d run(s), %d segment(s) before failing",
+					topic, partition, merges, segments)
+			}
+			return
+		case n == 0:
+			if merges == 0 {
+				return
+			}
+			recordPass(work{merges: merges, segments: segments})
+			log.Printf("Compactor: %s/%d merged %d run(s), %d segment(s)",
+				topic, partition, merges, segments)
+			return
+		}
+
+		merges++
+		segments += n
+
+		// Checked after the merge, so the budget is never spent on nothing: a
+		// pass always completes the merge it started.
+		if time.Now().After(deadline) {
+			metrics.CompactorPassBudgetExhausted.Inc()
+			log.Printf("Compactor: %s/%d merged %d run(s), %d segment(s) before its %s budget",
+				topic, partition, merges, segments, cfg.MaxPassDuration)
+			recordPass(work{merges: merges, segments: segments})
+			return
+		}
 	}
+}
+
+// work is one pass's tally of what it consolidated.
+type work struct {
+	merges   int
+	segments int
+}
+
+// recordPass publishes a pass's tally.
+//
+// The metrics count merges, not passes that merged. While a pass was a single
+// merge the two were the same number and the distinction was invisible; with a
+// pass doing many, counting the pass would flatten merges against passes and
+// destroy the difference the liveness alert reads -- a pass that did thirty
+// merges and a pass that did one would look identical.
+func recordPass(w work) {
+	if w.merges == 0 {
+		return
+	}
+	metrics.CompactorMerges.Add(float64(w.merges))
+	metrics.CompactorSegmentsMerged.Add(float64(w.segments))
+	// Set last, and only on a real merge. An idle pass leaves the value alone, so
+	// a stale timestamp means "no merge in a long time" -- the condition worth
+	// alerting on.
+	metrics.CompactorLastMergeTimestamp.SetToCurrentTime()
 }
 
 // compactionMarker names the object that records which sources a merge replaced.

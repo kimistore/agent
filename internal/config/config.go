@@ -173,8 +173,16 @@ type LeaseConfig struct {
 // environment so the interval can be tuned against a measured ingest rate
 // without a rebuild.
 type CompactionConfig struct {
-	Enabled  bool
+	Enabled bool
+	// Interval is the floor between sweeps of a partition.
 	Interval time.Duration
+	// PassBudget is how long one sweep keeps consolidating before yielding.
+	//
+	// The two are separate because they answer different questions: the interval
+	// is how often the compactor looks at a partition, and the budget is how much
+	// it does once it looks. A long budget with a long interval starves a backlog;
+	// a short budget with a short interval never clears one.
+	PassBudget time.Duration
 }
 
 type RetentionConfig struct {
@@ -207,6 +215,11 @@ func FromEnv() Config {
 		Compaction: CompactionConfig{
 			Enabled:  !envBool("KIMISTORE_COMPACTION_DISABLED", false),
 			Interval: time.Duration(envInt64("KIMISTORE_COMPACTION_INTERVAL_MS", 60_000)) * time.Millisecond,
+			// Half the interval by default, so a backlog is worked continuously and
+			// the compactor still leaves half of every period for ingest. A budget
+			// longer than the interval gains nothing: the next tick simply cannot
+			// start until this one finishes.
+			PassBudget: time.Duration(envInt64("KIMISTORE_COMPACTION_PASS_BUDGET_MS", 30_000)) * time.Millisecond,
 		},
 
 		Lease: LeaseConfig{

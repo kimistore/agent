@@ -11,6 +11,50 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.18
+
+A compaction pass now consolidates repeatedly instead of exactly once.
+
+### Changed
+
+- A pass merges until its queue is empty or its time budget runs out, rather
+  than performing a single merge per interval
+
+  One merge per tick was an arbitrary cap and an expensive one. Each merge
+  consolidates roughly 200 segments against an ingest rate of about 60 a minute,
+  so a single merge was already a surplus -- it was just being spent slowly. With
+  a dozen full buckets queued on knode3, a pass had 49,000 segments to reclaim and
+  could reach 198 of them a minute: hours of queueing to reclaim data that was
+  never in doubt, while the compactor idled through 95% of every interval
+
+  The bound is `KIMISTORE_COMPACTION_PASS_BUDGET_MS`, default 30s, half the
+  interval. Wall-clock rather than a merge count, because the useful bound is
+  the one that stops the compactor monopolising the disk it is compacting onto,
+  and how many merges fit in that depends on the object store. Once the queue is
+  empty the loop exits on its own and the budget is never reached
+
+  Repeating the merges changes throughput and nothing about what survives a
+  crash: each is its own transaction -- merged segment, bucket, index swap, then
+  marker, then sources -- and the loop re-reads the index on every iteration
+  rather than carrying state across merges, so it cannot merge against a view a
+  previous merge invalidated. Progress does not depend on the budget either: a
+  merge replaces its sources with one segment, and a segment at least half the
+  cap is never itself a source, so each iteration strictly reduces the mergeable
+  entries
+
+- `kimistore_compactor_merges_total` counts merges rather than passes that
+  merged. While a pass was one merge the two were the same number; with a pass
+  doing many, counting the pass would flatten merges against passes and destroy
+  the distinction the liveness alert reads -- a pass that did thirty merges and a
+  pass that did one would look identical
+
+### Added
+
+- `kimistore_compactor_budget_exhausted_total`, counting passes that stopped on
+  their budget with work still queued. A pass that runs out must be
+  distinguishable from one that found the queue empty, or "still behind" and
+  "caught up" report the same way
+
 ## 1.0.17
 
 Compaction liveness is now observable without reading logs.

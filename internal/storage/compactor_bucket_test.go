@@ -361,6 +361,7 @@ func TestCompactor_ReportsLivenessThroughMetrics(t *testing.T) {
 		WithCompactor(CompactorConfig{
 			Interval: time.Hour, MinSegments: 4,
 			MaxMergedBytes: 32 * 1024, ScratchDir: t.TempDir(),
+			MaxPassDuration: time.Minute,
 		}))
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
@@ -373,46 +374,35 @@ func TestCompactor_ReportsLivenessThroughMetrics(t *testing.T) {
 	}
 	passesBefore := testutil.ToFloat64(metrics.CompactorPasses)
 	mergesBefore := testutil.ToFloat64(metrics.CompactorMerges)
+	segmentsBefore := testutil.ToFloat64(metrics.CompactorSegmentsMerged)
 
 	seedBucketSized(t, engine, store.inner, "orders", 0, 1000, 120, 1024)
 	seedBucketSized(t, engine, store.inner, "orders", 0, 2000, 120, 1024)
 	seedBucketSized(t, engine, store.inner, "orders", 0, 3000, 120, 1024)
 
-	// Drain it, recording each pass the way the loop records it. The cap is
-	// applied per selection, so several passes are needed before the backlog is
-	// gone; each one is a merge.
-	for pass := 0; ; pass++ {
-		if pass > 100 {
-			t.Fatal("backlog did not drain")
-		}
-		engine.compactorPass("orders", 0)
-		// The merge counter is what says whether the pass found work; the pass
-		// counter moves either way.
-		if testutil.ToFloat64(metrics.CompactorMerges) == mergesBefore+float64(pass+1) {
-			continue
-		}
-		break
-	}
+	// One pass, which now consolidates repeatedly until the queue is empty.
+	engine.compactorPass("orders", 0)
 
 	if got := testutil.ToFloat64(metrics.CompactorPasses); got <= passesBefore {
 		t.Error("a pass did not increment the pass counter")
 	}
 	if got := testutil.ToFloat64(metrics.CompactorMerges); got <= mergesBefore {
-		t.Error("a successful merge did not increment the merge counter")
+		t.Error("a pass that merged did not increment the merge counter")
 	}
-	if got := testutil.ToFloat64(metrics.CompactorSegmentsMerged); got < 4 {
-		t.Errorf("segments-merged gauge is %v, want the merged run", got)
+	if got := testutil.ToFloat64(metrics.CompactorSegmentsMerged); got <= segmentsBefore {
+		t.Error("a pass that merged did not count the segments it reclaimed")
 	}
 	if got := testutil.ToFloat64(metrics.CompactorLastMergeTimestamp); got == 0 {
 		t.Error("a successful merge did not set the last-merge timestamp")
 	}
 
-	// Now the backlog is gone. A pass that finds nothing must still count as a
-	// pass and must not move the last-merge time. That difference is the signal:
-	// passes climbing with merges flat means the compactor is running and idle;
-	// passes flat means it has stopped.
+	// The queue is empty now. A pass that finds nothing must still count as a
+	// pass and must not move the merge counters or the last-merge time. That
+	// difference is the signal: passes climbing with merges flat means the
+	// compactor is running and idle; passes flat means it has stopped.
 	passesBefore = testutil.ToFloat64(metrics.CompactorPasses)
 	mergesBefore = testutil.ToFloat64(metrics.CompactorMerges)
+	segmentsBefore = testutil.ToFloat64(metrics.CompactorSegmentsMerged)
 	lastBefore := testutil.ToFloat64(metrics.CompactorLastMergeTimestamp)
 
 	engine.compactorPass("orders", 0)
@@ -422,6 +412,9 @@ func TestCompactor_ReportsLivenessThroughMetrics(t *testing.T) {
 	}
 	if testutil.ToFloat64(metrics.CompactorMerges) != mergesBefore {
 		t.Error("an idle pass was counted as a merge")
+	}
+	if testutil.ToFloat64(metrics.CompactorSegmentsMerged) != segmentsBefore {
+		t.Error("an idle pass counted segments")
 	}
 	if testutil.ToFloat64(metrics.CompactorLastMergeTimestamp) != lastBefore {
 		t.Error("an idle pass moved the last-merge timestamp")
@@ -448,5 +441,101 @@ func TestCompactor_ReportsLivenessThroughMetrics(t *testing.T) {
 	}
 	if testutil.ToFloat64(metrics.CompactorLastMergeTimestamp) != lastBefore {
 		t.Error("a failing pass moved the last-merge timestamp")
+	}
+}
+
+// A pass consolidates repeatedly, not once.
+//
+// One merge per tick capped the compactor at one 16MB merge a minute against a
+// workload adding a segment a second -- a surplus, but spent so slowly that a
+// twelve-bucket backlog took hours. The loop is what turns that into minutes.
+func TestCompactorPass_ConsolidatesRepeatedlyUntilTheQueueIsEmpty(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{},
+		WithCompactor(CompactorConfig{
+			Interval: time.Hour, MinSegments: 4,
+			MaxMergedBytes: 32 * 1024, ScratchDir: t.TempDir(),
+			MaxPassDuration: time.Minute,
+		}))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer engine.Close()
+
+	for _, base := range []int64{1000, 2000, 3000, 4000, 5000} {
+		seedBucketSized(t, engine, store.inner, "orders", 0, base, 120, 1024)
+	}
+
+	mergesBefore := testutil.ToFloat64(metrics.CompactorMerges)
+	segmentsBefore := testutil.ToFloat64(metrics.CompactorSegmentsMerged)
+
+	engine.compactorPass("orders", 0)
+
+	merges := testutil.ToFloat64(metrics.CompactorMerges) - mergesBefore
+	segments := testutil.ToFloat64(metrics.CompactorSegmentsMerged) - segmentsBefore
+
+	// Five buckets of 120 one-KB entries against a 32KB cap is about 31 entries
+	// per merge, so roughly nineteen merges. One merge per pass would have done
+	// one; the loop must do nearly all of them in a single pass.
+	if merges < 15 {
+		t.Errorf("one pass performed %.0f merges, want it to consolidate most of the backlog in one pass", merges)
+	}
+	if segments < 400 {
+		t.Errorf("one pass reclaimed %.0f of %d seeded segments", segments, 5*120)
+	}
+
+	// A second pass has nothing left to do.
+	mergesBefore = testutil.ToFloat64(metrics.CompactorMerges)
+	engine.compactorPass("orders", 0)
+	if got := testutil.ToFloat64(metrics.CompactorMerges) - mergesBefore; got != 0 {
+		t.Errorf("a second pass merged %.0f more; the first pass left work behind", got)
+	}
+}
+
+// The pass stops on its time budget, with the work still queued and the merges
+// already done still recorded.
+//
+// The budget is what stops a backlog from turning into an unbounded burst of I/O.
+// A pass that runs out must not discard what it finished, and must say that work
+// remains rather than looking identical to one that found the queue empty.
+func TestCompactorPass_StopsOnItsBudgetAndKeepsWhatItMerged(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{},
+		WithCompactor(CompactorConfig{
+			Interval: time.Hour, MinSegments: 4,
+			MaxMergedBytes: 32 * 1024, ScratchDir: t.TempDir(),
+			// Already spent, so the first merge exhausts it.
+			MaxPassDuration: time.Nanosecond,
+		}))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer engine.Close()
+
+	for _, base := range []int64{1000, 2000, 3000} {
+		seedBucketSized(t, engine, store.inner, "orders", 0, base, 120, 1024)
+	}
+
+	mergesBefore := testutil.ToFloat64(metrics.CompactorMerges)
+	budgetBefore := testutil.ToFloat64(metrics.CompactorPassBudgetExhausted)
+
+	engine.compactorPass("orders", 0)
+
+	if got := testutil.ToFloat64(metrics.CompactorMerges) - mergesBefore; got != 1 {
+		t.Errorf("a spent budget performed %.0f merges, want the one it started", got)
+	}
+	if got := testutil.ToFloat64(metrics.CompactorPassBudgetExhausted) - budgetBefore; got != 1 {
+		t.Errorf("budget-exhausted counter moved by %.0f, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.CompactorLastMergeTimestamp); got == 0 {
+		t.Error("the merge the budget allowed was not recorded")
+	}
+
+	// The queue is untouched behind it, so the next pass continues where this
+	// one stopped.
+	mergesBefore = testutil.ToFloat64(metrics.CompactorMerges)
+	engine.compactorPass("orders", 0)
+	if got := testutil.ToFloat64(metrics.CompactorMerges) - mergesBefore; got != 1 {
+		t.Errorf("the next pass merged %.0f, want it to carry on from where the budget stopped", got)
 	}
 }

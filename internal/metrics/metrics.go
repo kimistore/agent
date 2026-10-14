@@ -112,11 +112,15 @@ var (
 	})
 	CompactorMerges = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "kimistore_compactor_merges_total",
-		Help: "Compaction passes that consolidated at least one run of segments",
+		Help: "Segment runs consolidated into merged segments. One pass may do many",
 	})
 	CompactorSegmentsMerged = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "kimistore_compactor_segments_merged_total",
 		Help: "Total source segments consolidated into merged segments",
+	})
+	CompactorPassBudgetExhausted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_compactor_budget_exhausted_total",
+		Help: "Passes that stopped on their time budget with work still queued",
 	})
 	CompactorLastMergeTimestamp = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "kimistore_compactor_last_merge_timestamp_seconds",
