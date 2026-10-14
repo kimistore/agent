@@ -15,33 +15,6 @@
     "from": "now-6h",
     "to": "now"
   },
-  "templating": {
-    "list": [
-      {
-        "name": "datasource",
-        "type": "datasource",
-        "query": "prometheus",
-        "current": {
-          "text": "mimir-trial",
-          "value": "dg0i3veoyn5z4b"
-        },
-        "hide": 0
-      },
-      {
-        "name": "agent",
-        "type": "query",
-        "datasource": {
-          "type": "prometheus",
-          "uid": "${datasource}"
-        },
-        "query": "label_values(kimistore_agent_live, instance)",
-        "refresh": 1,
-        "includeAll": true,
-        "multi": true,
-        "hide": 0
-      }
-    ]
-  },
   "panels": [
     {
       "type": "row",
@@ -61,7 +34,7 @@
       "description": "1 when the agent reports itself live. Anything else means the process is up but not serving.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 4,
@@ -71,7 +44,7 @@
       },
       "targets": [
         {
-          "expr": "max(kimistore_agent_live{instance=~\"$agent\"})",
+          "expr": "max(kimistore_agent_live{instance=\"192.168.2.236:9101\"})",
           "refId": "A",
           "instant": true
         }
@@ -127,7 +100,6 @@
         "wideLayout": true
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -136,7 +108,7 @@
       "description": "Build info. Useful when a change was deployed and you are not sure it is the one running.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 4,
@@ -146,7 +118,7 @@
       },
       "targets": [
         {
-          "expr": "max by (version) (kimistore_build_info{instance=~\"$agent\"})",
+          "expr": "max by (version) (kimistore_build_info{instance=\"192.168.2.236:9101\"})",
           "refId": "A",
           "instant": true,
           "format": "table"
@@ -184,7 +156,6 @@
         "wideLayout": true
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -193,7 +164,7 @@
       "description": "Owned against the partition count known to the cluster. A shortfall means ownership is not fully settled.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 4,
@@ -203,13 +174,13 @@
       },
       "targets": [
         {
-          "expr": "sum(kimistore_partitions_owned{instance=~\"$agent\"})",
+          "expr": "sum(kimistore_partitions_owned{instance=\"192.168.2.236:9101\"})",
           "refId": "A",
           "instant": true,
           "legendFormat": "owned"
         },
         {
-          "expr": "sum(kimistore_partition_total_count{instance=~\"$agent\"})",
+          "expr": "sum(kimistore_partition_total_count{instance=\"192.168.2.236:9101\"})",
           "refId": "B",
           "instant": true,
           "legendFormat": "total"
@@ -247,7 +218,6 @@
         "wideLayout": true
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -256,7 +226,7 @@
       "description": "Written-minus-committed for the compactor. Zero in steady state; a value that only rises is a merge that wrote a segment and never committed it, which nothing else will ever collect. This is the gauge that would have caught the 4GB of stranded segments.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 4,
@@ -266,7 +236,7 @@
       },
       "targets": [
         {
-          "expr": "max(kimistore_compactor_uncommitted_merged_segments{instance=~\"$agent\"})",
+          "expr": "max(kimistore_compactor_uncommitted_merged_segments{instance=\"192.168.2.236:9101\"})",
           "refId": "A",
           "instant": true
         }
@@ -308,7 +278,6 @@
         "wideLayout": true
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -317,7 +286,7 @@
       "description": "Seconds since the last merge that consolidated anything. A large value while the passes/merges panel is flat means the compactor has stopped -- the failure that once ran silently for eight hours. Shows nothing until the first merge of the process's life, because last_merge is 0 until then and time() minus 0 is the current unix time rather than a duration.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 4,
@@ -327,7 +296,7 @@
       },
       "targets": [
         {
-          "expr": "(time() - max(kimistore_compactor_last_merge_timestamp_seconds{instance=~\"$agent\"})) and (max(kimistore_compactor_last_merge_timestamp_seconds{instance=~\"$agent\"}) > 0)",
+          "expr": "(time() - max(kimistore_compactor_last_merge_timestamp_seconds{instance=\"192.168.2.236:9101\"})) and (max(kimistore_compactor_last_merge_timestamp_seconds{instance=\"192.168.2.236:9101\"}) > 0)",
           "refId": "A",
           "instant": true
         }
@@ -374,7 +343,6 @@
         "wideLayout": true
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -383,7 +351,7 @@
       "description": "Everything that should stay flat. Any sustained non-zero line here is a fault, not background noise.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -393,57 +361,57 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(kimistore_offset_flush_failures_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_offset_flush_failures_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "A",
           "legendFormat": "offset flush"
         },
         {
-          "expr": "sum(rate(kimistore_ownership_claim_failures_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_ownership_claim_failures_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "B",
           "legendFormat": "ownership claim"
         },
         {
-          "expr": "sum(rate(kimistore_durable_timeouts_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_durable_timeouts_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "C",
           "legendFormat": "durable timeout"
         },
         {
-          "expr": "sum(rate(kimistore_object_store_timeouts_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_object_store_timeouts_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "D",
           "legendFormat": "object store timeout"
         },
         {
-          "expr": "sum(rate(kimistore_lease_renewal_failures_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_lease_renewal_failures_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "E",
           "legendFormat": "lease renewal"
         },
         {
-          "expr": "sum(rate(kimistore_wal_recovery_truncations_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_wal_recovery_truncations_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "F",
           "legendFormat": "wal truncation"
         },
         {
-          "expr": "sum(rate(kimistore_compactor_pass_errors_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_compactor_pass_errors_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "G",
           "legendFormat": "compactor pass"
         },
         {
-          "expr": "sum(rate(kimistore_ownership_renewal_failures_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_ownership_renewal_failures_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "H",
           "legendFormat": "ownership renewal"
         },
         {
-          "expr": "sum(rate(kimistore_manifest_writes_rejected_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_manifest_writes_rejected_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "I",
           "legendFormat": "manifest write rejected"
         },
         {
-          "expr": "sum(rate(kimistore_lease_refused_writes_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_lease_refused_writes_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "J",
           "legendFormat": "lease refused writes"
         },
         {
-          "expr": "sum(rate(kimistore_ownership_refused_writes_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_ownership_refused_writes_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "K",
           "legendFormat": "ownership refused writes"
         }
@@ -477,7 +445,6 @@
         }
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -486,7 +453,7 @@
       "description": "The liveness signal. Passes climbing with merges flat means the compactor is running and idle. Passes flat means it has stopped -- and on its own that is indistinguishable from a healthy idle compactor unless both are on the same axes, which is why they are here together rather than as separate panels.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -496,17 +463,17 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(kimistore_compactor_passes_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_compactor_passes_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "A",
           "legendFormat": "passes"
         },
         {
-          "expr": "sum(rate(kimistore_compactor_merges_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_compactor_merges_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "B",
           "legendFormat": "merges"
         },
         {
-          "expr": "sum(rate(kimistore_compactor_merge_commits_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_compactor_merge_commits_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "C",
           "legendFormat": "commits"
         }
@@ -540,7 +507,6 @@
         }
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -549,7 +515,7 @@
       "description": "Segments written and reclaimed, against passes that hit their time budget. A budget-exhausted rate matching the pass rate means the compactor is throughput-limited; zero while passes climb means it is simply idle.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -559,22 +525,22 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(kimistore_compactor_merged_segments_written_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_compactor_merged_segments_written_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "A",
           "legendFormat": "segments written"
         },
         {
-          "expr": "sum(rate(kimistore_compactor_segments_merged_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_compactor_segments_merged_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "B",
           "legendFormat": "segments reclaimed"
         },
         {
-          "expr": "sum(rate(kimistore_compactor_budget_exhausted_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_compactor_budget_exhausted_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "C",
           "legendFormat": "passes budget-exhausted"
         },
         {
-          "expr": "sum(rate(kimistore_compactor_passes_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_compactor_passes_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "D",
           "legendFormat": "passes"
         }
@@ -608,7 +574,6 @@
         }
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -628,7 +593,7 @@
       "title": "Request rate",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -638,7 +603,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(kimistore_request_count_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_request_count_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "A",
           "legendFormat": "requests"
         }
@@ -673,7 +638,6 @@
       },
       "transparent": false,
       "description": "",
-      "interval": null,
       "links": []
     },
     {
@@ -681,7 +645,7 @@
       "title": "Ingest throughput",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -691,12 +655,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(kimistore_request_size_bytes_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_request_size_bytes_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "A",
           "legendFormat": "bytes in"
         },
         {
-          "expr": "sum(rate(kimistore_uploader_bytes_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_uploader_bytes_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "B",
           "legendFormat": "bytes uploaded"
         }
@@ -731,7 +695,6 @@
       },
       "transparent": false,
       "description": "",
-      "interval": null,
       "links": []
     },
     {
@@ -740,7 +703,7 @@
       "description": "Quantiles from the request-time histogram. p99 rather than a mean, because a mean hides exactly the tail that makes a broker slow. This metric is a histogram, so the query has to go through _bucket -- querying the bare name returns nothing at all.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -750,17 +713,17 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(kimistore_request_time_milliseconds_total_bucket{instance=~\"$agent\"}[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(kimistore_request_time_milliseconds_total_bucket{instance=\"192.168.2.236:9101\"}[5m])))",
           "refId": "A",
           "legendFormat": "p50"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(kimistore_request_time_milliseconds_total_bucket{instance=~\"$agent\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(kimistore_request_time_milliseconds_total_bucket{instance=\"192.168.2.236:9101\"}[5m])))",
           "refId": "B",
           "legendFormat": "p95"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(kimistore_request_time_milliseconds_total_bucket{instance=~\"$agent\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(kimistore_request_time_milliseconds_total_bucket{instance=\"192.168.2.236:9101\"}[5m])))",
           "refId": "C",
           "legendFormat": "p99"
         }
@@ -794,7 +757,6 @@
         }
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -803,7 +765,7 @@
       "description": "Segments in flight. A queue that climbs without draining is backpressure on the object store.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -813,7 +775,7 @@
       },
       "targets": [
         {
-          "expr": "max(kimistore_uploader_in_flight_count{instance=~\"$agent\"})",
+          "expr": "max(kimistore_uploader_in_flight_count{instance=\"192.168.2.236:9101\"})",
           "refId": "A",
           "legendFormat": "in flight"
         }
@@ -847,7 +809,6 @@
         }
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -856,7 +817,7 @@
       "description": "Missed events. Non-zero means the uploader dropped work.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -866,12 +827,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(kimistore_uploader_missed_events_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_uploader_missed_events_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "A",
           "legendFormat": "missed"
         },
         {
-          "expr": "sum(rate(kimistore_uploader_task_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_uploader_task_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "B",
           "legendFormat": "tasks"
         }
@@ -905,7 +866,6 @@
         }
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -913,7 +873,7 @@
       "title": "Connections",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -923,7 +883,7 @@
       },
       "targets": [
         {
-          "expr": "max(kimistore_server_connection_count{instance=~\"$agent\"})",
+          "expr": "max(kimistore_server_connection_count{instance=\"192.168.2.236:9101\"})",
           "refId": "A",
           "legendFormat": "connections"
         }
@@ -958,7 +918,6 @@
       },
       "transparent": false,
       "description": "",
-      "interval": null,
       "links": []
     },
     {
@@ -979,7 +938,7 @@
       "description": "Consolidation against deletion. The object count only falls when merges outpace what retention removes; when these flatten together the count is at steady state.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -989,17 +948,17 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(kimistore_compactor_segments_merged_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_compactor_segments_merged_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "A",
           "legendFormat": "segments merged"
         },
         {
-          "expr": "sum(rate(kimistore_retention_segments_deleted_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_retention_segments_deleted_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "B",
           "legendFormat": "segments deleted"
         },
         {
-          "expr": "sum(rate(kimistore_objects_reconciled_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_objects_reconciled_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "C",
           "legendFormat": "reconciled"
         }
@@ -1033,7 +992,6 @@
         }
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -1042,7 +1000,7 @@
       "description": "Read and write volume against the backing store. This is what the compactor costs, so it is the place to see compaction competing with ingest. The direction values are inbound and outbound; read and write return nothing and look identical to a dead target.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -1052,12 +1010,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(kimistore_network_io_bytes_total{instance=~\"$agent\", direction=\"inbound\"}[5m]))",
+          "expr": "sum(rate(kimistore_network_io_bytes_total{instance=\"192.168.2.236:9101\", direction=\"inbound\"}[5m]))",
           "refId": "A",
           "legendFormat": "inbound"
         },
         {
-          "expr": "sum(rate(kimistore_network_io_bytes_total{instance=~\"$agent\", direction=\"outbound\"}[5m]))",
+          "expr": "sum(rate(kimistore_network_io_bytes_total{instance=\"192.168.2.236:9101\", direction=\"outbound\"}[5m]))",
           "refId": "B",
           "legendFormat": "outbound"
         }
@@ -1091,7 +1049,6 @@
         }
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -1112,7 +1069,7 @@
       "description": "Flush interval is a durability bound for acks=all, not a size target. Flush rate tracking request rate means the bound is being met; a gap means writes are waiting.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -1122,12 +1079,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(kimistore_durable_flushes_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_durable_flushes_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "A",
           "legendFormat": "flushes"
         },
         {
-          "expr": "sum(rate(kimistore_offsets_flushed_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_offsets_flushed_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "B",
           "legendFormat": "offsets flushed"
         }
@@ -1161,7 +1118,6 @@
         }
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -1169,7 +1125,7 @@
       "title": "Durable wait",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -1179,12 +1135,12 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(kimistore_durable_wait_seconds_bucket{instance=~\"$agent\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(kimistore_durable_wait_seconds_bucket{instance=\"192.168.2.236:9101\"}[5m])))",
           "refId": "A",
           "legendFormat": "p99"
         },
         {
-          "expr": "rate(kimistore_durable_wait_seconds_sum{instance=~\"$agent\"}[5m]) / clamp_min(rate(kimistore_durable_wait_seconds_count{instance=~\"$agent\"}[5m]), 1e-9)",
+          "expr": "rate(kimistore_durable_wait_seconds_sum{instance=\"192.168.2.236:9101\"}[5m]) / clamp_min(rate(kimistore_durable_wait_seconds_count{instance=\"192.168.2.236:9101\"}[5m]), 1e-9)",
           "refId": "B",
           "legendFormat": "mean"
         }
@@ -1219,7 +1175,6 @@
         }
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -1239,7 +1194,7 @@
       "title": "Topics",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 4,
@@ -1249,7 +1204,7 @@
       },
       "targets": [
         {
-          "expr": "max(kimistore_topic_count{instance=~\"$agent\"})",
+          "expr": "max(kimistore_topic_count{instance=\"192.168.2.236:9101\"})",
           "refId": "A",
           "instant": true
         }
@@ -1287,7 +1242,6 @@
       },
       "transparent": false,
       "description": "",
-      "interval": null,
       "links": []
     },
     {
@@ -1295,7 +1249,7 @@
       "title": "Agents live",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 4,
@@ -1305,7 +1259,7 @@
       },
       "targets": [
         {
-          "expr": "max(kimistore_agents_live{instance=~\"$agent\"})",
+          "expr": "max(kimistore_agents_live{instance=\"192.168.2.236:9101\"})",
           "refId": "A",
           "instant": true
         }
@@ -1343,7 +1297,6 @@
       },
       "transparent": false,
       "description": "",
-      "interval": null,
       "links": []
     },
     {
@@ -1351,7 +1304,7 @@
       "title": "Lease owned",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 4,
@@ -1361,7 +1314,7 @@
       },
       "targets": [
         {
-          "expr": "max(kimistore_lease_owned{instance=~\"$agent\"})",
+          "expr": "max(kimistore_lease_owned{instance=\"192.168.2.236:9101\"})",
           "refId": "A",
           "instant": true
         }
@@ -1399,7 +1352,6 @@
       },
       "transparent": false,
       "description": "",
-      "interval": null,
       "links": []
     },
     {
@@ -1408,7 +1360,7 @@
       "description": "Increments on every writer claim. A jump means the partition was re-claimed.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 4,
@@ -1418,7 +1370,7 @@
       },
       "targets": [
         {
-          "expr": "max(kimistore_writer_epoch{instance=~\"$agent\"})",
+          "expr": "max(kimistore_writer_epoch{instance=\"192.168.2.236:9101\"})",
           "refId": "A",
           "instant": true
         }
@@ -1455,7 +1407,6 @@
         "wideLayout": true
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -1464,7 +1415,7 @@
       "description": "How stale the routing inventory is. A climbing age with publishing conflicts means agents disagree about the table.",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -1474,12 +1425,12 @@
       },
       "targets": [
         {
-          "expr": "max(kimistore_routing_age_seconds{instance=~\"$agent\"})",
+          "expr": "max(kimistore_routing_age_seconds{instance=\"192.168.2.236:9101\"})",
           "refId": "A",
           "legendFormat": "age"
         },
         {
-          "expr": "max(kimistore_routing_brokers{instance=~\"$agent\"})",
+          "expr": "max(kimistore_routing_brokers{instance=\"192.168.2.236:9101\"})",
           "refId": "B",
           "legendFormat": "brokers"
         }
@@ -1513,7 +1464,6 @@
         }
       },
       "transparent": false,
-      "interval": null,
       "links": []
     },
     {
@@ -1521,7 +1471,7 @@
       "title": "Routing faults",
       "datasource": {
         "type": "prometheus",
-        "uid": "${datasource}"
+        "uid": "dg0i3veoyn5z4b"
       },
       "gridPos": {
         "h": 7,
@@ -1531,17 +1481,17 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(kimistore_routing_publish_conflicts_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_routing_publish_conflicts_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "A",
           "legendFormat": "publish conflicts"
         },
         {
-          "expr": "sum(rate(kimistore_routing_inventory_failures_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_routing_inventory_failures_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "B",
           "legendFormat": "inventory failures"
         },
         {
-          "expr": "sum(rate(kimistore_routing_inconsistent_tables_total{instance=~\"$agent\"}[5m]))",
+          "expr": "sum(rate(kimistore_routing_inconsistent_tables_total{instance=\"192.168.2.236:9101\"}[5m]))",
           "refId": "C",
           "legendFormat": "inconsistent tables"
         }
@@ -1576,7 +1526,6 @@
       },
       "transparent": false,
       "description": "",
-      "interval": null,
       "links": []
     }
   ]
