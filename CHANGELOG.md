@@ -11,6 +11,26 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.16
+
+Compaction stopped entirely once the backlog was cleared, and said nothing while
+it did.
+
+### Fixed
+
+- A bucket that is already fully merged no longer stops the queue. Once the
+  backlog on knode3 was compacted, the oldest bucket held nothing but merged
+  products, every one at or above half the merged-size cap, so the selection
+  skipped every entry and the pass had nothing to do. Candidate selection
+  accepted that bucket anyway, because it only checked whether the entries
+  carried sizes and never whether a pass would actually pick any, so it won the
+  queue and returned zero
+
+  The result was silence: no log line, no error, and the object count rising by
+  48,000 over eight hours while a search for "Compactor" showed the last merge
+  at 00:05. Candidate selection and the pass now use one `selectSources`, so a
+  bucket is only taken when a pass over it would have something to do
+
 ## 1.0.15
 
 Fixes a data-loss defect in the compactor. It destroyed seven offsets on knode3

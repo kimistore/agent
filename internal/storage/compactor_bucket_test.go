@@ -234,6 +234,32 @@ func currentBucketKey(t *testing.T, engine *StorageEngine, partition int32) stri
 	return oldest.Key
 }
 
+// seedAllMerged lays down a bucket whose every entry is an already-merged
+// product: each is at or above half the cap, so selectSources skips them all.
+func seedAllMerged(t *testing.T, engine *StorageEngine, store ObjectStore, topic string, partition int32, first int64, count int, size int64) BucketRef {
+	t.Helper()
+	var refs []SegmentRef
+	for i := int64(0); i < int64(count); i++ {
+		ref := SegmentRef{Base: first + i*10, Epoch: 9, Size: size}
+		writeSeg(t, store, topic, partition, ref, 1024)
+		refs = append(refs, ref)
+	}
+	b := BucketRef{
+		First: refs[0].Base, Last: refs[len(refs)-1].Base,
+		Key:   bucketKey(topic, partition, refs[0].Base, refs[len(refs)-1].Base),
+		Bytes: sumSizes(refs), Newest: 1000,
+	}
+	raw, err := json.Marshal(refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(context.Background(), b.Key, bytesReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+	engine.metadataCache.SeededBucket(topic, partition, b)
+	return b
+}
+
 func readBucketObject(t *testing.T, store ObjectStore, key string) []byte {
 	t.Helper()
 	rc, err := store.Get(context.Background(), key)
@@ -262,5 +288,58 @@ func putU64(b []byte, v uint64) {
 func putU32(b []byte, v uint32) {
 	for i := 0; i < 4; i++ {
 		b[i] = byte(v >> (24 - 8*i))
+	}
+}
+
+// A bucket that is already fully merged must not stop the queue.
+//
+// This is what knode3 did for eight hours: compaction logged nothing at all
+// while the object count rose by 48,000. Once the backlog was compacted the
+// oldest bucket held nothing but merged products, every one of them at least
+// half the merged-size cap, so the selection skipped every entry and the pass had
+// nothing to do. Candidate selection accepted that bucket anyway, because it only
+// asked whether the entries carried sizes -- never whether a pass would actually
+// pick any -- so it won the queue and returned zero every minute.
+func TestCompactPartition_FullyMergedBucketDoesNotBlockTheQueue(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{},
+		WithCompactor(CompactorConfig{
+			Interval: time.Hour, MinSegments: 4,
+			MaxMergedBytes: 32 * 1024, ScratchDir: t.TempDir(),
+		}))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer engine.Close()
+
+	// Oldest bucket: nothing but merged products, every entry at or above half
+	// the 32KB cap, so the selection has nothing it can take.
+	seedAllMerged(t, engine, store.inner, "orders", 0, 1000, 12, 24*1024)
+
+	// Behind it: a bucket of ordinary small segments that must be merged.
+	_, behind := seedBucketSized(t, engine, store.inner, "orders", 0, 2000, 120, 1024)
+	seedBucketSized(t, engine, store.inner, "orders", 0, 3000, 120, 1024)
+
+	n, err := engine.compactPartition(context.Background(), "orders", 0)
+	if err != nil {
+		t.Fatalf("compactPartition: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("nothing was compacted; a fully merged oldest bucket blocked the queue")
+	}
+
+	merged := 0
+	for _, ref := range behind {
+		if rc, err := store.inner.Get(context.Background(), segmentKey("orders", 0, ref)); err == nil {
+			_ = rc.Close()
+		} else {
+			merged++
+		}
+	}
+	// A 32KB cap over ~1KB entries takes about 31 segments, so anything near
+	// that proves the pass reached past the blocking bucket.
+	if merged < 20 {
+		t.Errorf("%d of %d segments behind the fully merged bucket were reclaimed, want the pass to reach them",
+			merged, len(behind))
 	}
 }

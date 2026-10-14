@@ -187,6 +187,7 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 	var (
 		b       BucketRef
 		refs    []SegmentRef
+		picked  []int
 		found   bool
 		readErr error
 	)
@@ -196,17 +197,20 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 			readErr = fmt.Errorf("read bucket %s: %w", cand.Key, err)
 			continue
 		}
-		if len(candRefs) < cfg.MinSegments {
-			continue
-		}
-		// Whether an entry has a recorded size is a property of the candidate,
-		// so it is decided here rather than after a bucket has been chosen.
-		// Testing it afterwards turns a skip into an abort, and the abort stops
-		// the pass that has already found a workable bucket further along.
 		if !allSized(candRefs) {
 			continue
 		}
-		b, refs, found = cand, candRefs, true
+		// The candidate is accepted only if a pass over it would actually pick
+		// something. A bucket whose entries are all already merged products is
+		// skipped by the selection, so accepting it here made it win the queue
+		// and then yield nothing -- which is what stopped compaction entirely
+		// once the backlog was compacted: the first bucket was fully merged, so
+		// every entry was skipped, and no bucket behind it was ever reached.
+		candPicked := selectSources(candRefs, cfg)
+		if len(candPicked) < cfg.MinSegments {
+			continue
+		}
+		b, refs, picked, found = cand, candRefs, candPicked, true
 		break
 	}
 	if !found {
@@ -228,53 +232,9 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 	// the sources listed merged segments -- whose objects this pass then deletes
 	// -- and dropped entries that were left alone. On knode3 that destroyed seven
 	// offsets.
-	var picked []int
-	var bytesIn int64
-	// Take segments until the merged size reaches the cap.
-	//
-	// The cap and the minimum are independent. They were once combined into one
-	// condition, which meant a bucket whose first entry was already a merged
-	// segment satisfied the byte test on the first iteration and stopped the
-	// loop at exactly MinSegments -- eight. That is why compaction reclaimed 8
-	// segments every fifteen minutes while the partition took in 3,200: it was
-	// not losing the race on interval, it was barely entering it.
-	//
-	// Segments are taken in order from the oldest, so a partially compacted
-	// bucket keeps filling the same merged segment rather than starting a new
-	// one per pass.
-	for i, ref := range refs {
-		// A segment already at the cap is a previous pass's product. Taking it
-		// would spend the whole budget on one entry and leave the pass merging
-		// nothing, so it is stepped over rather than merged again.
-		//
-		// The test is most of the cap rather than exactly it. A merged segment
-		// lands just under, because the loop stops before an entry would
-		// overshoot -- so an exact comparison lets the first entry of every
-		// subsequent pass through, and that entry then consumes the entire
-		// budget, leaving the pass with nothing to do. That is what made a
-		// partially compacted bucket stall: every pass selected the one segment
-		// it had already merged.
-		if ref.Size >= cfg.MaxMergedBytes/2 {
-			continue
-		}
-		// Stop before an entry would carry the result past the cap, rather than
-		// after. Taking one that overshoots produces an object larger than
-		// anything the writer emits, which is the limit this exists to hold.
-		if bytesIn+ref.Size > cfg.MaxMergedBytes {
-			break
-		}
-		picked = append(picked, i)
-		bytesIn += ref.Size
-	}
-	if len(picked) < cfg.MinSegments {
-		return 0, nil
-	}
-
-	// Re-checked on the run actually selected: it is a subset of the candidate,
-	// and the cap is applied per selection.
-	if !allSized(refsAt(refs, picked)) {
-		return 0, fmt.Errorf("bucket %s holds entries recorded before sizes were indexed; skipping", b.Key)
-	}
+	// picked was chosen above, where the candidate was accepted on the same
+	// test, so it is not recomputed here: the two would have to agree for the
+	// pass to merge what the selection promised.
 
 	merged, picked, err := s.mergeRefs(ctx, topic, partition, refs, picked, cfg)
 	if err != nil {
@@ -721,4 +681,30 @@ func isNotFound(err error) bool {
 	return strings.Contains(msg, "nosuchkey") ||
 		strings.Contains(msg, "not found") ||
 		strings.Contains(msg, "statuscode: 404")
+}
+
+// selectSources returns the positions in refs that a pass would merge.
+//
+// It steps over entries at least half the merged-size cap, which are earlier
+// passes' products, and stops before an entry would carry the result past the
+// cap. Both halves matter: taking an already-merged entry spends the whole
+// budget on it and leaves the pass merging nothing, and taking one that
+// overshoots produces an object larger than anything the writer emits.
+//
+// Candidate selection and the pass itself both call this, so a bucket is only
+// taken when a pass over it would actually have something to do.
+func selectSources(refs []SegmentRef, cfg CompactorConfig) []int {
+	var picked []int
+	var bytesIn int64
+	for i, ref := range refs {
+		if ref.Size >= cfg.MaxMergedBytes/2 {
+			continue
+		}
+		if bytesIn+ref.Size > cfg.MaxMergedBytes {
+			break
+		}
+		picked = append(picked, i)
+		bytesIn += ref.Size
+	}
+	return picked
 }
