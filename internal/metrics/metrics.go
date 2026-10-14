@@ -99,6 +99,34 @@ var (
 		Help: "Total number of log segments reclaimed by retention",
 	})
 
+	// Compactor
+	//
+	// These exist because a stopped compactor and a finished one were
+	// indistinguishable: both logged nothing, and the object count gave the
+	// answer hours later. LastMergeTimestamp is the one that matters -- a
+	// compactor with work pending and no recent merge is stuck, and an alert can
+	// say so directly.
+	CompactorPasses = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_compactor_passes_total",
+		Help: "Compaction passes attempted, whether or not they found work",
+	})
+	CompactorMerges = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_compactor_merges_total",
+		Help: "Compaction passes that consolidated at least one run of segments",
+	})
+	CompactorSegmentsMerged = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_compactor_segments_merged_total",
+		Help: "Total source segments consolidated into merged segments",
+	})
+	CompactorLastMergeTimestamp = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kimistore_compactor_last_merge_timestamp_seconds",
+		Help: "Unix time of the last compaction that merged anything, or 0 if none has",
+	})
+	CompactorPassErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_compactor_pass_errors_total",
+		Help: "Compaction passes that ended in an error",
+	})
+
 	// Coordinator / session reaper
 	CoordinatorEvictions = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "kimistore_coordinator_evicted_members_total",

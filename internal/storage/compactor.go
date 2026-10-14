@@ -126,14 +126,39 @@ func (s *StorageEngine) compactorLoop() {
 		case <-ticker.C:
 			for _, topic := range s.metadataCache.GetTopics() {
 				for _, partition := range s.metadataCache.GetPartitions(topic) {
-					if n, err := s.compactPartition(context.Background(), topic, partition); err != nil {
-						log.Printf("Compactor: %s/%d: %v", topic, partition, err)
-					} else if n > 0 {
-						log.Printf("Compactor: %s/%d merged %d segment(s)", topic, partition, n)
-					}
+					s.compactorPass(topic, partition)
 				}
 			}
 		}
+	}
+}
+
+// compactorPass runs one compaction pass over a partition and records what it
+// did.
+//
+// The recording is a method rather than inlined in the ticker loop so that a
+// test can reach it. While it was inlined, the only way to observe it was a live
+// ticker, and a compactor that had stopped -- the failure these metrics exist to
+// detect -- was precisely the case a test could not produce.
+//
+// Every pass counts, whether or not it found work. That is what separates
+// "running with nothing to do" from "stopped": the pass counter climbs in the
+// first case and is flat in the second, and only the second is a fault.
+func (s *StorageEngine) compactorPass(topic string, partition int32) {
+	metrics.CompactorPasses.Inc()
+	n, err := s.compactPartition(context.Background(), topic, partition)
+	switch {
+	case err != nil:
+		metrics.CompactorPassErrors.Inc()
+		log.Printf("Compactor: %s/%d: %v", topic, partition, err)
+	case n > 0:
+		metrics.CompactorMerges.Inc()
+		metrics.CompactorSegmentsMerged.Add(float64(n))
+		// Set last, and only on a real merge. An idle pass leaves the value
+		// alone, so a stale timestamp means "no merge in a long time" -- which is
+		// the condition worth alerting on.
+		metrics.CompactorLastMergeTimestamp.SetToCurrentTime()
+		log.Printf("Compactor: %s/%d merged %d segment(s)", topic, partition, n)
 	}
 }
 

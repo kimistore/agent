@@ -11,6 +11,34 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.17
+
+Compaction liveness is now observable without reading logs.
+
+### Added
+
+- Compactor metrics. `1.0.16` fixed a compactor that had stopped, but the thing
+  that made it invisible was not fixed with it: a stopped compactor and a
+  compactor with nothing to do both logged nothing, and the object count gave the
+  answer hours later
+
+  `kimistore_compactor_passes_total` counts every pass whether or not it found
+  work, `kimistore_compactor_merges_total` counts passes that consolidated
+  anything, `kimistore_compactor_segments_merged_total` counts the segments
+  reclaimed, `kimistore_compactor_pass_errors_total` counts failures, and
+  `kimistore_compactor_last_merge_timestamp_seconds` records when the last real
+  merge happened and is 0 if none has
+
+  The pair that matters is passes against merges: passes climbing with merges
+  flat is a compactor running with nothing to do, passes flat is a compactor that
+  has stopped. Alerting on a stale `last_merge` while the object count rises
+  would have caught `1.0.16` in about two minutes
+
+- `compactorPass` extracted from the ticker loop so the recording is reachable
+  from a test. While it was inlined, the only way to exercise it was a live
+  ticker -- and a compactor that had stopped was exactly the case a test could
+  not produce
+
 ## 1.0.16
 
 Compaction stopped entirely once the backlog was cleared, and said nothing while

@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"kimistore/internal/metrics"
 	"kimistore/internal/storage/wal"
 )
 
@@ -341,5 +344,109 @@ func TestCompactPartition_FullyMergedBucketDoesNotBlockTheQueue(t *testing.T) {
 	if merged < 20 {
 		t.Errorf("%d of %d segments behind the fully merged bucket were reclaimed, want the pass to reach them",
 			merged, len(behind))
+	}
+}
+
+// A compactor that has stopped must be distinguishable from one with nothing to
+// do.
+//
+// This is the failure the metric exists for. Compaction went silent for eight
+// hours on knode3 -- no log line, no error, return value ignored -- while the
+// object count rose by 48,000. "No work available" and "not running" looked
+// identical from outside, and the only reason it was eventually caught was
+// noticing the object count had gone the wrong way.
+func TestCompactor_ReportsLivenessThroughMetrics(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{},
+		WithCompactor(CompactorConfig{
+			Interval: time.Hour, MinSegments: 4,
+			MaxMergedBytes: 32 * 1024, ScratchDir: t.TempDir(),
+		}))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer engine.Close()
+
+	if got := testutil.ToFloat64(metrics.CompactorLastMergeTimestamp); got != 0 {
+		t.Errorf("last-merge timestamp is %v before anything has merged; want 0 so "+
+			"'never merged' is distinguishable from 'merged long ago'", got)
+	}
+	passesBefore := testutil.ToFloat64(metrics.CompactorPasses)
+	mergesBefore := testutil.ToFloat64(metrics.CompactorMerges)
+
+	seedBucketSized(t, engine, store.inner, "orders", 0, 1000, 120, 1024)
+	seedBucketSized(t, engine, store.inner, "orders", 0, 2000, 120, 1024)
+	seedBucketSized(t, engine, store.inner, "orders", 0, 3000, 120, 1024)
+
+	// Drain it, recording each pass the way the loop records it. The cap is
+	// applied per selection, so several passes are needed before the backlog is
+	// gone; each one is a merge.
+	for pass := 0; ; pass++ {
+		if pass > 100 {
+			t.Fatal("backlog did not drain")
+		}
+		engine.compactorPass("orders", 0)
+		// The merge counter is what says whether the pass found work; the pass
+		// counter moves either way.
+		if testutil.ToFloat64(metrics.CompactorMerges) == mergesBefore+float64(pass+1) {
+			continue
+		}
+		break
+	}
+
+	if got := testutil.ToFloat64(metrics.CompactorPasses); got <= passesBefore {
+		t.Error("a pass did not increment the pass counter")
+	}
+	if got := testutil.ToFloat64(metrics.CompactorMerges); got <= mergesBefore {
+		t.Error("a successful merge did not increment the merge counter")
+	}
+	if got := testutil.ToFloat64(metrics.CompactorSegmentsMerged); got < 4 {
+		t.Errorf("segments-merged gauge is %v, want the merged run", got)
+	}
+	if got := testutil.ToFloat64(metrics.CompactorLastMergeTimestamp); got == 0 {
+		t.Error("a successful merge did not set the last-merge timestamp")
+	}
+
+	// Now the backlog is gone. A pass that finds nothing must still count as a
+	// pass and must not move the last-merge time. That difference is the signal:
+	// passes climbing with merges flat means the compactor is running and idle;
+	// passes flat means it has stopped.
+	passesBefore = testutil.ToFloat64(metrics.CompactorPasses)
+	mergesBefore = testutil.ToFloat64(metrics.CompactorMerges)
+	lastBefore := testutil.ToFloat64(metrics.CompactorLastMergeTimestamp)
+
+	engine.compactorPass("orders", 0)
+
+	if testutil.ToFloat64(metrics.CompactorPasses) <= passesBefore {
+		t.Error("an idle pass did not increment the pass counter")
+	}
+	if testutil.ToFloat64(metrics.CompactorMerges) != mergesBefore {
+		t.Error("an idle pass was counted as a merge")
+	}
+	if testutil.ToFloat64(metrics.CompactorLastMergeTimestamp) != lastBefore {
+		t.Error("an idle pass moved the last-merge timestamp")
+	}
+
+	// A failing pass is counted as an error, and is not counted as a merge. The
+	// distinction matters because a compactor that fails every pass looks alive
+	// from the pass counter alone -- the object count never falls and the last
+	// merge goes stale, but neither of those is an error counter until the errors
+	// are counted somewhere.
+	seedBucketSized(t, engine, store.inner, "orders", 0, 4000, 120, 1024)
+	store.failGet = true
+	errsBefore := testutil.ToFloat64(metrics.CompactorPassErrors)
+	mergesBefore = testutil.ToFloat64(metrics.CompactorMerges)
+	lastBefore = testutil.ToFloat64(metrics.CompactorLastMergeTimestamp)
+
+	engine.compactorPass("orders", 0)
+
+	if testutil.ToFloat64(metrics.CompactorPassErrors) <= errsBefore {
+		t.Error("a failing pass did not increment the error counter")
+	}
+	if testutil.ToFloat64(metrics.CompactorMerges) != mergesBefore {
+		t.Error("a failing pass was counted as a merge")
+	}
+	if testutil.ToFloat64(metrics.CompactorLastMergeTimestamp) != lastBefore {
+		t.Error("a failing pass moved the last-merge timestamp")
 	}
 }
