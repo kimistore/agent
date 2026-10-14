@@ -11,6 +11,48 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.19
+
+A merge that fails after writing its segment no longer strands it.
+
+### Fixed
+
+- An uncommitted merged segment is now discarded. The order is segment, bucket,
+  index swap -- and anything that failed in between returned with the segment
+  still in object storage and named by nothing
+
+  The swap is what replaces the sources, so at that moment the segment's range is
+  covered by nothing either. Nothing would ever collect it: no index named it, so
+  no later merge or retention pass would look at it. knode3 had accumulated 218 of
+  them at roughly 18MB each, about 4GB, a third of the bucket
+
+### Added
+
+- `kimistore_compactor_merged_segments_written_total`,
+  `kimistore_compactor_merge_commits_total` and the
+  `kimistore_compactor_uncommitted_merged_segments` gauge. Written minus
+  committed is the quantity that makes a leak visible: it is zero in steady
+  state, and a value that only rises is segments being stranded
+
+  A gauge rather than two counters because the interesting thing is the
+  difference, and PromQL should not have to be trusted to notice it
+
+- `reclaim-orphans.py`, which sweeps objects no index names. It establishes that
+  the index is complete before deleting anything, because a bucket that fails to
+  parse makes every segment behind it look unreferenced, and a stale checkpoint
+  does the same for everything since
+
+  "Unreferenced" is not the same as "worthless". A segment whose offset range is
+  covered by an indexed entry is redundant; one whose range nothing covers is the
+  last copy of data, so it is quarantined for review rather than deleted -- it is
+  the symptom of something that lost a reference and the evidence of what. All
+  218 on knode3 were redundant, 0 were the last copy
+
+  Deletion is the last step, not the first: candidates are copied to a quarantine
+  prefix and each copy is verified before anything is deleted, and the index is
+  re-read after copying so that a candidate which became referenced in the
+  meantime stops the run
+
 ## 1.0.18
 
 A compaction pass now consolidates repeatedly instead of exactly once.

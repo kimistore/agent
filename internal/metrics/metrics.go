@@ -118,6 +118,24 @@ var (
 		Name: "kimistore_compactor_segments_merged_total",
 		Help: "Total source segments consolidated into merged segments",
 	})
+	// A merge writes its merged segment before it commits the index, so a
+	// failure in between leaves an object nothing references. On knode3 that had
+	// already happened: 218 unmerged-looking segments of about 18MB, roughly 4GB,
+	// sitting on disk forever because no code path deletes an object no index
+	// names. Written-minus-committed is the quantity that makes that visible.
+	CompactorMergedSegmentsWritten = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_compactor_merged_segments_written_total",
+		Help: "Merged segments written to object storage, before the index commit",
+	})
+	CompactorMergeCommits = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "kimistore_compactor_merge_commits_total",
+		Help: "Merges whose index swap succeeded, making the merged segment live",
+	})
+	CompactorUncommittedMergedSegments = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "kimistore_compactor_uncommitted_merged_segments",
+		Help: "Merged segments written but never committed to the index. " +
+			"Zero in steady state; a value that only rises is a leak",
+	})
 	CompactorPassBudgetExhausted = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "kimistore_compactor_budget_exhausted_total",
 		Help: "Passes that stopped on their time budget with work still queued",

@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"regexp"
 	"sort"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -537,5 +540,148 @@ func TestCompactorPass_StopsOnItsBudgetAndKeepsWhatItMerged(t *testing.T) {
 	engine.compactorPass("orders", 0)
 	if got := testutil.ToFloat64(metrics.CompactorMerges) - mergesBefore; got != 1 {
 		t.Errorf("the next pass merged %.0f, want it to carry on from where the budget stopped", got)
+	}
+}
+
+// bucketWriteFailStore fails writes of sealed bucket objects while allowing
+// segment writes.
+//
+// This isolates the failure that strands a merged segment: the segment goes up,
+// the bucket that would name it does not. Everything else keeps working, so the
+// only thing distinguishing this from a healthy run is an object nothing
+// references.
+type bucketWriteFailStore struct {
+	// The concrete store, not the interface: the engine also uses the optional
+	// ConditionalObjectStore methods, and a wrapper that hides them is not
+	// equivalent to the store it wraps.
+	inner *casStore
+	fail  atomic.Bool
+}
+
+var bucketKeyPattern = regexp.MustCompile(`\d{20}-\d{20}\.idx$`)
+
+func (f *bucketWriteFailStore) Put(ctx context.Context, key string, r io.Reader) error {
+	if f.fail.Load() && bucketKeyPattern.MatchString(key) {
+		return fmt.Errorf("bucket write is unavailable")
+	}
+	return f.inner.Put(ctx, key, r)
+}
+
+func (f *bucketWriteFailStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	return f.inner.Get(ctx, key)
+}
+
+func (f *bucketWriteFailStore) Delete(ctx context.Context, key string) error {
+	return f.inner.Delete(ctx, key)
+}
+
+func (f *bucketWriteFailStore) GetRange(ctx context.Context, key string, start, length int64) (io.ReadCloser, error) {
+	return f.inner.GetRange(ctx, key, start, length)
+}
+
+func (f *bucketWriteFailStore) List(ctx context.Context, prefix string) ([]ObjectMetadata, error) {
+	return f.inner.List(ctx, prefix)
+}
+
+func (f *bucketWriteFailStore) GetVersion(ctx context.Context, key string) ([]byte, string, bool, error) {
+	return f.inner.GetVersion(ctx, key)
+}
+
+func (f *bucketWriteFailStore) PutVersion(ctx context.Context, key string, data []byte, version string) (string, error) {
+	if f.fail.Load() && bucketKeyPattern.MatchString(key) {
+		return "", fmt.Errorf("bucket write is unavailable")
+	}
+	return f.inner.PutVersion(ctx, key, data, version)
+}
+
+// A merge that fails after writing its segment must not leave the segment
+// behind.
+//
+// The order is segment, then bucket, then the swap that commits it. A failure in
+// between used to return with the segment still in object storage and named by
+// nothing -- and since the swap is what replaces the sources, the segment's range
+// is covered by nothing at that moment either. There was no path to delete it
+// afterwards: no index named it, so no future merge or retention pass would ever
+// look at it.
+//
+// knode3 had 218 of them, about 18MB each, roughly 4GB, accumulated over the
+// life of the system.
+func TestCompactPartition_FailedMergeDiscardsItsSegmentAndKeepsSources(t *testing.T) {
+	inner := newCASStore()
+	store := &bucketWriteFailStore{inner: inner}
+	engine, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{},
+		WithCompactor(CompactorConfig{
+			Interval: time.Hour, MinSegments: 4,
+			MaxMergedBytes: 32 * 1024, ScratchDir: t.TempDir(),
+			MaxPassDuration: time.Minute,
+		}))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer engine.Close()
+
+	pendingBefore := testutil.ToFloat64(metrics.CompactorUncommittedMergedSegments)
+	writtenBefore := testutil.ToFloat64(metrics.CompactorMergedSegmentsWritten)
+	commitsBefore := testutil.ToFloat64(metrics.CompactorMergeCommits)
+
+	// Two buckets: the newest is left alone by design, so a lone bucket would
+	// be skipped rather than merged and the failure would never be reached.
+	_, sources := seedBucketSized(t, engine, inner, "orders", 0, 1000, 120, 1024)
+	seedBucketSized(t, engine, inner, "orders", 0, 2000, 120, 1024)
+
+	store.fail.Store(true)
+	if _, err = engine.compactPartition(context.Background(), "orders", 0); err == nil {
+		t.Fatal("expected the merge to fail when the bucket write fails")
+	}
+
+	// The segment was written, and must not still be there.
+	if got := testutil.ToFloat64(metrics.CompactorMergedSegmentsWritten) - writtenBefore; got != 1 {
+		t.Fatalf("expected the merged segment to have been written, got %v writes", got)
+	}
+	merged := 0
+	for _, ref := range sources {
+		rc, err := inner.Get(context.Background(), segmentKey("orders", 0, ref))
+		if err == nil {
+			_ = rc.Close()
+		} else {
+			merged++
+		}
+	}
+	if merged > 0 {
+		t.Errorf("%d source segments were deleted by a merge that never committed; "+
+			"the index still names them, so their offsets are now unreadable", merged)
+	}
+	for _, ref := range sources[:4] {
+		key := segmentKey("orders", 0, ref)
+		rc, err := inner.Get(context.Background(), key)
+		if err != nil {
+			t.Errorf("source %s is gone after a failed merge: %v", key, err)
+			continue
+		}
+		_ = rc.Close()
+	}
+
+	// Nothing may be left pending: the write and the commit do not balance.
+	if got := testutil.ToFloat64(metrics.CompactorUncommittedMergedSegments); got != pendingBefore {
+		t.Errorf("uncommitted merged segments is %v, want %v -- a discarded "+
+			"segment must not stay on the gauge", got, pendingBefore)
+	}
+	if got := testutil.ToFloat64(metrics.CompactorMergeCommits); got != commitsBefore {
+		t.Errorf("a merge that failed was counted as a commit")
+	}
+
+	// And the merged segment must not be on disk under any name.
+	entries, err := inner.List(context.Background(), "orders/0/")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	stray := 0
+	for _, e := range entries {
+		if e.Size > 20*1024 { // a merged product, larger than any source here
+			stray++
+		}
+	}
+	if stray != 0 {
+		t.Errorf("%d large segment(s) left behind by a merge that never committed", stray)
 	}
 }

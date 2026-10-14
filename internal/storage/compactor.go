@@ -373,9 +373,24 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 	}
 
 	// Steps 2 and 3: the merged segment and the bucket that names it.
+	//
+	// From here on an object exists that the index does not name, and it stays
+	// that way until the swap below commits it. Anything that fails in between
+	// has to undo this write, or the segment is stranded: the range it holds is
+	// covered by the merged segment only after the commit, so nothing else can
+	// be substituted for it and no code path will ever collect it. That is not
+	// hypothetical -- knode3 carried 218 of them at about 18MB each.
+	uncommitted := true
+	defer func() {
+		if uncommitted {
+			s.discardMergedSegment(ctx, topic, partition, mergedRef)
+		}
+	}()
 	if err := s.writeMergedSegment(ctx, topic, partition, mergedRef, merged.Path, merged.BytesOut); err != nil {
 		return 0, fmt.Errorf("write merged segment: %w", err)
 	}
+	metrics.CompactorMergedSegmentsWritten.Inc()
+	metrics.CompactorUncommittedMergedSegments.Inc()
 	// Everything this pass did not merge, selected by membership. Slicing
 	// refs[len(sources):] assumes the sources are a prefix, and they are not --
 	// the selection steps over entries that are already merged products.
@@ -441,6 +456,10 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 			topic, partition, b.Key)
 		return 0, fmt.Errorf("bucket %s changed during merge", b.Key)
 	}
+	// The merged segment is now named by the index and is live.
+	metrics.CompactorMergeCommits.Inc()
+	metrics.CompactorUncommittedMergedSegments.Dec()
+	uncommitted = false
 	s.markManifestDirty(topic, partition)
 
 	// Step 5: record the sources so an interrupted delete can be finished.
@@ -656,6 +675,32 @@ func (s *StorageEngine) downloadSegment(ctx context.Context, topic string, parti
 // source sidecar would point at positions that no longer exist -- the merged
 // file concatenates them. Generating it costs one pass over the merged file,
 // which was written locally and so is still cheap to read.
+// discardMergedSegment removes a merged segment that was written but never
+// committed to the index.
+//
+// It runs on the failure paths between writing the segment and the index swap
+// that would have made it live. The segment is unreferenced at that point and
+// its range is not covered by anything else, because the sources are still
+// present -- the swap is what replaces them. So this deletes an object no reader
+// can reach, and leaving it behind is what stranded 218 of them on knode3.
+//
+// A failure here is logged rather than propagated: the caller is already
+// returning an error for the original cause, and masking it with a cleanup
+// failure would hide the reason the merge stopped. The gauge drops either way,
+// because the segment is uncommitted whether or not the delete succeeded, and a
+// delete that failed will be picked up as debris by a later sweep.
+func (s *StorageEngine) discardMergedSegment(ctx context.Context, topic string, partition int32, ref SegmentRef) {
+	metrics.CompactorUncommittedMergedSegments.Dec()
+	key := segmentKey(topic, partition, ref)
+	for _, k := range []string{key, strings.TrimSuffix(key, ".log") + ".index"} {
+		if err := s.objDelete(ctx, k); err != nil && !isNotFound(err) {
+			log.Printf("Compactor: cannot discard uncommitted merged segment %s: %v", k, err)
+			continue
+		}
+		log.Printf("Compactor: discarded uncommitted merged segment %s", k)
+	}
+}
+
 func (s *StorageEngine) writeMergedSegment(ctx context.Context, topic string, partition int32, ref SegmentRef, path string, size int64) error {
 	if size <= 0 {
 		return fmt.Errorf("merged segment has no size")
