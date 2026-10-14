@@ -105,15 +105,30 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "unit": "short",
+          "custom": {}
         },
         "overrides": []
       },
       "options": {
         "colorMode": "background",
         "graphMode": "none",
-        "textMode": "value"
-      }
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "stat",
@@ -125,7 +140,7 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 5,
+        "w": 4,
         "x": 4,
         "y": 1
       },
@@ -138,14 +153,39 @@
         }
       ],
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "short",
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          }
+        },
         "overrides": []
       },
       "options": {
         "colorMode": "none",
         "graphMode": "none",
-        "textMode": "name"
-      }
+        "textMode": "name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "stat",
@@ -157,8 +197,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 5,
-        "x": 9,
+        "w": 4,
+        "x": 8,
         "y": 1
       },
       "targets": [
@@ -176,14 +216,39 @@
         }
       ],
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "short",
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          }
+        },
         "overrides": []
       },
       "options": {
         "colorMode": "none",
         "graphMode": "none",
-        "textMode": "value_and_name"
-      }
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "stat",
@@ -195,8 +260,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 5,
-        "x": 14,
+        "w": 4,
+        "x": 12,
         "y": 1
       },
       "targets": [
@@ -220,15 +285,31 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "unit": "short",
+          "custom": {},
+          "mappings": []
         },
         "overrides": []
       },
       "options": {
         "colorMode": "background",
         "graphMode": "area",
-        "textMode": "value"
-      }
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "stat",
@@ -240,8 +321,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 5,
-        "x": 19,
+        "w": 4,
+        "x": 16,
         "y": 1
       },
       "targets": [
@@ -271,15 +352,30 @@
               }
             ]
           },
-          "noValue": "no merges yet this process"
+          "noValue": "no merges yet this process",
+          "custom": {},
+          "mappings": []
         },
         "overrides": []
       },
       "options": {
         "colorMode": "value",
         "graphMode": "none",
-        "textMode": "value"
-      }
+        "textMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "timeseries",
@@ -291,7 +387,7 @@
       },
       "gridPos": {
         "h": 7,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 5
       },
@@ -358,11 +454,31 @@
           "custom": {
             "fillOpacity": 8,
             "lineWidth": 1,
-            "showPoints": "never"
+            "showPoints": "never",
+            "drawStyle": "line",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
           }
         },
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "timeseries",
@@ -374,8 +490,8 @@
       },
       "gridPos": {
         "h": 7,
-        "w": 12,
-        "x": 12,
+        "w": 8,
+        "x": 8,
         "y": 5
       },
       "targets": [
@@ -397,10 +513,35 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ops"
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
+          }
         },
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "timeseries",
@@ -412,8 +553,8 @@
       },
       "gridPos": {
         "h": 7,
-        "w": 24,
-        "x": 0,
+        "w": 8,
+        "x": 16,
         "y": 5
       },
       "targets": [
@@ -440,10 +581,35 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ops"
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
+          }
         },
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "row",
@@ -452,7 +618,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 19
+        "y": 12
       },
       "collapsed": false,
       "panels": []
@@ -465,10 +631,10 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 6,
+        "h": 7,
         "w": 8,
         "x": 0,
-        "y": 20
+        "y": 13
       },
       "targets": [
         {
@@ -479,10 +645,36 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps"
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
+          }
         },
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "description": "",
+      "interval": null,
+      "links": []
     },
     {
       "type": "timeseries",
@@ -492,10 +684,10 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 6,
+        "h": 7,
         "w": 8,
         "x": 8,
-        "y": 20
+        "y": 13
       },
       "targets": [
         {
@@ -511,10 +703,36 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "Bps"
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
+          }
         },
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "description": "",
+      "interval": null,
+      "links": []
     },
     {
       "type": "timeseries",
@@ -525,10 +743,10 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 6,
+        "h": 7,
         "w": 8,
         "x": 16,
-        "y": 20
+        "y": 13
       },
       "targets": [
         {
@@ -549,10 +767,35 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ms"
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
+          }
         },
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "timeseries",
@@ -563,10 +806,10 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 6,
+        "h": 7,
         "w": 8,
         "x": 0,
-        "y": 26
+        "y": 20
       },
       "targets": [
         {
@@ -576,9 +819,36 @@
         }
       ],
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
+          }
+        },
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "timeseries",
@@ -589,10 +859,10 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 6,
+        "h": 7,
         "w": 8,
         "x": 8,
-        "y": 26
+        "y": 20
       },
       "targets": [
         {
@@ -608,10 +878,35 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ops"
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
+          }
         },
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "timeseries",
@@ -621,10 +916,10 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 6,
+        "h": 7,
         "w": 8,
         "x": 16,
-        "y": 26
+        "y": 20
       },
       "targets": [
         {
@@ -634,9 +929,37 @@
         }
       ],
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
+          }
+        },
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "description": "",
+      "interval": null,
+      "links": []
     },
     {
       "type": "row",
@@ -645,7 +968,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 32
+        "y": 27
       },
       "collapsed": false,
       "panels": []
@@ -662,7 +985,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 33
+        "y": 28
       },
       "targets": [
         {
@@ -683,10 +1006,35 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ops"
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
+          }
         },
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "timeseries",
@@ -700,7 +1048,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 33
+        "y": 28
       },
       "targets": [
         {
@@ -716,10 +1064,35 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "Bps"
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
+          }
         },
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "row",
@@ -728,7 +1101,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 40
+        "y": 35
       },
       "collapsed": false,
       "panels": []
@@ -742,10 +1115,10 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 6,
+        "h": 7,
         "w": 12,
         "x": 0,
-        "y": 41
+        "y": 36
       },
       "targets": [
         {
@@ -761,10 +1134,35 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ops"
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
+          }
         },
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "timeseries",
@@ -774,10 +1172,10 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 6,
+        "h": 7,
         "w": 12,
         "x": 12,
-        "y": 41
+        "y": 36
       },
       "targets": [
         {
@@ -793,11 +1191,36 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "s"
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
+          }
         },
         "overrides": []
       },
-      "description": "How long an acks=all produce waited for its segment to reach object storage. Also a histogram: the mean is _sum over _count, and the tail comes from _bucket."
+      "description": "How long an acks=all produce waited for its segment to reach object storage. Also a histogram: the mean is _sum over _count, and the tail comes from _bucket.",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "row",
@@ -806,7 +1229,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 47
+        "y": 43
       },
       "collapsed": false,
       "panels": []
@@ -822,7 +1245,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 48
+        "y": 44
       },
       "targets": [
         {
@@ -832,13 +1255,40 @@
         }
       ],
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "short",
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          }
+        },
         "overrides": []
       },
       "options": {
         "colorMode": "none",
-        "graphMode": "none"
-      }
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "transparent": false,
+      "description": "",
+      "interval": null,
+      "links": []
     },
     {
       "type": "stat",
@@ -851,7 +1301,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 48
+        "y": 44
       },
       "targets": [
         {
@@ -861,13 +1311,40 @@
         }
       ],
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "short",
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          }
+        },
         "overrides": []
       },
       "options": {
         "colorMode": "none",
-        "graphMode": "none"
-      }
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "transparent": false,
+      "description": "",
+      "interval": null,
+      "links": []
     },
     {
       "type": "stat",
@@ -880,7 +1357,7 @@
         "h": 4,
         "w": 4,
         "x": 8,
-        "y": 48
+        "y": 44
       },
       "targets": [
         {
@@ -890,13 +1367,40 @@
         }
       ],
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "short",
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          }
+        },
         "overrides": []
       },
       "options": {
         "colorMode": "none",
-        "graphMode": "none"
-      }
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "transparent": false,
+      "description": "",
+      "interval": null,
+      "links": []
     },
     {
       "type": "stat",
@@ -910,7 +1414,7 @@
         "h": 4,
         "w": 4,
         "x": 12,
-        "y": 48
+        "y": 44
       },
       "targets": [
         {
@@ -920,13 +1424,39 @@
         }
       ],
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "short",
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          }
+        },
         "overrides": []
       },
       "options": {
         "colorMode": "none",
-        "graphMode": "none"
-      }
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "timeseries",
@@ -937,10 +1467,10 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 6,
+        "h": 7,
         "w": 12,
         "x": 0,
-        "y": 52
+        "y": 48
       },
       "targets": [
         {
@@ -955,9 +1485,36 @@
         }
       ],
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
+          }
+        },
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "interval": null,
+      "links": []
     },
     {
       "type": "timeseries",
@@ -967,10 +1524,10 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 6,
+        "h": 7,
         "w": 12,
         "x": 12,
-        "y": 52
+        "y": 48
       },
       "targets": [
         {
@@ -991,10 +1548,36 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ops"
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "axisPlacement": "auto",
+            "gradientMode": "none"
+          }
         },
         "overrides": []
-      }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "transparent": false,
+      "description": "",
+      "interval": null,
+      "links": []
     }
   ]
 }
