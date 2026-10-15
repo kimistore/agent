@@ -2360,11 +2360,17 @@ func (s *StorageEngine) loadCheckpointInto(ctx context.Context, withRecovery boo
 			errSuperseded, key, stored, s.metadataCache.Writer, s.lease.Epoch())
 	}
 
+	// Before the recovery guard, not after it. Startup loads the checkpoint
+	// through restoreDurableState with recovery off -- that is the path a booting
+	// agent takes -- so a repair placed after this return never ran, and the
+	// startup log stayed silent while the totals stayed wrong. Placed here it runs
+	// on both paths, which costs one read per sealed bucket at load and nothing
+	// afterwards, because the totals are then correct.
+	s.repairBucketBytes(ctx)
+
 	if !withRecovery {
 		return nil
 	}
-
-	s.repairBucketBytes(ctx)
 
 	// Merge any offsets carried in the checkpoint. Rehydration from object
 	// storage is authoritative and runs separately, so a checkpoint that is
