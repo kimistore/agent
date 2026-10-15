@@ -12,7 +12,7 @@
   "graphTooltip": 1,
   "schemaVersion": 39,
   "version": 1,
-  "refresh": "30s",
+  "refresh": "1m",
   "time": {
     "from": "now-6h",
     "to": "now"
@@ -341,6 +341,18 @@
           "legendFormat": "commits",
           "instant": false,
           "range": true
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dg0i3veoyn5z4b"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(kimistore_compactor_budget_exhausted_total[5m]))",
+          "legendFormat": "budget exhausted",
+          "instant": false,
+          "range": true
         }
       ],
       "options": {
@@ -389,6 +401,7 @@
         },
         "overrides": []
       },
+      "interval": "60s",
       "gridPos": {
         "h": 7,
         "w": 12,
@@ -449,25 +462,13 @@
             "uid": "dg0i3veoyn5z4b"
           },
           "editorMode": "code",
-          "expr": "sum(rate(kimistore_lease_renewal_failures_total[5m]))",
-          "legendFormat": "lease renewal",
-          "instant": false,
-          "range": true
-        },
-        {
-          "refId": "E",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dg0i3veoyn5z4b"
-          },
-          "editorMode": "code",
           "expr": "sum(rate(kimistore_durable_timeouts_total[5m]))",
           "legendFormat": "durable timeout",
           "instant": false,
           "range": true
         },
         {
-          "refId": "F",
+          "refId": "E",
           "datasource": {
             "type": "prometheus",
             "uid": "dg0i3veoyn5z4b"
@@ -479,7 +480,7 @@
           "range": true
         },
         {
-          "refId": "G",
+          "refId": "F",
           "datasource": {
             "type": "prometheus",
             "uid": "dg0i3veoyn5z4b"
@@ -491,7 +492,7 @@
           "range": true
         },
         {
-          "refId": "H",
+          "refId": "G",
           "datasource": {
             "type": "prometheus",
             "uid": "dg0i3veoyn5z4b"
@@ -499,42 +500,6 @@
           "editorMode": "code",
           "expr": "sum(rate(kimistore_compactor_pass_errors_total[5m]))",
           "legendFormat": "compactor pass",
-          "instant": false,
-          "range": true
-        },
-        {
-          "refId": "I",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dg0i3veoyn5z4b"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(kimistore_lease_refused_writes_total[5m]))",
-          "legendFormat": "lease refused writes",
-          "instant": false,
-          "range": true
-        },
-        {
-          "refId": "J",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dg0i3veoyn5z4b"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(kimistore_ownership_refused_writes_total[5m]))",
-          "legendFormat": "ownership refused writes",
-          "instant": false,
-          "range": true
-        },
-        {
-          "refId": "K",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dg0i3veoyn5z4b"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(kimistore_manifest_writes_rejected_total[5m]))",
-          "legendFormat": "manifest write rejected",
           "instant": false,
           "range": true
         }
@@ -585,6 +550,7 @@
         },
         "overrides": []
       },
+      "interval": "60s",
       "gridPos": {
         "h": 7,
         "w": 12,
@@ -698,6 +664,7 @@
         },
         "overrides": []
       },
+      "interval": "60s",
       "gridPos": {
         "h": 7,
         "w": 12,
@@ -798,6 +765,7 @@
         },
         "overrides": []
       },
+      "interval": "60s",
       "gridPos": {
         "h": 7,
         "w": 12,
@@ -898,6 +866,7 @@
         },
         "overrides": []
       },
+      "interval": "60s",
       "gridPos": {
         "h": 7,
         "w": 12,
@@ -1011,6 +980,7 @@
         },
         "overrides": []
       },
+      "interval": "60s",
       "gridPos": {
         "h": 7,
         "w": 12,
@@ -1020,94 +990,6 @@
     },
     {
       "id": 14,
-      "type": "timeseries",
-      "title": "Compaction budget",
-      "description": "Passes that hit their time budget against passes overall. A budget-exhausted rate matching the pass rate means the compactor is throughput-limited; zero while passes climb means it is simply idle. Those two look identical in the passes/merges panel alone.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dg0i3veoyn5z4b"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dg0i3veoyn5z4b"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(kimistore_compactor_passes_total[5m]))",
-          "legendFormat": "passes",
-          "instant": false,
-          "range": true
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dg0i3veoyn5z4b"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(kimistore_compactor_budget_exhausted_total[5m]))",
-          "legendFormat": "budget exhausted",
-          "instant": false,
-          "range": true
-        }
-      ],
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": [],
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green"
-              }
-            ]
-          },
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "spanNulls": false,
-            "pointSize": 5,
-            "axisPlacement": "auto",
-            "gradientMode": "none",
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            }
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 12,
-        "y": 28
-      }
-    },
-    {
-      "id": 15,
       "type": "timeseries",
       "title": "Object store IO",
       "description": "Volume against the backing store. This is what the compactor costs, so it is where compaction competing with ingest becomes visible.",
@@ -1187,15 +1069,16 @@
         },
         "overrides": []
       },
+      "interval": "60s",
       "gridPos": {
         "h": 7,
         "w": 12,
-        "x": 0,
-        "y": 35
+        "x": 12,
+        "y": 28
       }
     },
     {
-      "id": 16,
+      "id": 15,
       "type": "row",
       "title": "Durability and cluster",
       "collapsed": false,
@@ -1204,11 +1087,11 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 42
+        "y": 35
       }
     },
     {
-      "id": 17,
+      "id": 16,
       "type": "timeseries",
       "title": "Durable flushes and wait",
       "description": "The flush interval is a durability bound for acks=all, not a size target, so it cannot simply be raised. Durable wait is also a histogram: mean is _sum over _count, the tail comes from _bucket.",
@@ -1312,15 +1195,16 @@
         },
         "overrides": []
       },
+      "interval": "60s",
       "gridPos": {
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 43
+        "y": 36
       }
     },
     {
-      "id": 18,
+      "id": 17,
       "type": "timeseries",
       "title": "Routing",
       "description": "How fresh the routing inventory is, and whether agents disagree about it.",
@@ -1424,11 +1308,12 @@
         },
         "overrides": []
       },
+      "interval": "60s",
       "gridPos": {
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 43
+        "y": 36
       }
     }
   ],

@@ -114,7 +114,17 @@ def stat(title, description, targets, **over):
 def ts(title, description, targets, unit="short"):
     d = json.loads(json.dumps(TS_DEFAULTS))
     d["unit"] = unit
-    return panel("timeseries", title, description, targets, d, TS_OPTIONS)
+    p = panel("timeseries", title, description, targets, d, TS_OPTIONS)
+    # A fixed step, so the query asks for 60s-spaced points rather than whatever
+    # the panel's pixel width would imply.
+    #
+    # Without it a 6h window in a wide panel can be stepped at 15s or finer, which
+    # is four times the points for no extra information: every metric here is a
+    # counter sampled on a 30s scrape, so a 15s step returns interpolated filler
+    # between samples that do not exist. It is the single cheapest reduction in
+    # query cost available and it changes nothing that is plotted.
+    p["interval"] = "60s"
+    return p
 
 
 def row(title):
@@ -234,7 +244,8 @@ def build():
         "compactor sit broken for eight hours while every log line looked normal.",
         [("sum(rate(kimistore_compactor_passes_total[5m]))", "passes"),
          ("sum(rate(kimistore_compactor_merges_total[5m]))", "merges"),
-         ("sum(rate(kimistore_compactor_merge_commits_total[5m]))", "commits")],
+         ("sum(rate(kimistore_compactor_merge_commits_total[5m]))", "commits"),
+         ("sum(rate(kimistore_compactor_budget_exhausted_total[5m]))", "budget exhausted")],
     ))
 
     p.append(ts(
@@ -245,14 +256,10 @@ def build():
         [("sum(rate(kimistore_offset_flush_failures_total[5m]))", "offset flush"),
          ("sum(rate(kimistore_ownership_claim_failures_total[5m]))", "ownership claim"),
          ("sum(rate(kimistore_ownership_renewal_failures_total[5m]))", "ownership renewal"),
-         ("sum(rate(kimistore_lease_renewal_failures_total[5m]))", "lease renewal"),
          ("sum(rate(kimistore_durable_timeouts_total[5m]))", "durable timeout"),
          ("sum(rate(kimistore_object_store_timeouts_total[5m]))", "object store timeout"),
          ("sum(rate(kimistore_wal_recovery_truncations_total[5m]))", "wal truncation"),
-         ("sum(rate(kimistore_compactor_pass_errors_total[5m]))", "compactor pass"),
-         ("sum(rate(kimistore_lease_refused_writes_total[5m]))", "lease refused writes"),
-         ("sum(rate(kimistore_ownership_refused_writes_total[5m]))", "ownership refused writes"),
-         ("sum(rate(kimistore_manifest_writes_rejected_total[5m]))", "manifest write rejected")],
+         ("sum(rate(kimistore_compactor_pass_errors_total[5m]))", "compactor pass")],
     ))
 
     p.append(row("Ingest"))
@@ -295,15 +302,6 @@ def build():
         [("sum(rate(kimistore_compactor_segments_merged_total[5m]))", "segments merged"),
          ("sum(rate(kimistore_compactor_merged_segments_written_total[5m]))", "segments written"),
          ("sum(rate(kimistore_retention_segments_deleted_total[5m]))", "segments deleted")],
-    ))
-
-    p.append(ts(
-        "Compaction budget",
-        "Passes that hit their time budget against passes overall. A budget-exhausted rate matching the pass rate "
-        "means the compactor is throughput-limited; zero while passes climb means it is simply idle. Those two "
-        "look identical in the passes/merges panel alone.",
-        [("sum(rate(kimistore_compactor_passes_total[5m]))", "passes"),
-         ("sum(rate(kimistore_compactor_budget_exhausted_total[5m]))", "budget exhausted")],
     ))
 
     p.append(ts(
@@ -357,7 +355,7 @@ def main():
         "graphTooltip": 1,
         "schemaVersion": 39,
         "version": 1,
-        "refresh": "30s",
+        "refresh": "1m",
         "time": {"from": "now-6h", "to": "now"},
         "panels": panels,
         "annotations": {"list": [{
