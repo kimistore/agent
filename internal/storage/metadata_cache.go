@@ -434,6 +434,63 @@ func (mc *MetadataCache) SealWindow(topic string, partition int32) (*BucketRef, 
 	return &bucket, refs
 }
 
+// RepairBucketBytes overwrites one sealed bucket's recorded byte total.
+//
+// It exists because the total is a summary of the entries the bucket lists, and a
+// stored summary can disagree with what it summarises. Until 1.0.20 the
+// compactor wrote a rewritten bucket's Bytes from the one segment it had just
+// produced, so every bucket it touched carried roughly one entry's worth of a
+// total spanning all of them: 38 of 46 on knode3, under-reporting the partition
+// sixteenfold.
+//
+// The value is read only by the byte policy, which accumulates it against a
+// budget, so a stale total never misdirects a read -- it makes a correctly
+// configured retention budget reclaim far too little while reporting that it is
+// configured. Correcting it in memory at load is enough for the policy, and the
+// compactor writes correct totals from 1.0.20 onward, so the damage does not
+// spread.
+//
+// Buckets the compactor never revisits are the ones that stay wrong: a bucket
+// whose entries are all already-merged products has nothing left to merge, so
+// nothing else would ever rewrite it. This is the only thing that corrects them.
+//
+// Reports whether the bucket was present.
+func (mc *MetadataCache) RepairBucketBytes(topic string, partition int32, key string, bytes int64) bool {
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	ts, ok := mc.Topics[topic]
+	if !ok {
+		return false
+	}
+	ps, ok := ts.Partitions[partition]
+	if !ok {
+		return false
+	}
+	for i := range ps.Sealed {
+		if ps.Sealed[i].Key == key {
+			ps.Sealed[i].Bytes = bytes
+			return true
+		}
+	}
+	return false
+}
+
+// BucketRefs returns a copy of the sealed bucket references for a partition, so a
+// caller can inspect them without holding the cache lock across a read.
+func (mc *MetadataCache) BucketRefs(topic string, partition int32) []BucketRef {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+	ts, ok := mc.Topics[topic]
+	if !ok {
+		return nil
+	}
+	ps, ok := ts.Partitions[partition]
+	if !ok {
+		return nil
+	}
+	return append([]BucketRef(nil), ps.Sealed...)
+}
+
 // BucketFor returns the sealed bucket covering offset, or nil when the offset
 // falls in no bucket. It is the lookup a cold read performs before fetching.
 func (mc *MetadataCache) BucketFor(topic string, partition int32, offset int64) *BucketRef {

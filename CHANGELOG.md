@@ -11,6 +11,33 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.21
+
+The byte totals written before 1.0.20 are corrected when the index loads.
+
+### Fixed
+
+- A sealed bucket whose recorded byte total disagrees with the entries it lists
+  is recomputed at load
+
+  Buckets written by 1.0.19 and earlier keep their wrong total forever without
+  this, because the compactor never revisits them: a bucket whose entries are all
+  already-merged products has nothing left to merge, so it is skipped on every
+  pass and nothing else would ever rewrite it. The total is the only thing that
+  distinguishes them, and it is the only thing the byte policy reads
+
+  Correction is in memory, not persisted. The policy reads the in-memory copy, and
+  the compactor writes correct totals from 1.0.20 onward, so persisting would mean
+  a control-plane write per stale bucket on every start for no benefit
+
+  Startup logs what it corrected and by how much the partition was under-reported,
+  because that is what makes the number afterwards trustworthy
+
+  The repair function is unit-tested against a bucket carrying the old
+  compactor's arithmetic. Its wiring into the load path is not covered by that
+  test, which calls the function directly -- it is one line, and the startup log
+  line is the proof
+
 ## 1.0.20
 
 The byte retention policy has been reasoning from fiction since it was written.

@@ -761,3 +761,71 @@ func TestCompactPartition_RewrittenBucketRecordsTheSumOfItsEntries(t *testing.T)
 		t.Error("bucket lists every original entry; the merge replaced none of them")
 	}
 }
+
+// A bucket whose recorded byte total is wrong is corrected when the index loads,
+// because nothing else will ever correct it.
+//
+// Until 1.0.20 the compactor wrote a rewritten bucket's Bytes from the single
+// segment it had just produced. Those buckets persist: one whose entries are all
+// already-merged products has nothing left to merge, so the compactor skips it
+// forever and its total stays wrong for the life of the partition. Only a load
+// that recomputes from the entries can fix it, which is what this covers.
+func TestRestore_RepairsBucketByteTotalsThatDisagreeWithTheirEntries(t *testing.T) {
+	inner := newCASStore()
+	engine, err := NewStorageEngine(t.TempDir(), inner, "bucket", RetentionConfig{},
+		WithCompactor(CompactorConfig{
+			Interval: time.Hour, MinSegments: 4,
+			MaxMergedBytes: 32 * 1024, ScratchDir: t.TempDir(),
+		}))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	// Two buckets, so the seeded one is not the newest and is therefore not
+	// skipped by compaction on a later pass.
+	seedBucketSized(t, engine, inner, "orders", 0, 1000, 120, 1024)
+	seedBucketSized(t, engine, inner, "orders", 0, 2000, 120, 1024)
+
+	buckets := engine.metadataCache.BucketRefs("orders", 0)
+	if len(buckets) != 2 {
+		t.Fatalf("expected 2 sealed buckets, got %d", len(buckets))
+	}
+	target := buckets[0]
+
+	refs, err := engine.readBucket(context.Background(), target)
+	if err != nil {
+		t.Fatalf("readBucket: %v", err)
+	}
+	var want int64
+	for _, r := range refs {
+		want += r.Size
+	}
+	if want == 0 {
+		t.Fatal("fixture has no sized entries")
+	}
+
+	// The damage the old compactor wrote: the total of the last entry alone.
+	// SeededBucket derives the total correctly, so it is injected afterwards --
+	// which is also how it reached the real index, from a writer that believed it
+	// knew the total.
+	damage := refs[len(refs)-1].Size
+	engine.metadataCache.RepairBucketBytes("orders", 0, target.Key, damage)
+	if got := engine.metadataCache.BucketRefs("orders", 0)[0].Bytes; got != damage {
+		t.Fatalf("fixture did not take: recorded %d, want %d", got, damage)
+	}
+
+	engine.repairBucketBytes(context.Background())
+
+	var fixed *BucketRef
+	for i, b := range engine.metadataCache.BucketRefs("orders", 0) {
+		if b.Key == target.Key {
+			fixed = &engine.metadataCache.BucketRefs("orders", 0)[i]
+		}
+	}
+	if fixed == nil {
+		t.Fatal("bucket vanished from the index")
+	}
+	if fixed.Bytes != want {
+		t.Errorf("recorded Bytes=%d, entries sum to %d; a bucket the compactor will never "+
+			"rewrite keeps its wrong total forever unless it is repaired at load", fixed.Bytes, want)
+	}
+}

@@ -2263,6 +2263,67 @@ func (s *StorageEngine) LoadCheckpoint() error {
 // loadCheckpointInto reads the checkpoint and merges it into the cache.
 // withRecovery also re-applies the consumer offset map, which only a caller
 // explicitly asking for a reload needs.
+// repairBucketBytes recomputes every sealed bucket's recorded byte total from
+// the entries that bucket lists, and corrects the in-memory copy where it
+// disagrees.
+//
+// This exists to fix buckets written by 1.0.19 and earlier, where the compactor
+// recorded a rewritten bucket's total as the size of the single segment it had
+// just produced rather than the sum of the ~33 entries the bucket holds. Nothing
+// else corrects them: a bucket whose entries are all already-merged products has
+// nothing left to merge, so the compactor skips it forever and its total stays
+// wrong for the life of the partition.
+//
+// It matters only to the byte retention policy, which accumulates these totals
+// against a budget. A budget sized from real disk usage would have accounted for
+// about a sixteenth of what is stored and kept sixteen times too much, while the
+// configuration looked correct.
+//
+// The stored object is not rewritten. The policy reads the in-memory copy, and
+// the compactor writes correct totals from 1.0.20 onward, so persisting would
+// mean a control-plane write per stale bucket on every start for no benefit. What
+// it logs is what a reader needs in order to trust the number: how many buckets
+// were wrong, and by how much the partition was under-reported.
+func (s *StorageEngine) repairBucketBytes(ctx context.Context) {
+	for _, topic := range s.metadataCache.GetTopics() {
+		for _, partition := range s.metadataCache.GetPartitions(topic) {
+			var repaired, skipped int
+			var was, now int64
+			for _, b := range s.metadataCache.BucketRefs(topic, partition) {
+				refs, err := s.readBucket(ctx, b)
+				if err != nil {
+					// A bucket that cannot be read is left alone rather than
+					// zeroed: an unknown total already counts against the budget,
+					// which is the safe direction, and overwriting it with a guess
+					// would not be.
+					skipped++
+					continue
+				}
+				var total int64
+				for _, r := range refs {
+					total += r.Size
+				}
+				if total == b.Bytes {
+					continue
+				}
+				was += b.Bytes
+				now += total
+				if s.metadataCache.RepairBucketBytes(topic, partition, b.Key, total) {
+					repaired++
+				}
+			}
+			if repaired > 0 {
+				log.Printf("Repair: %s/%d corrected the recorded byte total of %d sealed bucket(s) "+
+					"(partition was recorded as %d B, actually %d B, %.1fx); %d unreadable and left alone",
+					topic, partition, repaired, was, now, float64(now)/float64(max(was, 1)), skipped)
+			} else if skipped > 0 {
+				log.Printf("Repair: %s/%d left %d sealed bucket(s) alone; their contents could not be read",
+					topic, partition, skipped)
+			}
+		}
+	}
+}
+
 func (s *StorageEngine) loadCheckpointInto(ctx context.Context, withRecovery bool) error {
 	key := s.checkpointKey()
 
@@ -2302,6 +2363,8 @@ func (s *StorageEngine) loadCheckpointInto(ctx context.Context, withRecovery boo
 	if !withRecovery {
 		return nil
 	}
+
+	s.repairBucketBytes(ctx)
 
 	// Merge any offsets carried in the checkpoint. Rehydration from object
 	// storage is authoritative and runs separately, so a checkpoint that is
