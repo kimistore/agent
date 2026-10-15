@@ -685,3 +685,79 @@ func TestCompactPartition_FailedMergeDiscardsItsSegmentAndKeepsSources(t *testin
 		t.Errorf("%d large segment(s) left behind by a merge that never committed", stray)
 	}
 }
+
+// A rewritten bucket must record the sum of what it holds, not the size of the
+// segment the pass happened to produce.
+//
+// Bytes is what the byte retention policy accumulates against the budget. Setting
+// it to the merged segment's own size records one entry's worth for a bucket
+// holding all of them, so the index under-reports the partition by the number of
+// entries it is carrying.
+//
+// On knode3 this had been true for as long as the compactor had been running: the
+// index claimed 1.12GB of sealed data where 18.58GB sat on disk, a ratio of 0.06,
+// in 38 of 46 buckets. Reads were unaffected, because they resolve offsets through
+// the entries rather than through this field -- which is why nothing noticed. A
+// KIMISTORE_RETENTION_BYTES set from real disk usage would have accounted for a
+// sixteenth of what is stored and kept roughly sixteen times too much, while
+// looking correctly configured.
+func TestCompactPartition_RewrittenBucketRecordsTheSumOfItsEntries(t *testing.T) {
+	store := &listFailStore{inner: newCASStore()}
+	engine, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{},
+		WithCompactor(CompactorConfig{
+			Interval: time.Hour, MinSegments: 4,
+			MaxMergedBytes: 32 * 1024, ScratchDir: t.TempDir(),
+			MaxPassDuration: time.Minute,
+		}))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer engine.Close()
+
+	// A bucket far larger than one merge's cap, so the pass rewrites it while
+	// most of its entries are kept rather than folded in. A bucket that compacts
+	// to a single segment would record the right total by accident.
+	_, refs := seedBucketSized(t, engine, store.inner, "orders", 0, 1000, 400, 1024)
+	seedBucketSized(t, engine, store.inner, "orders", 0, 5000, 400, 1024)
+
+	if _, err := engine.compactPartition(context.Background(), "orders", 0); err != nil {
+		t.Fatalf("compactPartition: %v", err)
+	}
+
+	window, buckets := engine.metadataCache.IndexSnapshot("orders", 0)
+	var rewritten *BucketRef
+	_ = window
+	for i := range buckets {
+		if buckets[i].First == 1000 {
+			rewritten = &buckets[i]
+		}
+	}
+	if rewritten == nil {
+		t.Fatal("the merged bucket is not in the index")
+	}
+
+	body := readBucketObject(t, store.inner, rewritten.Key)
+	var contents []SegmentRef
+	if err := json.Unmarshal(body, &contents); err != nil {
+		t.Fatalf("bucket body: %v", err)
+	}
+	var want int64
+	for _, r := range contents {
+		want += r.Size
+	}
+	if len(contents) < 2 {
+		t.Fatalf("bucket holds %d entries; this test needs a partially merged bucket "+
+			"where recording only the merged segment would under-report", len(contents))
+	}
+	if rewritten.Bytes != want {
+		t.Errorf("bucket records Bytes=%d but its %d entries sum to %d (%.1fx low)",
+			rewritten.Bytes, len(contents), want,
+			float64(want)/float64(max(rewritten.Bytes, 1)))
+	}
+
+	// The sources it kept are still in the bucket, and the sources it merged are
+	// not, so the entries are not simply the originals.
+	if len(contents) == len(refs) {
+		t.Error("bucket lists every original entry; the merge replaced none of them")
+	}
+}

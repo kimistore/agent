@@ -429,11 +429,34 @@ func (s *StorageEngine) compactPartition(ctx context.Context, topic string, part
 	// fall outside every bucket. SealWindow derives it the same way: the last
 	// entry's base offset, not the last entry's reach.
 	first, last := refs[0].Base, refs[len(refs)-1].Base
+	// Bytes is the sum over the whole rewritten bucket, not the size of the
+	// segment this pass just produced.
+	//
+	// The bucket holds kept plus mergedRef -- on knode3, 33 entries of about
+	// 16MB each -- so recording only the merged one under-reports it by roughly
+	// the number of entries. Measured there: the index claimed 1.12GB of sealed
+	// data where 18.58GB was on disk, a ratio of 0.06, in 38 of 46 buckets.
+	//
+	// That does not corrupt reads, which resolve offsets through the entries
+	// rather than through this field. It corrupts the byte policy, which
+	// accumulates Bytes newest-first against the budget in policyBoundary: a
+	// budget set from actual disk usage would have accounted for a sixteenth of
+	// what is really stored, and so would have kept roughly sixteen times too
+	// much while appearing correctly configured.
+	//
+	// This is the failure the merge consistency check further down refuses to
+	// write past -- the index disagreeing with the objects about how much data a
+	// range holds -- reached from the other direction, by never computing the
+	// total at all.
+	var totalBytes int64
+	for _, ref := range contents {
+		totalBytes += ref.Size
+	}
 	next := BucketRef{
 		First:  first,
 		Last:   last,
 		Key:    bucketKey(topic, partition, first, last),
-		Bytes:  merged.BytesOut,
+		Bytes:  totalBytes,
 		Newest: mergedRef.Modified,
 	}
 	// The entries this pass did not merge stay in the bucket. Leaving them out

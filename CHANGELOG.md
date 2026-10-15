@@ -11,6 +11,37 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.20
+
+The byte retention policy has been reasoning from fiction since it was written.
+
+### Fixed
+
+- A bucket rewritten by the compactor now records the sum of every entry it
+  holds, not the size of the segment the pass happened to produce
+
+  The rewritten bucket carries the entries that were not merged plus the new
+  merged one -- 33 entries of about 16MB each on knode3 -- and the total was taken
+  from the merged segment alone. The index claimed **1.12GB of sealed data where
+  18.58GB was on disk**, a ratio of 0.06, in 38 of 46 buckets
+
+  Reads are unaffected: an offset resolves through the entries, not through this
+  field. That is precisely why nothing noticed. The byte policy is affected:
+  `policyBoundary` accumulates `Bytes` newest-first against the budget, so a
+  `KIMISTORE_RETENTION_BYTES` set from actual disk usage would have accounted for
+  a sixteenth of what is really stored and kept roughly sixteen times too much,
+  while looking correctly configured
+
+  This is the same failure the merge consistency check refuses to write past --
+  the index disagreeing with the objects about how much data a range holds --
+  reached from the other direction, by never computing the total. Found by
+  comparing the recorded byte total against the sum of the sizes the buckets
+  actually list, which is a check nothing had been making
+
+  Existing buckets keep their wrong totals until the compactor rewrites them.
+  A one-off repair of the recorded values is needed before a byte budget can be
+  trusted
+
 ## 1.0.19
 
 A merge that fails after writing its segment no longer strands it.
