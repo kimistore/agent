@@ -249,3 +249,74 @@ func TestDurable_FrontierHoldsForRealGap(t *testing.T) {
 		t.Errorf("durable offset = %d, want 43 (only the gap segment is covered)", got)
 	}
 }
+
+// A wedge that already has entries in pending must still be repairable.
+//
+// This is the state knode3 spent eight hours in. The frontier froze at 1534684
+// while the write head ran to 1537421, and every acks=all produce timed out
+// against a 10s deadline even though the objects were in object storage and
+// named by the index. The downstream lost 8h15m of data across eleven gaps.
+//
+// The repair that exists for this was gated on pending being empty -- and a
+// wedge is precisely a frontier with entries stacked up in pending. So once a
+// wedge began, no further repair could ever run, and nothing but a restart
+// (which re-seeds the frontier from the log end offset) could clear it.
+//
+// Getting pending populated is the part that is easy to get wrong. An
+// out-of-order landing does not always do it: if the repair is reachable, it
+// skips the frontier forward first and the mark takes the ordinary path. The
+// repair is blocked only while a sealed segment still sits on local disk below
+// the landing base, because that segment is the evidence of a genuine gap. So
+// the sequence is: block the repair with a real sealed segment, let a mark stack
+// up in pending, complete that segment's upload, then land another mark.
+func TestDurable_FrontierRepairsAWedgeWithEntriesPending(t *testing.T) {
+	store := NewMockStore()
+	tmp := t.TempDir()
+	se, err := NewStorageEngine(tmp, store, "bucket", RetentionConfig{},
+		WithAgentID("durable"), WithFlushInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	defer se.Close()
+
+	dir := filepath.Join(tmp, "orders", "0")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// A restart seeded the frontier behind where the partition actually is.
+	se.ensureDurable("orders", 0, 1000)
+
+	// A sealed segment is still on local disk below the write head. While it is
+	// there the frontier must hold, because acknowledging past it would claim
+	// durability for bytes that have not reached object storage yet.
+	blocker := filepath.Join(dir, wal.SegmentName(990, 1))
+	if err := os.WriteFile(blocker, []byte("sealed"), 0o644); err != nil {
+		t.Fatalf("write sealed segment: %v", err)
+	}
+
+	// This lands past the frontier while the blocker is still present, so the
+	// repair is correctly refused and the segment can only stack up in pending.
+	se.markSegmentDurable("orders", 0, 1010, 1020)
+	if got := se.DurableOffset("orders", 0); got != 1000 {
+		t.Fatalf("frontier advanced to %d with a segment still on local disk; want 1000", got)
+	}
+
+	// The blocking segment's upload finishes and it leaves local disk. From
+	// here nothing below the write head is unaccounted for, so nothing here can
+	// justify the frontier staying where it is -- yet pending is non-empty,
+	// which is the wedge, and which the old gate read as a reason not to act.
+	if err := os.Remove(blocker); err != nil {
+		t.Fatalf("remove sealed segment: %v", err)
+	}
+
+	se.markSegmentDurable("orders", 0, 1020, 1030)
+
+	if got := se.DurableOffset("orders", 0); got != 1030 {
+		t.Errorf("durable offset = %d, want 1030; a frontier with entries in pending "+
+			"cannot recover without a restart", got)
+	}
+	if err := se.WaitDurable(context.Background(), "orders", 0, 1030, time.Second); err != nil {
+		t.Errorf("WaitDurable after repair: %v", err)
+	}
+}

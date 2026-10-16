@@ -11,6 +11,52 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.23
+
+The durability frontier could wedge permanently, and once wedged nothing but a
+restart could clear it.
+
+### Fixed
+
+- The stale-frontier repair no longer requires `pending` to be empty
+
+  The repair that skips a frontier forward past an under-reported seed was gated
+  on `len(pending) == 0`. A wedge is precisely a frontier with entries stacked up
+  in `pending`, so the first landing that put anything there disabled the repair
+  permanently, and the partition stayed wedged until a restart re-seeded the
+  frontier from the log end offset
+
+  On knode3 this held a partition frozen at offset 1534684 while the write head
+  ran to 1537421, for eight hours. Every `acks=all` produce was rejected against
+  its 10s deadline with `ErrDurableTimeout` even though the objects were in
+  object storage and named by the index, because the frontier is what decides
+  durability and it had stopped counting them. The downstream lost 8h15m of data
+  across eleven gaps
+
+  Getting `pending` populated is not simply a matter of landing segments out of
+  order. While the repair is reachable it skips the frontier forward first and
+  the landing takes the ordinary path, so an out-of-order landing only fills
+  `pending` when a sealed segment still sits on local disk below it, blocking the
+  repair as a genuine gap. The regression test sequences that explicitly; an
+  earlier attempt did not, and passed against the unfixed code
+
+  The repair still refuses to move the frontier while a sealed segment remains on
+  local disk below it, so a real gap is never skipped -- only a wedge, where
+  local disk is evidence of absence
+
+## 1.0.22
+
+The byte repair added in 1.0.21 never ran in production, because it sat behind a
+guard that only exists on the error path.
+
+### Fixed
+
+- The bucket byte repair runs on the startup load path
+
+  `repairBucketBytes` was called after the checkpoint was loaded inside a recovery
+  guard that a successful start never enters, so the startup log line it was
+  written to accompany never appeared, and no bucket was ever corrected
+
 ## 1.0.21
 
 The byte totals written before 1.0.20 are corrected when the index loads.

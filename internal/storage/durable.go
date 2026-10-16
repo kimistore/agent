@@ -114,7 +114,16 @@ func (s *StorageEngine) markSegmentDurable(topic string, partition int32, base, 
 	// A segment landing past the frontier means the frontier is behind. That is
 	// the case worth repairing, so note it and drop the lock: the check below
 	// touches the filesystem and must not be held across an append's wait.
-	staleFrontier := base > st.frontier && len(st.pending) == 0
+	//
+	// Deliberately not conditioned on pending being empty. Until 1.0.23 it was,
+	// and that made the repair unreachable in exactly the state it exists to fix:
+	// a wedge is a frontier with entries stacked up in pending, so the moment a
+	// transient out-of-order upload populated pending, no further repair could
+	// ever run. On knode3 that held a partition wedged at a fixed offset for eight
+	// hours, rejecting every acks=all produce while its records sat in object
+	// storage, and cost the downstream 8h15m of data. The restart cleared it,
+	// because the frontier is re-seeded from the log end offset at startup.
+	staleFrontier := base > st.frontier
 	s.durableMu.Unlock()
 
 	// Repair a frontier that fell behind without a real gap under it.
@@ -137,11 +146,19 @@ func (s *StorageEngine) markSegmentDurable(topic string, partition int32, base, 
 	//
 	// Without a WAL to inspect there is nothing to prove absence with, so the
 	// frontier is left alone.
+	//
+	// Advancing here cannot skip a gap. The frontier is the highest offset
+	// contiguously present in object storage, and this only claims everything
+	// below `base` is, which SealedBelow is the evidence for: nothing on local
+	// disk is still waiting to go up. The entries already in pending were
+	// uploaded -- pending holds segments that landed out of order, not ones that
+	// failed -- so they are durable and the drain below absorbs them once the
+	// frontier reaches them.
 	if staleFrontier && s.walMgr != nil && !s.walMgr.SealedBelow(topic, partition, base) {
 		s.durableMu.Lock()
 		// Re-check under the lock: a concurrent mark may have advanced the
-		// frontier or filled pending while the check was in flight.
-		if base > st.frontier && len(st.pending) == 0 {
+		// frontier while the filesystem check was in flight.
+		if base > st.frontier {
 			st.frontier = base
 		}
 		s.durableMu.Unlock()
