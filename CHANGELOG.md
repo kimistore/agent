@@ -11,6 +11,41 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.24
+
+The byte budget could only be written as a raw integer, and writing it any other
+way removed the budget instead of setting it.
+
+### Added
+
+- `KIMISTORE_RETENTION_BYTES` accepts a unit suffix: `30G`, `30GB`, `30GiB`, `1.5GiB`
+
+  A bare integer is still a bare count of bytes, so a value written before this
+  keeps its meaning and no deployment changes behaviour by upgrading
+
+  Plain SI letters are decimal and the `i` forms are binary, kept distinct
+  because they disagree by 7% at "G" and 10% at "T", and a budget that is
+  quietly 7% off is a budget nobody agreed to. `30G` is 30000000000 and
+  `30GiB` is 32212254720
+
+### Fixed
+
+- An unparseable byte budget no longer silently means "no limit"
+
+  The setting's default is -1, which means unlimited, so a value that failed to
+  parse did not fail safe. `KIMISTORE_RETENTION_BYTES=30G` logged one line and
+  the agent then stored without limit, which looks like a working retention
+  policy right up until the disk fills. The reason is now included in the log
+  message, so the line says why and not just that it happened
+
+  A negative value carrying a unit is refused for the same reason: it would
+  resolve to a negative count, which every caller reads as unlimited, so `-30G`
+  would quietly mean the opposite of itself. Plain negatives still work, since
+  -1 is the documented sentinel for a disabled budget
+
+  The other numeric settings are untouched. Counts, ports and durations still go
+  through the plain integer parser, because a suffix has no meaning in them
+
 ## 1.0.23
 
 The durability frontier could wedge permanently, and once wedged nothing but a

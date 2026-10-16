@@ -258,3 +258,126 @@ func TestFromEnv_AdvertisedPortFromListenAddress(t *testing.T) {
 		t.Errorf("an unparseable listen address should fall back to 19092, got %d", got)
 	}
 }
+
+// The byte budget must be writable the way a person says a size.
+//
+// KIMISTORE_RETENTION_BYTES defaults to -1, which means "no limit". So a value
+// that fails to parse does not fail safe -- it silently removes the budget it was
+// written to set. That is what KIMISTORE_RETENTION_BYTES=30G used to do: the
+// agent logged one line and then stored without limit, which looks exactly like
+// a working retention policy until the disk fills.
+func TestParseByteSize(t *testing.T) {
+	tests := []struct {
+		in      string
+		want    int64
+		wantErr bool
+	}{
+		// A bare integer stays a bare count of bytes, so values written before
+		// units existed keep their meaning across an upgrade.
+		{in: "0", want: 0},
+		{in: "30000000000", want: 30_000_000_000},
+		{in: "-1", want: -1},
+
+		// Plain SI letters are decimal.
+		{in: "30G", want: 30_000_000_000},
+		{in: "30g", want: 30_000_000_000},
+		{in: "30GB", want: 30_000_000_000},
+		{in: "1k", want: 1000},
+		{in: "1M", want: 1_000_000},
+		{in: "1T", want: 1_000_000_000_000},
+
+		// The "i" forms are binary, and the two disagree -- which is the reason
+		// both spellings exist.
+		{in: "30GiB", want: 30 << 30},
+		{in: "30gib", want: 30 << 30},
+		{in: "30gi", want: 30 << 30},
+		{in: "512MiB", want: 512 << 20},
+		{in: "1KiB", want: 1024},
+		{in: "1TiB", want: 1 << 40},
+
+		// Surrounding whitespace and a trailing "b" are tolerated.
+		{in: "  30G  ", want: 30_000_000_000},
+		{in: "42b", want: 42},
+		{in: "30B", want: 30},
+
+		// Fractions, to a thousandth.
+		{in: "1.5G", want: 1_500_000_000},
+		{in: "1.5GiB", want: 1_610_612_736},
+		{in: "0.5M", want: 500_000},
+
+		// Matching is case-insensitive, so the mixed-case spellings resolve to
+		// the same unit as their lowercase form rather than being refused.
+		{in: "30Gb", want: 30_000_000_000},
+		{in: "30Gi", want: 30 << 30},
+
+		// Refused rather than guessed, because each of these would otherwise
+		// resolve to something the operator did not ask for.
+		{in: "", wantErr: true},
+		{in: "30X", wantErr: true},
+		{in: "G", wantErr: true},   // no number
+		{in: "30.", wantErr: true}, // point with no digits
+		{in: "30.5.5G", wantErr: true},
+		{in: "-30G", wantErr: true},   // would mean "unlimited"
+		{in: "30 000", wantErr: true}, // no separator support
+		{in: "30GBs", wantErr: true},  // trailing junk
+	}
+
+	for _, tc := range tests {
+		got, err := parseByteSize(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("parseByteSize(%q) = %d, want an error", tc.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseByteSize(%q) unexpected error: %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("parseByteSize(%q) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The wiring, not just the parser.
+//
+// A parser test passes whether or not the setting is routed through it, which is
+// how 1.0.21 shipped a repair that was called in the wrong place and 1.0.22 had
+// to move it. So this drives the real entrypoint and asserts the setting lands.
+func TestFromEnv_RetentionBytesAcceptsUnits(t *testing.T) {
+	tests := []struct {
+		env  string
+		want int64
+	}{
+		{env: "30G", want: 30_000_000_000},
+		{env: "30GB", want: 30_000_000_000},
+		{env: "30GiB", want: 30 << 30},
+		{env: "30g", want: 30_000_000_000},
+		{env: "1.5G", want: 1_500_000_000},
+		{env: "30000000000", want: 30_000_000_000},
+		{env: "0", want: 0},
+		{env: "-1", want: -1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.env, func(t *testing.T) {
+			t.Setenv("KIMISTORE_RETENTION_BYTES", tc.env)
+			if got := FromEnv().Retention.RetentionBytes; got != tc.want {
+				t.Errorf("FromEnv().Retention.RetentionBytes = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// An unset budget must still mean "no limit", and an unreadable one must fall
+// back to that rather than to zero -- zero would mean "delete everything".
+func TestFromEnv_RetentionBytesFallsBackToUnlimited(t *testing.T) {
+	for _, env := range []string{"", "   ", "not-a-size", "-30G"} {
+		t.Setenv("KIMISTORE_RETENTION_BYTES", env)
+		if got := FromEnv().Retention.RetentionBytes; got != -1 {
+			t.Errorf("KIMISTORE_RETENTION_BYTES=%q gave RetentionBytes = %d, want -1 (unlimited)",
+				env, got)
+		}
+	}
+}

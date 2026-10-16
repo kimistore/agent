@@ -25,6 +25,7 @@ import (
 
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -247,7 +248,7 @@ func FromEnv() Config {
 		},
 
 		Retention: RetentionConfig{
-			RetentionBytes: envInt64("KIMISTORE_RETENTION_BYTES", -1),
+			RetentionBytes: envBytes("KIMISTORE_RETENTION_BYTES", -1),
 			RetentionTime:  time.Duration(envInt64("KIMISTORE_RETENTION_MS", 0)) * time.Millisecond,
 			CheckInterval:  time.Duration(envInt64("KIMISTORE_RETENTION_CHECK_MS", 300_000)) * time.Millisecond,
 		},
@@ -429,6 +430,147 @@ func envInt64(name string, def int64) int64 {
 	v, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
 		log.Printf("Invalid %s=%q, using default %d", name, raw, def)
+		return def
+	}
+	return v
+}
+
+// byteUnits are the suffixes parseByteSize accepts and what each one means.
+//
+// The plain SI letter is decimal and the "i" form is binary, which is the whole
+// reason both spellings exist: "30G" is 30e9 bytes and "30GiB" is 30*2^30. They
+// are kept distinct rather than guessed, because they disagree by 7% at "G" and
+// by 10% at "T", and a retention budget that is quietly 7% off is a budget
+// nobody agreed to.
+//
+// The binary spellings omit the trailing "b" ("30gi" as well as "30GiB") since
+// that is how most people type them, but the decimal ones keep it, matching how
+// the units are actually written.
+var byteUnits = map[string]int64{
+	"":  1,
+	"b": 1,
+
+	"k": 1000, "kb": 1000,
+	"m": 1000 * 1000, "mb": 1000 * 1000,
+	"g": 1000 * 1000 * 1000, "gb": 1000 * 1000 * 1000,
+	"t": 1000 * 1000 * 1000 * 1000, "tb": 1000 * 1000 * 1000 * 1000,
+	"p": 1000 * 1000 * 1000 * 1000 * 1000, "pb": 1000 * 1000 * 1000 * 1000 * 1000,
+
+	"ki": 1 << 10, "kib": 1 << 10,
+	"mi": 1 << 20, "mib": 1 << 20,
+	"gi": 1 << 30, "gib": 1 << 30,
+	"ti": 1 << 40, "tib": 1 << 40,
+	"pi": 1 << 50, "pib": 1 << 50,
+}
+
+// parseByteSize reads a byte count written as a plain integer or with a unit
+// suffix: "30G", "30GB", "30gib", "1.5GiB", "512MiB".
+//
+// A bare integer stays a bare count of bytes, so a value written before units
+// existed keeps its meaning and no deployment changes behaviour by upgrading.
+//
+// Fractions are honoured to three decimal places, which is finer than any unit
+// can be represented in and keeps the arithmetic inside int64 without needing
+// big integers: 999 * 1<<50 is well inside the range.
+//
+// A negative value carrying a unit is rejected rather than parsed. Accepting it
+// would resolve to a negative count, which every caller reads as "no limit" --
+// so "-30G" would quietly mean the opposite of "-30G". Plain negatives are still
+// accepted, because -1 is the documented sentinel for a disabled budget.
+func parseByteSize(raw string) (int64, error) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if s == "" {
+		return 0, errors.New("empty value")
+	}
+
+	neg := false
+	i := 0
+	if s[0] == '+' || s[0] == '-' {
+		neg = s[0] == '-'
+		i++
+	}
+
+	digitStart := i
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i == digitStart {
+		return 0, errors.New("no number before the unit")
+	}
+	whole := s[digitStart:i]
+
+	frac := ""
+	if i < len(s) && s[i] == '.' {
+		j := i + 1
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			j++
+		}
+		if j == i+1 {
+			return 0, errors.New("no digits after the decimal point")
+		}
+		// Anything finer than a thousandth of a byte cannot change a value that
+		// is already a multiple of a kilobyte, so drop the rest rather than
+		// carry a scale factor that could overflow.
+		if d := j - i - 1; d > 3 {
+			j = i + 1 + 3
+		}
+		frac = s[i+1 : j]
+		i = j
+	}
+
+	unit := s[i:]
+	mul, ok := byteUnits[unit]
+	if !ok {
+		return 0, fmt.Errorf("unknown unit %q", unit)
+	}
+	if neg && mul != 1 {
+		return 0, fmt.Errorf("negative size %q", raw)
+	}
+
+	n, err := strconv.ParseInt(whole, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("number out of range: %s", whole)
+	}
+	if n > math.MaxInt64/mul {
+		return 0, fmt.Errorf("%s%s overflows a 64-bit byte count", whole, unit)
+	}
+	total := n * mul
+
+	if frac != "" {
+		f, err := strconv.ParseInt(frac, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("bad fraction %q", frac)
+		}
+		scale := int64(1)
+		for range frac {
+			scale *= 10
+		}
+		total += (f * mul) / scale
+	}
+
+	if neg {
+		return -total, nil
+	}
+	return total, nil
+}
+
+// envBytes is envInt64 for byte counts, so a size can be written the way a
+// person would say it.
+//
+// It matters that an unparseable value is refused loudly. This setting's default
+// is -1, which means "no limit", so a value that fails to parse does not fail
+// safe -- it silently removes the budget it was written to set. Before this,
+// KIMISTORE_RETENTION_BYTES=30G produced exactly that: one log line and then an
+// agent storing without limit. The reason is included in the message so the line
+// says why, not just that it happened.
+func envBytes(name string, def int64) int64 {
+	raw := os.Getenv(name)
+	if strings.TrimSpace(raw) == "" {
+		return def
+	}
+	v, err := parseByteSize(raw)
+	if err != nil {
+		log.Printf("Invalid %s=%q, using default %d (%v)", name, raw, def, err)
 		return def
 	}
 	return v
