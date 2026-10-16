@@ -1,0 +1,174 @@
+# Self-hosted ntfy for Grafana alerting, on the homelab k3s cluster.
+#
+# Reachable at https://ntfy.internal.loafoe.com via the shared Cilium Gateway
+# API `internal` gateway (192.168.2.131), whose wildcard certificate already
+# covers *.internal.loafoe.com -- so no cert-manager changes were needed.
+#
+# Auth is on with auth-default-access: deny-all. A topic therefore exists only
+# for a granted user, which is what stops anything on the LAN from publishing a
+# fake "disk full" onto the channel you are trying to trust.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ntfy
+  labels:
+    app.kubernetes.io/name: ntfy
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ntfy-config
+  namespace: ntfy
+data:
+  server.yml: |
+    # base-url is what ntfy puts in the subscribe links it hands out, so it has
+    # to be the name clients actually reach it by -- not the pod or service name.
+    base-url: "https://ntfy.internal.loafoe.com"
+    listen-http: ":80"
+    auth-file: "/var/lib/ntfy/user.db"
+    auth-default-access: "deny-all"
+    cache-file: "/var/lib/ntfy/cache.db"
+    attachment-cache-dir: "/var/lib/ntfy/attachments"
+    # Alerts are text. A cap keeps a runaway webhook from filling the volume.
+    attachment-total-size-limit: 15M
+    # Only keep a short history: this is a notification channel, not an archive.
+    cache-duration: "24h"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ntfy-data
+  namespace: ntfy
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # nfs-csi is the cluster default and what every other stateful workload here
+  # uses. ReadWriteOnce rather than Once because ntfy rewrites user.db in place.
+  storageClassName: nfs-csi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ntfy
+  namespace: ntfy
+  labels:
+    app.kubernetes.io/name: ntfy
+spec:
+  # 1 is deliberate. ntfy's auth database is a single file with no replication,
+  # so two writers would corrupt it. A second replica would need a real database
+  # behind it, which is not worth it for an alert channel.
+  replicas: 1
+  strategy:
+    # Never run two pods against one ReadWriteOnce volume.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ntfy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ntfy
+    spec:
+      containers:
+        - name: ntfy
+          image: binwiederhier/ntfy:v2.31.0
+          args:
+            - serve
+          ports:
+            - name: http
+              containerPort: 80
+          env:
+            # Overrides base-url from the config file; kept here so the public
+            # name is visible in the Deployment rather than only in a ConfigMap.
+            - name: NTFY_BASE_URL
+              value: "https://ntfy.internal.loafoe.com"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ntfy
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/ntfy
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              # No CPU limit: ntfy is IO-bound and a CFS throttle on a shared
+              # rpi would show up as dropped alerts.
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: ntfy-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: ntfy-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ntfy
+  namespace: ntfy
+  labels:
+    app.kubernetes.io/name: ntfy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ntfy
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# Attaches to the shared `internal` gateway rather than creating one. That
+# gateway already has HTTP:80 and HTTPS:443 listeners with allowedRoutes from
+# All namespaces, and a wildcard cert for *.internal.loafoe.com, so this is the
+# only piece needed to be reachable by name.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ntfy
+  namespace: ntfy
+spec:
+  parentRefs:
+    - name: internal
+      namespace: default
+  hostnames:
+    - ntfy.internal.loafoe.com
+  rules:
+    - matches:
+        # Publish and health. The subscriber endpoints are deliberately left
+        # reachable too -- unlike the proxy workaround that was tried first,
+        # this is the real service, so ntfy's own auth is what protects reads.
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: ntfy
+          port: 80
+      timeouts:
+        # A webhook client waits; the default 30s is longer than anything
+        # Grafana or a phone will sit through.
+        request: 10s
+        backendRequest: 10s
