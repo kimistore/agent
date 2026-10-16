@@ -11,6 +11,100 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.26
+
+Closes three correctness bugs in consumer offset handling, all of which get
+worse with a second agent and all of which were written up in the HA document
+without ever being addressed.
+
+### Fixed
+
+- `OffsetCommit` is fenced on partition ownership
+
+  Every group's offsets share one flat `_offsets/` prefix, and both offset
+  handlers bypassed `coordinatorFence` — so any agent in a fleet accepted any
+  commit and wrote the key last-writer-wins, silently rewinding whichever
+  consumer was relying on the value it overwrote
+
+  The fence is `store.Owns(topic, partition)`, not the coordinator check. Kafka
+  routes OffsetCommit to the *partition leader*, and following that split is what
+  makes each fence correct: a commit is a statement about a partition, so the
+  partition claim is what makes exactly one agent able to store it. The refusal
+  is `NOT_LEADER_OR_FOLLOWER`, which is retriable and sends the client to the
+  agent holding the claim
+
+- `OffsetFetch` is fenced on the group coordinator
+
+  Also `NOT_COORDINATOR`, reported per partition — which is where that response
+  carries an error code — and paired with offset `-1` so a client that ignores
+  the error code still cannot mistake the answer for a real position
+
+  The failure it prevents is the expensive one: a non-coordinator could answer
+  `-1`, which the client reads as "no committed offset", applies
+  `auto.offset.reset` to, and replays the log from the beginning
+
+  `LeaveGroup` stays deliberately unfenced. A member must be able to tell
+  *someone* it is leaving; a commit landing on the wrong agent is a different
+  thing, and is written by an agent with no claim to the partition
+
+- `SaveOffset` writes through to object storage before acking
+
+  It previously only wrote to an in-memory buffer and returned success, with a
+  flusher persisting every 5s — so an acked commit was lost to a SIGKILL in the
+  window between the two. That window is not academic: this agent gets killed by
+  hand for restarts and deploys, and group offsets are the only durable record
+  of a consumer's position
+
+  A failure is now returned rather than swallowed, since reporting success for a
+  commit that was not stored is the bug. The entry is *also* left in the buffer
+  on failure, so the flusher still retries it: the client is told the truth and
+  the position is still not dropped
+
+- `LoadOffset` reads the buffer before object storage
+
+  It read only from the store, so an OffsetFetch issued right after an
+  OffsetCommit answered `-1` and sent the consumer to the start of the log.
+  Commit-then-fetch is the ordinary order and is what a rebalance does
+
+  The buffer is a superset of what is durable — write-through means a success is
+  already stored and only a failure lingers — so this gives read-your-writes
+  without ever answering from something stale
+
+- A new `offsetWriteMu` serialises offset PUTs across the write-through and the
+  periodic flusher
+
+  Without it, two commits for one partition can be in flight together and land
+  out of order, leaving the store holding the older offset. That is worse than
+  losing a commit: a consumer that was told it had moved past offset N gets
+  rewound and re-reads data it already processed
+
+Both fences are no-ops in the degenerate cases — `Owns` is true when the engine
+has no ownership configured, `IsCoordinator` is true when there is no live set —
+so a single-agent deployment fences nothing and an engine built without a registry
+behaves exactly as before.
+
+### Documentation
+
+- `docs/ha-architecture.md` §14.3 and §14.6 were **stale**, describing gaps as
+  open that had already been closed. §14.3 said nothing called `DrainPartition`;
+  `internal/storage/assignment.go` has called it since assignment shipped, so a
+  partition moves automatically when the live set changes. §14.6 said the
+  producer epoch was hardcoded to 0 with no increment path;
+  `internal/storage/producer.go` advances it on a higher epoch and returns
+  `ErrFencedProducerEpoch` for a stale one
+
+- Added §14.9: neither end-to-end script has ever run two agents at once.
+  `mimir-e2e.sh` does a `start_agent` → `stop_agent` → `start_agent` restart on
+  the same port and the same agent id; `mimir-integrity-e2e.sh` runs a single
+  broker throughout. So the crash and restart phases of the integrity test prove
+  *recovery*, not *failover* — the same process serves the data afterwards
+
+- Added §15 on the document going stale. Two of its sections described code that
+  no longer existed, and §14.5 flagged itself as an oversight that was
+  "not documented anywhere" and then stayed open until now. The suggestion is to
+  cite a test rather than a file for every claim in §14, since a test that fails
+  is a signal and a file path is not
+
 ## 1.0.25
 
 Time-based retention could be configured, but only in milliseconds, and setting

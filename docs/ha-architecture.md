@@ -513,8 +513,13 @@ only, so a coordinator change is a full rebalance — which is what D-4 accepted
 Phase 4 closed the loop: a partition can now be handed to another agent while this
 one keeps serving, and — more importantly — recovery no longer trusts a manifest
 that a crash may have left behind the objects it describes, which was silently
-overwriting acknowledged records on takeover. All six phases are now implemented;
-§13.8 is what remains.
+overwriting acknowledged records on takeover. All six phases are now implemented.
+
+What remains is **not** another phase of that design. It is the gap between "the
+fences hold in a test" and "the fences hold in production", which §14 is the
+inventory for. The two largest entries are §14.1 (no replication, so a failover
+is an outage rather than a metadata change) and §14.9 (no end-to-end test has
+ever run two agents at once).
 
 ### 13.2 Key files
 
@@ -897,42 +902,126 @@ could justify. The WAL directory itself is left on disk deliberately: for a few
 seconds after losing a partition it is the only copy of anything written but never
 flushed.
 
-### 14.3 Graceful handover is unreachable
+### 14.3 Graceful handover has no operator trigger
 
-`DrainPartition` exists and is correct, but nothing calls it. A partition moves by
-crashing or by a clean shutdown; there is no operator path to move one without
-paying the TTL. This needs an authenticated mutating endpoint or an operator
-protocol — a trust-boundary decision, deliberately not invented here.
+**Partly superseded — this section was stale until 1.0.26.** It previously said
+"nothing calls `DrainPartition`". That is no longer true: `internal/storage/assignment.go:308`
+calls it, so with `KIMISTORE_ASSIGNMENT=rendezvous` a partition is handed to
+another agent automatically when the live set changes, and
+`internal/storage/handover.go` drains on shutdown. A partition now moves without
+paying the TTL in either of those two cases.
+
+What is genuinely still missing is narrower, and worth stating precisely so it is
+not mistaken for the larger thing it was: there is no **operator-initiated**
+drain. Nobody can ask for a partition to move on purpose -- for maintenance, for
+a rolling upgrade, or to rebalance deliberately. It happens as a consequence of
+the cluster changing, not as a request.
+
+That needs an authenticated mutating endpoint or an operator protocol, which is
+a trust-boundary decision, deliberately not invented here.
 
 Deleting the claim out of band is **not** a substitute: it releases the partition
 immediately while the old owner keeps serving until its next renewal, which is
 precisely the split-brain window the epoch mitigates but does not close.
 
+Note that assignment is **opt-in**: `KIMISTORE_ASSIGNMENT` defaults to unset, so
+the automatic path does not run unless it is set to `rendezvous`. Without it,
+claims are a race that the first agent to start wins outright, so a second agent
+would sit idle owning nothing.
+
 ### 14.4 Consumer offsets: acked before persisted, and no read-your-writes
 
-`SaveOffset` only writes to an in-memory buffer and acks the client
-(`internal/storage/engine.go`); a flusher persists every 5s. An acked commit is
-lost on SIGKILL up to 5 seconds later. Separately, `LoadOffset` reads only from
-object storage and never consults the buffer, so an `OffsetFetch` issued
-immediately after an `OffsetCommit` can answer `-1` — which a client interprets as
-"no committed offset" and applies `auto.offset.reset`. After a restart that is a
-replay-from-the-start storm rather than a bounded one.
+**Fixed in 1.0.26.** Both halves are gone; this is kept because the reasoning is
+what makes the fix's shape obvious, and because the regression is invisible from
+the outside.
+
+What it was: `SaveOffset` only wrote to an in-memory buffer and acked the client
+(`internal/storage/engine.go`); a flusher persisted every 5s. An acked commit was
+lost on SIGKILL up to 5 seconds later. Separately, `LoadOffset` read only from
+object storage and never consulted the buffer, so an `OffsetFetch` issued
+immediately after an `OffsetCommit` could answer `-1` — which a client
+interprets as "no committed offset" and applies `auto.offset.reset`. Commit and
+fetch in that order is the ordinary sequence and is what a rebalance does, so the
+replay-from-the-start was reachable without anything unusual happening.
+
+What it is now:
+
+- `SaveOffset` **writes through to object storage before it returns**, so there
+  is no window between the ack and the write for a kill to land in. A failure is
+  returned to the client rather than swallowed: telling the client a commit
+  succeeded and then losing it is the bug being fixed. The entry is *also* left
+  in the buffer on failure, so the flusher still retries it — the client is told
+  the truth and the position is still not dropped.
+- `LoadOffset` **reads the buffer before object storage**. The buffer is a
+  superset of what is durable (write-through means a success is already in the
+  store and only a *failure* lingers), so this gives read-your-writes without
+  ever answering from something stale.
+- A new `offsetWriteMu` serialises offset PUTs across the write-through and the
+  flusher. Without it two commits for one partition can be in flight together and
+  land out of order, leaving the store holding the older offset — which is worse
+  than losing a commit, because a consumer that was told it had moved past offset
+  N gets rewound and re-reads data it already processed.
 
 ### 14.5 OffsetCommit and OffsetFetch are not fenced
 
-`coordinatorFence` runs at exactly three sites — JoinGroup, SyncGroup, Heartbeat.
-Both offset handlers bypass it, so any agent accepts and serves offset commits and
-writes to the shared flat `_offsets/` prefix: last-writer-wins, with no generation
-fencing. `LeaveGroup` being unfenced is deliberate and documented; this one reads
-as an oversight and is not documented anywhere.
+**Fixed in 1.0.26.** This section previously flagged itself as "reads as an
+oversight and is not documented anywhere", which was true and was the right
+instinct.
+
+What it was: `coordinatorFence` ran at exactly three sites — JoinGroup,
+SyncGroup, Heartbeat. Both offset handlers bypassed it, so any agent accepted and
+served offset commits and wrote to the shared flat `_offsets/` prefix:
+last-writer-wins, with no generation fencing. Every group's offsets share one
+flat prefix, so in a fleet this is every agent writing every group's position.
+
+What it is now, and the two fences are **not** the same fence — this is the part
+that was easy to get wrong:
+
+| Handler | Kafka routes it to | Fence used | Refusal |
+|---|---|---|---|
+| `OffsetCommit` | the **partition leader** | `store.Owns(topic, partition)` | `NOT_LEADER_OR_FOLLOWER (6)` |
+| `OffsetFetch` | the **group coordinator** | `coordinatorFence(store, groupID)` | `NOT_COORDINATOR (16)` |
+
+Following Kafka's split rather than fencing both with the coordinator check is
+what makes each one correct. A commit is a statement about a *partition*, so the
+partition claim is what makes exactly one agent able to store it; a fetch is a
+question about a *group*, so the coordinator is the only agent whose answer is
+meaningful. Fencing OffsetCommit on the coordinator instead would refuse commits
+for partitions the coordinator does not own, and fencing OffsetFetch on
+ownership would make a consumer ask an agent that has no idea which group it is
+part of.
+
+`OffsetFetch` reports the refusal per partition, which is where that response
+carries an error code, and pairs it with offset `-1` so a client that ignores the
+error code still cannot mistake the answer for a real position.
+
+`LeaveGroup` remains deliberately unfenced, and that is a genuinely different
+case: a member must be able to tell *someone* it is leaving, and the agent it
+thought it was talking to is the one most likely to have changed. A commit is
+not in that category — one that lands on the wrong agent is written by an agent
+with no claim to the partition.
+
+Both fences are no-ops in the degenerate cases, which is what makes them safe to
+ship: `Owns` is true when the engine has no ownership configured, and
+`IsCoordinator` is true when there is no live set. So an agent built without a
+registry — unit tests, one-shot tools — behaves exactly as before, and a
+single-agent deployment fences nothing.
 
 ### 14.6 Idempotent producer state does not survive a machine change
 
 Only the ID allocator counter is persisted. `producerEntry{epoch, nextSeq,
-lastOffset}` is in-memory and recovered from the local WAL tail only, and the epoch
-is hardcoded to 0 with no increment path. After a failover to a *different*
-machine the dedup window is empty, so a retried `acks=all` batch duplicates. This
-follows directly from §14.1 and is accepted rather than fixed.
+lastOffset}` is in-memory and recovered from the local WAL tail only. After a
+failover to a *different* machine the dedup window is empty, so a retried
+`acks=all` batch duplicates. This follows directly from §14.1 and is accepted
+rather than fixed.
+
+**Correction:** an earlier version of this section also said the epoch was
+"hardcoded to 0 with no increment path". That was wrong and has been wrong for
+some time — `internal/storage/producer.go` handles `epoch > e.epoch` by advancing
+the stored epoch, and returns `ErrFencedProducerEpoch` for a stale one. What
+remains true is only the machine-change gap above.
+
+This section and §14.3 both being stale is the reason for §15.
 
 ### 14.7 Kafka feature gaps
 
@@ -956,3 +1045,79 @@ writes, `Claim` returns early without recording anything, so `Owns()` reports fa
 for *every* partition: writes still succeed and every Fetch is answered
 `LEADER_NOT_AVAILABLE`. Unreachable with defaults, but it is a broker that accepts
 writes and serves no reads.
+
+Since 1.0.26 this has a second consequence: the same broken `Owns()` now also
+makes every `OffsetCommit` answer `NOT_LEADER_OR_FOLLOWER` (§14.5). That is the
+correct direction — it refuses rather than corrupting — but it means the
+footgun's blast radius grew, so it is worth closing rather than leaving at
+"unreachable with defaults".
+
+### 14.9 Multi-agent operation has never been tested end to end
+
+**Added in 1.0.26.** This was not in any earlier revision of this document, and it
+is the most consequential thing in this section.
+
+Every multi-agent guarantee in §5–§13 is verified by Go tests that stand up two
+engines against one in-memory bucket: `internal/storage/two_agent_test.go`,
+`ownership_test.go`, `assignment_test.go`, `handover_test.go`, and
+`internal/protocol/coordinator_test.go`. Those are real tests and they do run in
+CI.
+
+But neither end-to-end script ever runs **two agents concurrently**:
+
+| Script | Agents | What the restart phases actually test |
+|---|---|---|
+| `test/mimir-e2e.sh` | one at a time | `start_agent` → `stop_agent` → `start_agent` (lines 178/223/231), same port `19092`, same agent id |
+| `test/mimir-integrity-e2e.sh` | one, throughout | a single `start_agent` at line 351 |
+
+Neither sets `KIMISTORE_AGENT_ID` or `KIMISTORE_NODE_ID`, and neither allocates a
+second port. So `mimir-e2e.sh`'s second `start_agent` is a **restart**, not a
+peer — it reuses the port and, with the default agent id, the identity, which is
+precisely the misconfiguration
+`TestTwoAgentsSharingAnID_RefuseRatherThanFight` covers in unit form.
+
+That matters for what the integrity script proves. Its crash and restart phases
+re-verify per-series sample counts and value sums, which is exactly the check
+that would catch a failover defect — but in every one of those phases **the same
+process** is serving the data after the crash. It proves recovery, not failover.
+
+So the honest status is: the fences are proven against a fake bucket in-process,
+and unproven against real Mimir traffic across two concurrent processes with real
+object storage between them. §12 open risk 1 gestures at wanting a chaos test;
+this is the same gap stated as a concrete deliverable.
+
+The minimum that would close it: a script that starts two agents with distinct
+`KIMISTORE_AGENT_ID` values and distinct ports against one `kimistore` bucket,
+produces through Mimir, `SIGKILL`s the owner of the partition, and then asserts
+the same integrity properties `mimir-integrity-e2e.sh` already asserts — with
+the *second* agent as the one serving the data afterwards. `KIMISTORE_ASSIGNMENT`
+will need to be on, or the first agent to start claims everything and the second
+serves nothing.
+
+## 15. This document goes stale, and that is a finding
+
+Added in 1.0.26, because writing §14.4 and §14.5 turned up two sections that
+were describing code which no longer exists (§14.3, §14.6). Both were wrong in
+the same direction: they described a gap as open when it had been closed, which
+means the document's "still missing" list was not trustworthy as a planning input.
+
+This is not hypothetical drift. §14.5 said of itself "reads as an oversight and is
+not documented anywhere" — and it stayed that way for long enough that it was
+still open when the gap was finally addressed. §14.6's claim about a hardcoded
+epoch was contradicted by `internal/storage/producer.go` at the time it was
+written or shortly after.
+
+What went wrong is not carelessness in the writing; it is that §14 has no
+connection to the code it describes. Nothing fails when it drifts.
+
+Two cheap things would help, neither of them a large project:
+
+1. **Cite a test, not a file, for every entry.** §14.4 and §14.5 now name the
+   tests that pin the behaviour (`TestSaveOffset_IsDurableWhenItReturns`,
+   `TestOffsetCommit_OnlyThePartitionOwnerAccepts`, and so on). When the code
+   changes, those tests change or fail, which is a signal that the paragraph
+   needs revisiting. A paragraph citing only `internal/storage/engine.go` has no
+   such signal.
+2. **Grep the claims.** Every load-bearing claim in this document is a short
+   greppable assertion — `enc.Int32(0) // Replica Count`, `failNext`, `epoch = 0`.
+   Most of the drift here was one grep away from being caught.

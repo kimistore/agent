@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -52,8 +53,18 @@ func (f *faultStore) Put(ctx context.Context, key string, r io.Reader) error {
 	return nil
 }
 
+// Get serves what was written, so a test can read an offset back the way the
+// engine does in production. It used to fail unconditionally, which quietly
+// made every read path look empty -- and would have hidden the read-your-writes
+// regression entirely, since LoadOffset falls back to this on a buffer miss.
 func (f *faultStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	return nil, errors.New("not found")
+	f.mu.Lock()
+	v, ok := f.saved[key]
+	f.mu.Unlock()
+	if !ok {
+		return nil, errors.New("not found")
+	}
+	return io.NopCloser(strings.NewReader(v)), nil
 }
 func (f *faultStore) List(ctx context.Context, prefix string) ([]ObjectMetadata, error) {
 	return nil, nil
@@ -88,6 +99,12 @@ func (f *faultStore) bufferedCount(se *StorageEngine) int {
 // Any failed write was logged and forgotten, so a brief object-storage blip
 // permanently discarded a consumer-group commit that the client had already
 // been told succeeded.
+//
+// The contract has since tightened further: SaveOffset writes through to object
+// storage before it returns, so the failure now reaches the client as well as
+// being retried. Both halves are asserted here, because the dangerous
+// regression is either one alone -- retrying something the client was told had
+// failed is harmless, and acking something that was never stored is the bug.
 func TestFlushOffsets_RetriesAfterTransientFailure(t *testing.T) {
 	store := newFaultStore(1) // first Put fails
 	se, err := NewStorageEngine(t.TempDir(), store, "test", RetentionConfig{})
@@ -96,32 +113,114 @@ func TestFlushOffsets_RetriesAfterTransientFailure(t *testing.T) {
 	}
 	defer se.Close()
 
-	if err := se.SaveOffset("g", "orders", 0, 42); err != nil {
-		t.Fatalf("SaveOffset: %v", err)
+	// The commit must NOT be reported as successful: it is not durable yet.
+	if err := se.SaveOffset("g", "orders", 0, 42); err == nil {
+		t.Fatal("SaveOffset returned nil although the write-through failed; " +
+			"the client would believe a commit that is not stored")
 	}
-
-	// First flush: the write fails transiently.
-	se.flushOffsets()
 
 	if _, ok := store.get("_offsets/g/orders/0"); ok {
 		t.Fatal("offset should not have been persisted yet")
 	}
 	if n := store.bufferedCount(se); n != 1 {
-		t.Errorf("buffered entries after a failed flush = %d, want 1 (must be retained for retry)", n)
+		t.Errorf("buffered entries after a failed write = %d, want 1 (must be retained for retry)", n)
 	}
 
-	// Second flush: the store has recovered.
+	// The flusher retries on its own, so a client that gave up after the error
+	// still does not lose the position.
 	se.flushOffsets()
 
 	got, ok := store.get("_offsets/g/orders/0")
 	if !ok {
-		t.Fatal("OFFSET LOST: acked offset 42 never reached object storage despite the store recovering")
+		t.Fatal("OFFSET LOST: offset 42 never reached object storage despite the store recovering")
 	}
 	if got != "42" {
 		t.Errorf("persisted offset = %q, want \"42\"", got)
 	}
 	if n := store.bufferedCount(se); n != 0 {
 		t.Errorf("buffered entries after a successful flush = %d, want 0", n)
+	}
+}
+
+// TestSaveOffset_IsDurableWhenItReturns is the write-through guarantee stated
+// directly: once SaveOffset has returned nil, a SIGKILL cannot lose the commit,
+// because there is no window between the ack and the write for one to land in.
+func TestSaveOffset_IsDurableWhenItReturns(t *testing.T) {
+	store := newFaultStore(0) // no failures
+	se, err := NewStorageEngine(t.TempDir(), store, "test", RetentionConfig{})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer se.Close()
+
+	if err := se.SaveOffset("g", "orders", 0, 99); err != nil {
+		t.Fatalf("SaveOffset: %v", err)
+	}
+
+	// Read it back through the object store directly, bypassing every buffer.
+	got, ok := store.get("_offsets/g/orders/0")
+	if !ok {
+		t.Fatal("SaveOffset returned nil but nothing reached object storage")
+	}
+	if got != "99" {
+		t.Errorf("persisted offset = %q, want \"99\"", got)
+	}
+}
+
+// TestLoadOffset_SeesItsOwnCommit is read-your-writes.
+//
+// Commit and fetch are issued in that order routinely -- a rebalance commits as
+// it leaves -- and LoadOffset used to read only object storage. The commit sat
+// in a buffer for up to 5s, so the fetch answered -1, which the client reads as
+// "no committed offset" and responds to by applying auto.offset.reset and
+// replaying the log from the beginning.
+func TestLoadOffset_SeesItsOwnCommit(t *testing.T) {
+	store := newFaultStore(0)
+	se, err := NewStorageEngine(t.TempDir(), store, "test", RetentionConfig{})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer se.Close()
+
+	if err := se.SaveOffset("g", "orders", 0, 618775); err != nil {
+		t.Fatalf("SaveOffset: %v", err)
+	}
+
+	// Straight after the commit, with no flush and no wait.
+	got, err := se.LoadOffset("g", "orders", 0)
+	if err != nil {
+		t.Fatalf("LoadOffset: %v", err)
+	}
+	if got != 618775 {
+		t.Errorf("LoadOffset immediately after SaveOffset = %d, want 618775; "+
+			"-1 makes the consumer reset and replay the whole log", got)
+	}
+}
+
+// TestLoadOffset_SeesACommitThatFailedToPersist is the stronger form.
+//
+// A write that failed is still buffered for retry, so it is still something the
+// client was told about. Reading it back must not answer -1 and send the
+// consumer to the start of the log.
+func TestLoadOffset_SeesACommitThatFailedToPersist(t *testing.T) {
+	store := newFaultStore(1)
+	se, err := NewStorageEngine(t.TempDir(), store, "test", RetentionConfig{})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer se.Close()
+
+	if err := se.SaveOffset("g", "orders", 0, 555); err == nil {
+		t.Fatal("expected the write-through to fail")
+	}
+
+	got, err := se.LoadOffset("g", "orders", 0)
+	if err != nil {
+		t.Fatalf("LoadOffset: %v", err)
+	}
+	if got != 555 {
+		t.Errorf("LoadOffset after a failed persist = %d, want 555; the commit is "+
+			"buffered for retry and must not read back as \"no committed offset\"", got)
 	}
 }
 

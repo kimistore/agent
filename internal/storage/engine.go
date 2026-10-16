@@ -110,6 +110,22 @@ type StorageEngine struct {
 	offsetBuf   map[string]int64
 	offsetBufMu sync.Mutex
 
+	// offsetWriteMu serializes offset PUTs to object storage.
+	//
+	// Two paths write offsets: the write-through in SaveOffset, which acks the
+	// client the moment the object lands, and the periodic flusher, which
+	// coalesces whatever is still buffered. Without a lock between them, two
+	// commits for one partition can be in flight at once and land out of order,
+	// leaving the store holding the older offset. That is not a lost commit, it
+	// is worse: a consumer that was told it had moved past offset N is rewound
+	// to N-1 by the next read, and re-reads data it already processed.
+	//
+	// It is held across network I/O deliberately. Offset commits are per group
+	// per rebalance plus whatever the client sends periodically, which is not a
+	// rate worth optimising, and holding it is what makes the ordering obvious
+	// rather than a property of timing.
+	offsetWriteMu sync.Mutex
+
 	// committedByGroup tracks each group's committed offset per topic/partition.
 	// The retention log-start is the minimum across groups, computed on demand.
 	//
@@ -1956,14 +1972,49 @@ func (s *StorageEngine) uploadSegments() {
 	}
 }
 func (s *StorageEngine) SaveOffset(groupID, topic string, partition int32, offset int64) error {
-	// Buffer the offset save
+	// The key without the _offsets/ prefix, which is what the buffer and the
+	// flusher both use.
 	key := fmt.Sprintf("%s/%s/%d", groupID, topic, partition)
+
+	// Buffer first, so a commit that fails to persist is retried by the flusher
+	// rather than dropped, and so a read immediately after this one sees it.
 	s.offsetBufMu.Lock()
 	s.offsetBuf[key] = offset
 	s.offsetBufMu.Unlock()
 
+	// Then persist, before acking.
+	//
+	// This used to return nil here and let the 5s flusher do the write, which
+	// meant an acked commit could be lost to a SIGKILL in the window between
+	// the two. That window is not academic: this agent has been killed by
+	// hand for restarts and deploys, and the group offsets are the only
+	// durable record of where a consumer was, so losing them costs a replay
+	// from the start of the log rather than a bounded re-read.
+	//
+	// A failure here is returned, not swallowed. Telling the client a commit
+	// succeeded and then losing it is the failure mode being fixed; buffering
+	// it for the flusher's retry is a genuine attempt, and the retry is why
+	// the entry stays in the buffer.
+	s.offsetWriteMu.Lock()
+	err := s.objPut(context.Background(), "_offsets/"+key, bytes.NewReader([]byte(strconv.FormatInt(offset, 10))))
+	s.offsetWriteMu.Unlock()
+
+	if err == nil {
+		metrics.OffsetsFlushed.Inc()
+		// Clear the buffered copy, but only if it is still this value: a newer
+		// commit may have arrived during the PUT, and that one is not on disk.
+		s.offsetBufMu.Lock()
+		if cur, ok := s.offsetBuf[key]; ok && cur == offset {
+			delete(s.offsetBuf, key)
+		}
+		s.offsetBufMu.Unlock()
+	} else {
+		metrics.OffsetFlushFailures.Inc()
+		log.Printf("Failed to persist offset %s (%d): %v -- buffered for retry", key, offset, err)
+	}
+
 	s.recordCommitted(groupID, topic, partition, offset)
-	return nil
+	return err
 }
 
 // recordCommitted notes a group's latest committed offset. Retention derives
@@ -2047,7 +2098,15 @@ func (s *StorageEngine) flushOffsets() {
 		// k is "groupID/topic/partition"
 		s3Key := fmt.Sprintf("_offsets/%s", k)
 		data := []byte(strconv.FormatInt(offset, 10))
-		if err := s.objPut(ctx, s3Key, bytes.NewReader(data)); err != nil {
+
+		// Serialised against SaveOffset's write-through. Without this a
+		// buffered commit and a fresh one for the same key can be in flight
+		// together and land out of order.
+		s.offsetWriteMu.Lock()
+		err := s.objPut(ctx, s3Key, bytes.NewReader(data))
+		s.offsetWriteMu.Unlock()
+
+		if err != nil {
 			// Leave the entry in the buffer so the next tick retries it.
 			// Dropping it here would silently discard a commit the client
 			// was already told had succeeded.
@@ -2499,10 +2558,29 @@ func parseOffsetKey(key string) (group, topicPartition string, ok bool) {
 }
 
 func (s *StorageEngine) LoadOffset(groupID, topic string, partition int32) (int64, error) {
-	key := fmt.Sprintf("_offsets/%s/%s/%d", groupID, topic, partition)
+	key := fmt.Sprintf("%s/%s/%d", groupID, topic, partition)
+
+	// Read the buffer before object storage.
+	//
+	// The buffer holds every commit this agent has acked, which is a superset
+	// of what is durable: SaveOffset writes through before acking and only
+	// clears the entry once the object is stored, but a write that failed is
+	// still in there awaiting retry. So the buffer is never behind the store.
+	//
+	// Skipping it is what made an OffsetFetch issued right after an
+	// OffsetCommit answer -1. A client reads -1 as "no committed offset",
+	// applies auto.offset.reset, and starts the log again from the beginning --
+	// so the sequence commit-then-fetch, which is the ordinary order and is
+	// what a rebalance does, produced a full replay from offset 0.
+	s.offsetBufMu.Lock()
+	buffered, bufferedOK := s.offsetBuf[key]
+	s.offsetBufMu.Unlock()
+	if bufferedOK {
+		return buffered, nil
+	}
 
 	ctx := context.Background()
-	rc, err := s.objGet(ctx, key)
+	rc, err := s.objGet(ctx, "_offsets/"+key)
 	if err != nil {
 		// Assume not found if error (simplified)
 		return -1, nil

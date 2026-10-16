@@ -830,6 +830,25 @@ func handleLeaveGroup(dec *Decoder, enc *Encoder, store *storage.StorageEngine, 
 	return enc.Bytes(), nil
 }
 
+// handleOffsetCommit stores committed consumer offsets.
+//
+// Kafka routes OffsetCommit to the *partition leader*, not to the group
+// coordinator, and this follows it. That matters more than it looks: the offsets
+// for every group live in one flat `_offsets/` prefix shared by all agents, so
+// without a fence two agents both accept commits and write the same key
+// last-writer-wins. The partition claim is the fence that prevents it, because
+// exactly one agent holds each (topic, partition) at a time.
+//
+// This handler was previously unfenced, so every agent in a fleet accepted every
+// commit and overwrote whatever the owner had recorded -- silently rewinding a
+// consumer's position. NOT_LEADER_OR_FOLLOWER is the right answer because it is
+// retriable and sends the client to the agent that can actually store the commit.
+//
+// LeaveGroup is deliberately unfenced (a member must be able to tell *someone*
+// it is leaving, and the agent it thought it was talking to is the one most
+// likely to have changed). A commit is not in that category: one that lands on
+// the wrong agent is not merely dropped, it is written by an agent with no claim
+// to the partition.
 func handleOffsetCommit(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
 	groupID, _ := dec.String()
 	topicCount, _ := dec.Int32()
@@ -862,13 +881,27 @@ func handleOffsetCommit(dec *Decoder, enc *Encoder, store *storage.StorageEngine
 			offset, _ := dec.Int64()
 			_, _ = dec.String() // Metadata
 
-			// SAVE OFFSET
+			enc.Int32(partition)
+
+			// The fence. Absent ownership -- an agent built without a registry,
+			// which is how unit tests and one-shot tools run -- Owns is true and
+			// nothing changes.
+			if store != nil && !store.Owns(topic, partition) {
+				log.Printf("OffsetCommit refused: this agent does not own %s/%d (group=%s)", topic, partition, groupID)
+				enc.Int16(ErrNotLeaderForPartition)
+				continue
+			}
+
 			err := GlobalCoordinator.CommitOffset(store, groupID, topic, partition, offset)
 
-			enc.Int32(partition)
 			if err != nil {
+				// The offset is durably written before the ack, so an error here
+				// means it was NOT stored. Say so with a retriable code rather
+				// than ErrUnknown, which is what the pre-write-through version
+				// returned for a commit it had already buffered and would have
+				// persisted 5 seconds later.
 				log.Printf("Error committing offset group=%s topic=%s part=%d off=%d: %v", groupID, topic, partition, offset, err)
-				enc.Int16(ErrUnknown)
+				enc.Int16(ErrKafkaStorageError)
 			} else {
 				enc.Int16(ErrNone)
 			}
@@ -880,19 +913,46 @@ func handleOffsetCommit(dec *Decoder, enc *Encoder, store *storage.StorageEngine
 
 // handleOffsetFetch returns committed offsets for a group.
 //
-// v0 is a bare group id and answers with a flat partition list; v1 adds a
-// topic list to the request and answers with a topic-nested structure. The
-// request version is not optional here: parsing a v0 request as if it were v1
-// reads a topic count out of whatever bytes follow, and answers with a
-// structure the client cannot decode.
+// Kafka routes OffsetFetch to the group *coordinator*, unlike OffsetCommit
+// which goes to the partition leader, so this gets the coordinator fence and
+// not the ownership one.
+//
+// The fence matters because the group offsets are shared: any agent could serve
+// this request, and one that is not the coordinator is reading a position from
+// a store whose group state it knows nothing about. Worse, it can answer -1
+// for a group it never saw a commit for, and the consumer applies
+// auto.offset.reset and replays the log from the beginning -- which on a
+// partition with a long history is the single most expensive wrong answer this
+// broker can give.
+//
+// NOT_COORDINATOR is retriable and the client re-resolves through
+// FindCoordinator, which is exactly the recovery. LeaveGroup being unfenced is
+// deliberate and does not apply here: unlike a leave, a fetch that arrives at
+// the wrong agent produces a confident wrong answer rather than a no-op.
+//
+// v0 is a bare group id and answers with a flat partition list; v1 adds a topic
+// list to the request and answers with a topic-nested structure. The request
+// version is not optional here: parsing a v0 request as if it were v1 reads a
+// topic count out of whatever bytes follow, and answers with a structure the
+// client cannot decode.
 func handleOffsetFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine, version int16) ([]byte, error) {
 	groupID, err := dec.String()
 	if err != nil {
 		return nil, err
 	}
 
+	// Fence before answering anything. Every response path below reports the
+	// error per-partition, because that is where OffsetFetch's error code
+	// lives; a refused request therefore answers -1 *and* NOT_COORDINATOR,
+	// and the error is what stops the client believing the -1.
+	fenceErr := coordinatorFence(store, groupID)
+
 	if version == 0 {
 		// Response V0: offsets[] of (partition, offset, metadata, error)
+		// v0 carries no group topic list, so a refused request has nowhere to
+		// put an error code and answers empty. Refusing beats the alternative
+		// either way: the previous behaviour served offsets from this agent's
+		// view regardless of whether it coordinated the group.
 		enc.Int32(0)
 		return enc.Bytes(), nil
 	}
@@ -926,9 +986,20 @@ func handleOffsetFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine,
 			enc.Int32(int32(len(parts)))
 			for partition, offset := range parts {
 				enc.Int32(partition)
-				enc.Int64(offset)
+				if fenceErr != nil {
+					// -1 so a client that ignores the error code still cannot
+					// mistake this for a real position and carry on reading
+					// from the wrong place.
+					enc.Int64(-1)
+				} else {
+					enc.Int64(offset)
+				}
 				enc.String("") // Metadata
-				enc.Int16(ErrNone)
+				if fenceErr != nil {
+					enc.Int16(ErrNotCoordinator)
+				} else {
+					enc.Int16(ErrNone)
+				}
 			}
 		}
 		return enc.Bytes(), nil
@@ -956,7 +1027,9 @@ func handleOffsetFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine,
 			}
 
 			offset, err := GlobalCoordinator.FetchOffset(store, groupID, topic, partition)
-			if err != nil || offset < 0 {
+			if fenceErr != nil {
+				offset = -1
+			} else if err != nil || offset < 0 {
 				// -1 is the protocol's "no committed offset", which is what
 				// tells the consumer to apply auto.offset.reset.
 				offset = -1
@@ -965,7 +1038,11 @@ func handleOffsetFetch(dec *Decoder, enc *Encoder, store *storage.StorageEngine,
 			enc.Int32(partition)
 			enc.Int64(offset)
 			enc.String("") // Metadata
-			enc.Int16(ErrNone)
+			if fenceErr != nil {
+				enc.Int16(ErrNotCoordinator)
+			} else {
+				enc.Int16(ErrNone)
+			}
 		}
 	}
 
