@@ -452,9 +452,18 @@ func (s *StorageEngine) policyBoundary(topic string, partition int32) int64 {
 
 	boundary := int64(-1)
 
+	// Held separately so the two policies can be combined by min at the end,
+	// rather than the second one overwriting the first.
+	timeBoundary := int64(-1)
+
 	if d := s.retentionCfg.RetentionTime; d > 0 {
+		// Scanned separately from the byte policy below and combined by min at
+		// the end. Both write into the same boundary, and assigning them into one
+		// variable would make whichever is evaluated last win outright -- so an
+		// operator who asked to keep 7 days and 30G would silently get the
+		// budget when the budget happened to be the more permissive of the two.
 		cutoff := time.Now().Add(-d).Unix()
-		// Oldest-first, so the first segment already inside the age limit ends
+		// Oldest-first, so the last segment already outside the age limit ends
 		// the run of reclaimable ones. A segment with no recorded time counts
 		// as current: an unknown age is not evidence of an old one, and the
 		// alternative is deleting data because a field is missing.
@@ -462,15 +471,19 @@ func (s *StorageEngine) policyBoundary(topic string, partition int32) int64 {
 			if ref.Modified == 0 || ref.Modified >= cutoff {
 				break
 			}
-			boundary = ref.Base
+			timeBoundary = ref.Base
 		}
 		for _, b := range buckets {
 			if b.Newest == 0 || b.Newest >= cutoff {
 				break
 			}
-			boundary = b.First
+			timeBoundary = b.First
 		}
 	}
+
+	// The byte policy accumulates into its own boundary, leaving the time one
+	// untouched, so that neither can discard the other's answer.
+	bytesBoundary := int64(-1)
 
 	if budget := s.retentionCfg.RetentionBytes; budget > 0 {
 		// Entries recorded before the index carried sizes do not have one, and
@@ -502,9 +515,9 @@ func (s *StorageEngine) policyBoundary(topic string, partition int32) int64 {
 			total += buckets[i].Bytes
 			if unknown || total > budget {
 				if i+1 < len(buckets) {
-					boundary = buckets[i+1].First
+					bytesBoundary = buckets[i+1].First
 				} else if len(window) > 0 {
-					boundary = window[0].Base
+					bytesBoundary = window[0].Base
 				}
 				break
 			}
@@ -516,12 +529,34 @@ func (s *StorageEngine) policyBoundary(topic string, partition int32) int64 {
 			total += window[i].Size
 			if unknown || total > budget {
 				if i+1 < len(window) {
-					boundary = window[i+1].Base
+					bytesBoundary = window[i+1].Base
 				} else {
-					boundary = window[i].Base
+					bytesBoundary = window[i].Base
 				}
 				break
 			}
+		}
+	}
+
+	// A boundary is the oldest offset still kept, so the smaller of the two is
+	// the one that satisfies both policies: data the operator asked to keep on
+	// age survives whether or not the byte budget also permitted it.
+	//
+	// This is the same principle reclaimByIndex already applies between the
+	// policy boundary and the consumer floor -- "the more conservative limit is
+	// the one that has to survive" -- extended to the two policies themselves.
+	// Without it the byte scan simply overwrote the time scan, since it runs
+	// second, and asking to keep 7 days and 30G silently yielded the budget
+	// whenever the budget was the more permissive of the two.
+	//
+	// A policy that selected nothing leaves its boundary at -1 and loses, which
+	// is what makes "only one of the two set" behave exactly as it did before.
+	for _, b := range []int64{timeBoundary, bytesBoundary} {
+		if b < 0 {
+			continue
+		}
+		if boundary < 0 || b < boundary {
+			boundary = b
 		}
 	}
 

@@ -249,7 +249,7 @@ func FromEnv() Config {
 
 		Retention: RetentionConfig{
 			RetentionBytes: envBytes("KIMISTORE_RETENTION_BYTES", -1),
-			RetentionTime:  time.Duration(envInt64("KIMISTORE_RETENTION_MS", 0)) * time.Millisecond,
+			RetentionTime:  envDuration("KIMISTORE_RETENTION_TIME", retentionTimeMS()),
 			CheckInterval:  time.Duration(envInt64("KIMISTORE_RETENTION_CHECK_MS", 300_000)) * time.Millisecond,
 		},
 	}
@@ -574,6 +574,104 @@ func envBytes(name string, def int64) int64 {
 		return def
 	}
 	return v
+}
+
+// parseDuration reads a retention window written as a duration: "7d", "24h",
+// "168h", "90m", "500ms", or a bare integer count of milliseconds.
+//
+// Days and weeks are handled here because time.ParseDuration stops at hours --
+// "7d" is the unit people actually want for a retention window, and it is the
+// one time.ParseDuration cannot express at all. Everything else is handed to
+// time.ParseDuration rather than reimplemented, so the sub-second units and its
+// error messages are the ones Go already tests.
+//
+// A bare integer is read as milliseconds, matching KIMISTORE_RETENTION_MS, which
+// stays supported. That is not a pleasant thing to type -- 604800000 for a week
+// is why this function exists -- but it is what existing deployments already
+// have in their environment files, and guessing a different unit for it would
+// silently rescale anyone's window.
+//
+// Negatives are refused rather than parsed, for the same reason as in
+// parseByteSize: the retention config treats anything non-positive as disabled,
+// so a negative would switch the policy off rather than fail the parse.
+func parseDuration(raw string) (time.Duration, error) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if s == "" {
+		return 0, errors.New("empty value")
+	}
+
+	// Bare integer: milliseconds, matching KIMISTORE_RETENTION_MS.
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		if n < 0 {
+			return 0, fmt.Errorf("negative duration %q", raw)
+		}
+		if n > math.MaxInt64/int64(time.Millisecond) {
+			return 0, fmt.Errorf("%sms overflows a duration", raw)
+		}
+		return time.Duration(n) * time.Millisecond, nil
+	}
+
+	if s[0] == '-' || s[0] == '+' {
+		return 0, fmt.Errorf("negative duration %q", raw)
+	}
+
+	// Days and weeks, which time.ParseDuration does not have.
+	for _, u := range []struct {
+		suffix string
+		unit   time.Duration
+	}{
+		{"w", 7 * 24 * time.Hour},
+		{"d", 24 * time.Hour},
+	} {
+		num, ok := strings.CutSuffix(s, u.suffix)
+		if !ok || num == "" {
+			continue
+		}
+		n, err := strconv.ParseFloat(num, 64)
+		if err != nil {
+			return 0, fmt.Errorf("no number before %q in %q", u.suffix, raw)
+		}
+		if n*float64(u.unit) > float64(math.MaxInt64) {
+			return 0, fmt.Errorf("%q overflows a duration", raw)
+		}
+		return time.Duration(n * float64(u.unit)), nil
+	}
+
+	if d, err := time.ParseDuration(s); err == nil {
+		return d, nil
+	}
+	return 0, fmt.Errorf("not a duration %q; try 7d, 24h or 30m", raw)
+}
+
+// envDuration is envBytes for retention windows, for the same reason: the default
+// is zero, which means "no policy", so a value that fails to parse silently turns
+// the policy off instead of setting it.
+func envDuration(name string, def time.Duration) time.Duration {
+	raw := os.Getenv(name)
+	if strings.TrimSpace(raw) == "" {
+		return def
+	}
+	v, err := parseDuration(raw)
+	if err != nil {
+		log.Printf("Invalid %s=%q, using default %s (%v)", name, raw, def, err)
+		return def
+	}
+	return v
+}
+
+// retentionTimeMS reads the retention window from whichever of the two settings is
+// present, preferring the readable one.
+//
+// KIMISTORE_RETENTION_MS is kept because it is what existing environment files
+// already contain, and reinterpreting those files as seconds would silently
+// rescale someone's window by a thousand. It only applies when
+// KIMISTORE_RETENTION_TIME is unset, so the readable setting wins outright when
+// someone sets both, rather than the older key quietly taking precedence.
+func retentionTimeMS() time.Duration {
+	if strings.TrimSpace(os.Getenv("KIMISTORE_RETENTION_TIME")) != "" {
+		return 0
+	}
+	return time.Duration(envInt64("KIMISTORE_RETENTION_MS", 0)) * time.Millisecond
 }
 
 // envBool reads a boolean environment variable, falling back to def.

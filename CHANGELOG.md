@@ -11,6 +11,55 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.25
+
+Time-based retention could be configured, but only in milliseconds, and setting
+it alongside a byte budget silently discarded one of the two.
+
+### Added
+
+- `KIMISTORE_RETENTION_TIME` accepts a duration: `7d`, `24h`, `1w`, `90m`
+
+  `KIMISTORE_RETENTION_MS` stays supported, so existing environment files keep
+  their windows, and a bare integer is still read as milliseconds. The readable
+  key wins when both are set, rather than the older one taking precedence
+
+  Days and weeks are handled directly because `time.ParseDuration` stops at
+  hours, and "7d" is the unit a retention window is actually written in.
+  Everything else is handed to `time.ParseDuration`, so its sub-second units and
+  error messages are Go's rather than a reimplementation
+
+  The unit being invisible from the value is the part that made this worth
+  changing: `604800000` reads as an opaque number, so a wrong window is still a
+  valid one, and the policy runs and simply keeps the wrong amount of data
+
+- Negatives are refused in both size and duration settings
+
+  A negative retention window resolves to "no policy", since anything
+  non-positive is treated as disabled. So `-7d` would have switched the policy
+  off rather than failing the parse, which is the same silent-inversion the size
+  parser already rejected
+
+### Fixed
+
+- The time and byte retention policies now combine instead of overwriting
+
+  `policyBoundary` assigned both policies' answers into one variable, and the
+  byte scan runs second, so its result replaced the time one unconditionally.
+  Asking to keep 7 days *and* 30G silently yielded the budget whenever the
+  budget was the more permissive of the two -- the agent would delete data from
+  the day before on the strength of a size limit, having been told to keep a
+  week
+
+  Each policy now computes into its own boundary and the older of the two is
+  kept, which is the same principle `reclaimByIndex` already applies between the
+  policy boundary and the consumer floor: a segment is reclaimable only where
+  every configured limit agrees, and the more conservative limit is the one that
+  has to survive
+
+  A policy that selects nothing leaves its boundary unset and loses to the other,
+  so configuring only one of them behaves exactly as before
+
 ## 1.0.24
 
 The byte budget could only be written as a raw integer, and writing it any other

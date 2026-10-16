@@ -423,3 +423,56 @@ func TestDeleteTopic_ClearsRetentionState(t *testing.T) {
 		t.Errorf("FirstAllowedOffset() after delete = %d, want -1 (state should be cleared)", got)
 	}
 }
+
+// The two policies must combine, not overwrite each other.
+//
+// reclaimByIndex already clamps the policy boundary against the consumer floor by
+// taking the older of the two, on the stated principle that "a segment is
+// reclaimable only where both agree ... the more conservative limit is the one
+// that has to survive". policyBoundary does not apply that principle to its own
+// two policies: it assigns to the same variable from the time block and then from
+// the byte block, so whichever runs second wins outright.
+//
+// The operator-visible consequence is that asking for both "keep 7 days" and
+// "keep 30G" silently keeps whichever that pair happens to resolve to. When the
+// byte budget is the tighter of the two it wins and the time window is discarded
+// -- the agent deletes data from yesterday on the strength of a budget, having
+// been told to keep a week.
+func TestRetention_TimeAndBytesCombineConservatively(t *testing.T) {
+	store := newRecordingStore()
+	se, err := NewStorageEngine(t.TempDir(), store, "bucket", RetentionConfig{
+		RetentionTime:  7 * 24 * time.Hour,
+		RetentionBytes: 250,
+	})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	defer se.Close()
+
+	se.metadataCache.AddTopic("orders")
+	se.metadataCache.AddPartition("orders", 0)
+
+	// Four 100-byte segments at base 0, 100, 200, 300. The oldest two are ten
+	// days old and the newest two are current.
+	old := time.Now().Add(-10 * 24 * time.Hour).Unix()
+	for i := int64(0); i < 4; i++ {
+		putSegment(t, store, "orders", 0, i*100, 100)
+		modified := time.Now().Unix()
+		if i < 2 {
+			modified = old
+		}
+		se.metadataCache.AddSegment("orders", 0, SegmentRef{
+			Base: i * 100, Size: 100, Modified: modified,
+		})
+	}
+
+	// Alone, each policy answers something different:
+	//   time 7d  -> the two 10-day-old segments are reclaimable, so keep from 100
+	//   250 bytes -> the newest two fit in the budget, so keep from 200
+	got := se.policyBoundary("orders", 0)
+	if got != 100 {
+		t.Errorf("policyBoundary = %d, want 100; with both policies set the boundary "+
+			"must be the more conservative of the two (100 from time, 200 from "+
+			"bytes), not whichever was evaluated last", got)
+	}
+}

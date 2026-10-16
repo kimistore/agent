@@ -381,3 +381,124 @@ func TestFromEnv_RetentionBytesFallsBackToUnlimited(t *testing.T) {
 		}
 	}
 }
+
+// The retention window must be writable as a duration.
+//
+// KIMISTORE_RETENTION_MS is a real setting nobody configures by hand, and its
+// unit is invisible from the value alone: 604800000 for seven days. A window
+// that reads as an opaque number is also one nobody can review, and the failure
+// is silent in the worst direction -- a wrong value is still a valid value, so
+// the policy runs and just keeps the wrong amount of data.
+func TestParseDuration(t *testing.T) {
+	tests := []struct {
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		// Days and weeks are the units a retention window is actually written
+		// in, and time.ParseDuration cannot express them at all.
+		{in: "7d", want: 7 * 24 * time.Hour},
+		{in: "1d", want: 24 * time.Hour},
+		{in: "14d", want: 14 * 24 * time.Hour},
+		{in: "1w", want: 7 * 24 * time.Hour},
+		{in: "90d", want: 90 * 24 * time.Hour},
+		{in: "1.5d", want: 36 * time.Hour},
+
+		// The rest go through time.ParseDuration, so sub-day units and its
+		// error messages are Go's rather than a reimplementation.
+		{in: "24h", want: 24 * time.Hour},
+		{in: "168h", want: 7 * 24 * time.Hour},
+		{in: "90m", want: 90 * time.Minute},
+		{in: "45s", want: 45 * time.Second},
+		{in: "500ms", want: 500 * time.Millisecond},
+		{in: "0", want: 0},
+
+		// A bare integer is milliseconds, which is what KIMISTORE_RETENTION_MS
+		// already meant. Existing environment files keep their windows.
+		{in: "604800000", want: 7 * 24 * time.Hour},
+
+		// Case and surrounding space are tolerated.
+		{in: "  7D  ", want: 7 * 24 * time.Hour},
+
+		// Refused rather than guessed. A negative would switch the policy off,
+		// since anything non-positive reads as "no policy configured".
+		{in: "", wantErr: true},
+		{in: "-7d", wantErr: true},
+		{in: "-1000", wantErr: true},
+		{in: "7", want: 7 * time.Millisecond}, // integer, not days
+		{in: "d", wantErr: true},
+		{in: "7q", wantErr: true},
+		{in: "7 days", wantErr: true},
+		{in: "next tuesday", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		got, err := parseDuration(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("parseDuration(%q) = %v, want an error", tc.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseDuration(%q) unexpected error: %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("parseDuration(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The wiring, not just the parser. A parser test passes whether or not the
+// setting is routed through it.
+func TestFromEnv_RetentionTimeAcceptsDurations(t *testing.T) {
+	tests := []struct {
+		env  string
+		want time.Duration
+	}{
+		{env: "7d", want: 7 * 24 * time.Hour},
+		{env: "24h", want: 24 * time.Hour},
+		{env: "1w", want: 7 * 24 * time.Hour},
+		{env: "90d", want: 90 * 24 * time.Hour},
+		{env: "604800000", want: 7 * 24 * time.Hour}, // the old key's unit
+		{env: "0", want: 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.env, func(t *testing.T) {
+			t.Setenv("KIMISTORE_RETENTION_TIME", tc.env)
+			t.Setenv("KIMISTORE_RETENTION_MS", "") // not set in a clean env
+			if got := FromEnv().Retention.RetentionTime; got != tc.want {
+				t.Errorf("FromEnv().Retention.RetentionTime = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// KIMISTORE_RETENTION_MS must keep working, and must lose to the readable key
+// when both are present rather than silently taking precedence.
+func TestFromEnv_RetentionTimePrefersReadableKey(t *testing.T) {
+	t.Setenv("KIMISTORE_RETENTION_MS", "3600000") // 1h, the only setting until 1.0.25
+	if got := FromEnv().Retention.RetentionTime; got != time.Hour {
+		t.Errorf("RETENTION_MS alone = %v, want 1h; existing environment files must "+
+			"keep their window", got)
+	}
+
+	t.Setenv("KIMISTORE_RETENTION_TIME", "7d")
+	if got := FromEnv().Retention.RetentionTime; got != 7*24*time.Hour {
+		t.Errorf("with both set = %v, want 7d; the readable key must win", got)
+	}
+}
+
+// An unreadable window falls back to no policy, not to a short one.
+func TestFromEnv_RetentionTimeFallsBackToDisabled(t *testing.T) {
+	for _, env := range []string{"", "   ", "not-a-duration", "-7d"} {
+		t.Setenv("KIMISTORE_RETENTION_TIME", env)
+		t.Setenv("KIMISTORE_RETENTION_MS", "")
+		if got := FromEnv().Retention.RetentionTime; got != 0 {
+			t.Errorf("KIMISTORE_RETENTION_TIME=%q gave RetentionTime = %v, want 0 (no policy)",
+				env, got)
+		}
+	}
+}
