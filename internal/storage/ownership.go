@@ -141,6 +141,12 @@ type partitionOwnership struct {
 	// failed renewal has aged past the TTL and the claim is really gone.
 	lastRenew atomic.Int64
 
+	// lastTakeAttempt is when this agent last tried to take or retake this
+	// partition's claim, whether it succeeded or not. It paces the retry so that
+	// a partition another agent genuinely owns costs one compare-and-swap per
+	// TTL rather than one per renewal tick.
+	lastTakeAttempt atomic.Int64
+
 	// claimMu serialises compare-and-swap attempts for this partition. Two
 	// concurrent first-writes to the same partition must not both race to
 	// create the claim: the loser would be told it does not own a partition it
@@ -457,9 +463,45 @@ func (om *ownershipManager) renewAll(ctx context.Context) {
 	if om.retryLost(ctx) {
 		ok = true
 	}
+	// A partition this agent knows about but never managed to claim is retried
+	// too. Without this it was stranded: the claim failed at startup because a
+	// previous process of the same agent still held it, nothing marked it lost,
+	// and so neither the renewal pass nor retryLost ever touched it again. It sat
+	// unowned and unserved until someone restarted the agent a second time.
+	if om.retryUnheld(ctx) {
+		ok = true
+	}
 	if ok {
 		om.lastRenewOK.Store(time.Now().UnixNano())
 	}
+}
+
+// retryUnheld tries to claim partitions this agent knows about but does not hold.
+//
+// This is the other half of retryLost. A partition reaches that state when the
+// claim could not be taken -- because a peer holds it, or because this agent's
+// own previous process had not finished exiting when this one started -- and it
+// is neither held nor lost, so nothing else would ever try again. On 2026-10-17
+// that left a partition unserved for over an hour after a restart that was
+// supposed to have recovered it.
+//
+// Attempts are paced to one per TTL by lastTakeAttempt, so a partition another
+// agent legitimately owns costs one compare-and-swap per TTL rather than one per
+// renewal tick.
+func (om *ownershipManager) retryUnheld(ctx context.Context) bool {
+	allHeld := true
+	for _, p := range om.snapshot() {
+		if p.held.Load() || p.lost.Load() {
+			continue
+		}
+		if last := time.Unix(0, p.lastTakeAttempt.Load()); !last.IsZero() && time.Since(last) < om.cfg.TTL {
+			continue
+		}
+		if !om.takePartition(ctx, p) {
+			allHeld = false
+		}
+	}
+	return allHeld
 }
 
 // retryLost tries once to take back every partition this agent has lost.
@@ -488,16 +530,35 @@ func (om *ownershipManager) retryLost(ctx context.Context) bool {
 // partition as ours in Metadata while our idea of where the log ends is stale,
 // which is how a log gets written at offsets that are already taken.
 func (om *ownershipManager) reacquirePartition(ctx context.Context, p *partitionOwnership) bool {
-	p.claimMu.Lock()
-	defer p.claimMu.Unlock()
-
 	if !p.lost.Load() {
 		return true
 	}
+	return om.takePartition(ctx, p)
+}
+
+// takePartition claims one partition and reports whether this agent now holds
+// it and can vouch for its log position.
+//
+// It serves both retry paths. A partition that was *lost* to a transient error
+// is being taken back; one that was never claimed is being claimed for the first
+// time. They differ only in that the second has no position at all rather than a
+// stale one, which makes the recovery hook more necessary, not less.
+func (om *ownershipManager) takePartition(ctx context.Context, p *partitionOwnership) bool {
+	p.claimMu.Lock()
+	defer p.claimMu.Unlock()
+
+	if p.held.Load() {
+		return true
+	}
+
+	// Stamped before the attempt, not after, so a store that hangs does not turn
+	// into a compare-and-swap on every tick.
+	p.lastTakeAttempt.Store(time.Now().UnixNano())
 
 	claimCtx, cancel := context.WithTimeout(ctx, om.cfg.TTL)
 	defer cancel()
 
+	wasLost := p.lost.Load()
 	owner, err := om.claim(claimCtx, p.topic, p.partition, 0)
 	if err != nil {
 		// Someone else holds it, or the store is still unavailable. Either way
@@ -518,7 +579,7 @@ func (om *ownershipManager) reacquirePartition(ctx context.Context, p *partition
 			// a peer can take it. What must never happen is serving the partition
 			// with a position we cannot vouch for, which is what staying fenced
 			// guarantees.
-			log.Printf("Ownership: took %s/%d back at epoch %d but could not recover its position (%v); "+
+			log.Printf("Ownership: took %s/%d at epoch %d but could not recover its position (%v); "+
 				"staying fenced and retrying, because serving a log we cannot vouch for is worse",
 				p.topic, p.partition, owner.Epoch, err)
 			return false
@@ -533,8 +594,13 @@ func (om *ownershipManager) reacquirePartition(ctx context.Context, p *partition
 	if metrics.PartitionsOwned != nil {
 		metrics.PartitionsOwned.Set(float64(om.count()))
 	}
-	log.Printf("Ownership: RECOVERED %s/%d at epoch %d after a transient loss; log position re-derived from object storage",
-		p.topic, p.partition, owner.Epoch)
+	if wasLost {
+		log.Printf("Ownership: RECOVERED %s/%d at epoch %d after a transient loss; log position re-derived from object storage",
+			p.topic, p.partition, owner.Epoch)
+	} else {
+		log.Printf("Ownership: CLAIMED %s/%d at epoch %d; log position re-derived from object storage",
+			p.topic, p.partition, owner.Epoch)
+	}
 	return true
 }
 

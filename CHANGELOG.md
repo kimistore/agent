@@ -11,6 +11,38 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.29
+
+Closes a gap in 1.0.27 that stranded a partition nobody retried.
+
+### Fixed
+
+- A partition that is known but never claimed is now retried
+
+  On 2026-10-17 the v1.0.28 deploy did not complete. The previous process was
+  still inside a recovery listing when the new one started, so the new agent's
+  startup claim was refused -- correctly, because two processes must not share an
+  identity:
+
+  ```
+  Ownership: not claiming mimir-distributor/0: partition ownership is held by
+  another agent: _owners/mimir-distributor/0 is held at epoch 41705 by an agent
+  using our id
+  ```
+
+  That left the partition in a state nothing retried. `renewPartition` skipped it
+  because it was not held, `retryLost` skipped it because it was not lost, so
+  nothing ever tried again. The agent sat idle and unserved until someone
+  restarted it a second time, 90 seconds later.
+
+  The renewal pass now also retries known-but-unheld partitions. Attempts are
+  paced to one compare-and-swap per TTL, matching what renewing a held claim
+  already costs, so a partition a live peer owns does not become a hot loop.
+
+  Taking such a partition runs the same recovery hook as re-acquiring a lost
+  one. It needs it more: a lost partition has a stale position, while one that
+  was never claimed has no position at all.
+
 ## 1.0.28
 
 Fixes a bug in 1.0.27 that made the recovery path unrunnable on a real bucket.

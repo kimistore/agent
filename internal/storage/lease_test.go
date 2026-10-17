@@ -41,7 +41,13 @@ type casStore struct {
 	data    map[string][]byte
 	version map[string]int64
 	putKeys map[string]int // key -> how many times it has been written
-	failPut error
+	// getVersionCalls counts conditional-read attempts.
+	//
+	// Neither putKeys nor putCalls can show an un-paced retry loop: when a peer
+	// holds the claim, claim() reads the record, sees it is live, and returns
+	// ErrPartitionHeld *without* writing. The cost of a losing retry is the read.
+	getVersionCalls int
+	failPut         error
 	// failPutVersion fails the conditional write only. Ownership claims go
 	// through PutVersion, not Put, so a blip test has to be able to break
 	// that path specifically -- failPut alone models an outage that skips the
@@ -137,6 +143,9 @@ func (s *casStore) GetRange(ctx context.Context, key string, start, length int64
 }
 
 func (s *casStore) GetVersion(ctx context.Context, key string) ([]byte, string, bool, error) {
+	s.mu.Lock()
+	s.getVersionCalls++
+	s.mu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b, ok := s.data[key]
