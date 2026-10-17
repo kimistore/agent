@@ -376,6 +376,12 @@ func NewStorageEngine(walDir string, objStore ObjectStore, bucket string, retent
 		// unflushed WAL could justify -- to a consumer reading from this node,
 		// or to whoever takes the partition next.
 		se.ownershipCfg.OnLost = se.forgetLostPartition
+		// Re-derive the position before a re-taken claim becomes servable.
+		// Without this the recovery pass would happily take the partition back
+		// and then append at offsets a previous owner had already handed out.
+		se.ownershipCfg.OnReacquire = func(topic string, partition int32) error {
+			return se.recoverReacquiredPartition(se.closedCtx, topic, partition)
+		}
 		om, err := newOwnershipManager(context.Background(), objStore, se.ownershipCfg)
 		if err != nil {
 			_ = mgr.Close()
@@ -1414,6 +1420,75 @@ func (s *StorageEngine) forgetLostPartition(topic string, partition int32) {
 	log.Printf("Storage: dropping %s/%d from this agent's view; the partition is no longer ours to describe",
 		topic, partition)
 	s.dropPartitionFromView(topic, partition, true)
+}
+
+// recoverPartitionPosition re-derives one partition's log position from the
+// segments that are actually in object storage, and reports whether it moved.
+//
+// Object storage is the system of record, so the objects win over the manifest.
+// Both ends move, in opposite directions:
+//
+//   - The log end is raised to what the objects hold. A manifest behind its own
+//     segments is the crash case: trusting it makes the next writer append over
+//     records a producer was already told were durable.
+//   - The log start is lowered to the oldest segment present. It has to move
+//     even when the log end was already right, because ListOffsets reports it to
+//     every consumer that resets to the start of the log, and a start that is
+//     too high hides data that is still there with no error anywhere.
+//
+// This exists as a standalone function because it has two callers with the same
+// requirement: startup recovery, and re-acquiring a partition that was lost to a
+// transient object-store error. The second is the more important one -- a claim
+// re-taken without re-deriving the position would let this agent append at
+// offsets another writer had already handed out.
+func (s *StorageEngine) recoverPartitionPosition(ctx context.Context, topic string, partition int32, segments []*SegmentMetadata) bool {
+	if len(segments) == 0 {
+		return false
+	}
+	leo, start, err := s.endOffsetsFromObject(ctx, topic, partition, segments)
+	if err != nil {
+		log.Printf("Recovery: could not determine end of %s/%d: %v", topic, partition, err)
+		return false
+	}
+
+	manifestEnd := s.metadataCache.LogEndOffset(topic, partition)
+	manifestStart := s.metadataCache.LogStartOffset(topic, partition)
+
+	if leo <= manifestEnd && start >= manifestStart {
+		return false
+	}
+
+	s.metadataCache.SetPartitionState(topic, partition, leo, start)
+	// Persist the repaired position so the next restart does not pay for the
+	// same segment read.
+	s.markManifestDirty(topic, partition)
+	metrics.ObjectsReconciled.Inc()
+	if leo > manifestEnd {
+		// Loud on purpose: a manifest that lags the objects is the signature of
+		// a crash mid-append, and the thing that would silently truncate the log
+		// if it went unnoticed.
+		log.Printf("Recovery: %s/%d objects end at %d but the manifest said %d; taking the objects",
+			topic, partition, leo, manifestEnd)
+	}
+	if start < manifestStart {
+		log.Printf("Recovery: %s/%d manifest reported log start %d but segments from %d are present; lowering it",
+			topic, partition, manifestStart, start)
+	}
+	return true
+}
+
+// recoverReacquiredPartition is the OnReacquire hook.
+//
+// It lists this partition's segments and re-derives the position. An error means
+// the store is still unhealthy, and the caller releases the claim rather than
+// serving a log whose end it cannot vouch for.
+func (s *StorageEngine) recoverReacquiredPartition(ctx context.Context, topic string, partition int32) error {
+	segments, err := s.objectSegmentsByPartition(ctx, topic)
+	if err != nil {
+		return fmt.Errorf("listing segments of %s: %w", topic, err)
+	}
+	s.recoverPartitionPosition(ctx, topic, partition, segments[partition])
+	return nil
 }
 
 // LogStartOffset is the oldest offset still retrievable. It is what
@@ -2721,47 +2796,7 @@ func (s *StorageEngine) recoverManifest(ctx context.Context) error {
 			continue
 		}
 		for _, partition := range s.metadataCache.GetPartitions(topic) {
-			segments := segmentsByPartition[partition]
-			if len(segments) == 0 {
-				continue
-			}
-			leo, start, err := s.endOffsetsFromObject(ctx, topic, partition, segments)
-			if err != nil {
-				log.Printf("Recovery: could not determine end of %s/%d: %v", topic, partition, err)
-				continue
-			}
-			// Both ends are reconciled, and in opposite directions.
-			//
-			// The log end is raised to what the objects hold: a manifest behind
-			// its own segments is the crash case, and trusting it makes the next
-			// writer append over acknowledged records.
-			//
-			// The log start is lowered to the oldest segment present. It has to
-			// move even when the log end was already right, because ListOffsets
-			// reports this value to every consumer that resets to the start of
-			// the log -- and a start that is too high hides data that is still
-			// there, with no error anywhere. That is the same object storage is
-			// the system of record argument, applied to the other end.
-			manifestEnd := s.metadataCache.LogEndOffset(topic, partition)
-			manifestStart := s.metadataCache.LogStartOffset(topic, partition)
-
-			if leo > manifestEnd || start < manifestStart {
-				s.metadataCache.SetPartitionState(topic, partition, leo, start)
-				// Persist the repaired position so the next restart does not
-				// pay for the same segment read.
-				s.markManifestDirty(topic, partition)
-				metrics.ObjectsReconciled.Inc()
-				if leo > manifestEnd {
-					// Loud on purpose: a manifest that lags the objects is the
-					// signature of a crash mid-append, and it is the thing that
-					// would silently truncate the log if it went unnoticed.
-					log.Printf("Recovery: %s/%d objects end at %d but the manifest said %d; taking the objects",
-						topic, partition, leo, manifestEnd)
-				}
-				if start < manifestStart {
-					log.Printf("Recovery: %s/%d manifest reported log start %d but segments from %d are present; lowering it",
-						topic, partition, manifestStart, start)
-				}
+			if s.recoverPartitionPosition(ctx, topic, partition, segmentsByPartition[partition]) {
 				restored++
 			}
 		}

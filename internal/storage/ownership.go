@@ -101,6 +101,24 @@ type OwnershipConfig struct {
 	// let this agent report a log end -- to a consumer, or to a failover
 	// candidate -- that only its own unflushed WAL could justify.
 	OnLost func(topic string, partition int32)
+	// OnReacquire is called after a previously-lost claim has been taken again,
+	// and before the partition is served again. Returning an error releases the
+	// claim and leaves the partition lost.
+	//
+	// This exists because re-acquiring a claim is not sufficient on its own. A
+	// claim gives this agent a newer epoch, but not a current view of the log:
+	// whoever held the partition in between was assigning offsets from a
+	// position this agent cannot see. That is why a lost claim used to be
+	// permanent for the life of the process, and the price was severe -- on
+	// 2026-10-17 a single transient object-store error fenced a partition at
+	// 03:09 and ingest did not resume until a human restarted the agent at
+	// 12:56, by which time 9h43m of samples had been dropped upstream.
+	//
+	// So the engine re-derives the position from object storage here, which is
+	// the system of record, and only then does the partition become servable. The
+	// ordering is claim-then-recover because claiming is what makes the epoch
+	// comparison meaningful, exactly as it is at startup.
+	OnReacquire func(topic string, partition int32) error
 }
 
 // DefaultOwnershipTTL is the default per-partition claim lifetime.
@@ -258,13 +276,15 @@ func (om *ownershipManager) Claim(ctx context.Context, topic string, partition i
 		return p.epoch.Load(), nil
 	}
 
-	// A claim that was lost is never retried in-process. Re-acquiring would give
-	// this agent a newer epoch but not a current view of the log: whoever took
-	// the partition over has been assigning offsets from a position this agent
-	// cannot see, so writing here would reissue offsets that are already taken.
-	// The partition stays fenced until the process restarts and recovers.
+	// A lost claim is retried by the renewal pass, not here, and not on the
+	// append path. Re-acquiring requires the position to be re-derived from
+	// object storage first (see OnReacquire), which is far too expensive to do
+	// inline on a produce. Until that retry succeeds the partition stays fenced,
+	// which is the correct answer for a caller: it is better a producer is told
+	// NOT_LEADER_OR_FOLLOWER and retries than that it gets an offset this agent
+	// cannot stand behind.
 	if p.lost.Load() {
-		return p.epoch.Load(), fmt.Errorf("%w: %s/%d lost its claim at epoch %d and will not re-acquire it in this process",
+		return p.epoch.Load(), fmt.Errorf("%w: %s/%d lost its claim at epoch %d; waiting for the recovery pass to take it back",
 			ErrPartitionLost, topic, partition, p.epoch.Load())
 	}
 
@@ -429,9 +449,93 @@ func (om *ownershipManager) renewAll(ctx context.Context) {
 			ok = false
 		}
 	}
+	// A partition lost to a transient error is retried here rather than left
+	// fenced until someone restarts the process. The retry is deliberately part
+	// of the renewal pass and not a separate timer: it needs the same claim, the
+	// same epoch and the same object store, and a blip that took the claim out
+	// almost certainly takes the retry out with it.
+	if om.retryLost(ctx) {
+		ok = true
+	}
 	if ok {
 		om.lastRenewOK.Store(time.Now().UnixNano())
 	}
+}
+
+// retryLost tries once to take back every partition this agent has lost.
+//
+// It reports whether the agent holds everything it used to. A failed retry is
+// not an error condition in itself: the partition is already fenced and stays
+// fenced, and the next pass tries again, which is the whole point.
+func (om *ownershipManager) retryLost(ctx context.Context) bool {
+	allBack := true
+	for _, p := range om.snapshot() {
+		if !p.lost.Load() {
+			continue
+		}
+		if !om.reacquirePartition(ctx, p) {
+			allBack = false
+		}
+	}
+	return allBack
+}
+
+// reacquirePartition takes one lost partition back, and only reports success
+// once the engine has re-derived the log position from object storage.
+//
+// Releasing on a failed recovery is the point. Holding a claim whose position we
+// cannot vouch for is strictly worse than holding none: it advertises the
+// partition as ours in Metadata while our idea of where the log ends is stale,
+// which is how a log gets written at offsets that are already taken.
+func (om *ownershipManager) reacquirePartition(ctx context.Context, p *partitionOwnership) bool {
+	p.claimMu.Lock()
+	defer p.claimMu.Unlock()
+
+	if !p.lost.Load() {
+		return true
+	}
+
+	claimCtx, cancel := context.WithTimeout(ctx, om.cfg.TTL)
+	defer cancel()
+
+	owner, err := om.claim(claimCtx, p.topic, p.partition, 0)
+	if err != nil {
+		// Someone else holds it, or the store is still unavailable. Either way
+		// there is nothing to announce, and the next pass retries.
+		if metrics.OwnershipClaimFailures != nil {
+			metrics.OwnershipClaimFailures.Inc()
+		}
+		return false
+	}
+
+	if om.cfg.OnReacquire != nil {
+		if err := om.cfg.OnReacquire(p.topic, p.partition); err != nil {
+			// Deliberately *not* released. The claim is already ours, and
+			// releasing it would hand a partition whose store is still unhealthy
+			// to another agent that would then hit the same store. This pass
+			// retries in TTL/3, and by then either the store has recovered and the
+			// position can be re-derived, or the claim has aged out on its own and
+			// a peer can take it. What must never happen is serving the partition
+			// with a position we cannot vouch for, which is what staying fenced
+			// guarantees.
+			log.Printf("Ownership: took %s/%d back at epoch %d but could not recover its position (%v); "+
+				"staying fenced and retrying, because serving a log we cannot vouch for is worse",
+				p.topic, p.partition, owner.Epoch, err)
+			return false
+		}
+	}
+
+	p.epoch.Store(owner.Epoch)
+	p.lastRenew.Store(time.Now().UnixNano())
+	p.lost.Store(false)
+	p.held.Store(true)
+
+	if metrics.PartitionsOwned != nil {
+		metrics.PartitionsOwned.Set(float64(om.count()))
+	}
+	log.Printf("Ownership: RECOVERED %s/%d at epoch %d after a transient loss; log position re-derived from object storage",
+		p.topic, p.partition, owner.Epoch)
+	return true
 }
 
 // Live reports whether this agent can currently prove it holds what it holds.

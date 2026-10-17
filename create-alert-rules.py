@@ -39,17 +39,32 @@ RULES = [
     ),
     dict(
         title="Kimistore: retention has stopped reclaiming",
-        expr="increase(kimistore_retention_segments_deleted_total[6h])",
+        # Gated on process uptime. Without this the rule is guaranteed to fire
+        # after every restart: the counter resets to zero, so
+        # increase(...[6h]) is 0 for six hours afterwards no matter how well
+        # retention is working. Only evaluate once the process has been up for
+        # longer than the lookback window.
+        #
+        # Note this cannot distinguish "retention is broken" from "there is
+        # nothing old enough to delete". With a 7d window and a consumer that
+        # keeps up, the second case is normal. The 6h window plus the uptime
+        # gate makes the rule quiet in steady state; the disk rule is what
+        # actually bounds the risk of retention not working.
+        expr=(
+            "(increase(kimistore_retention_segments_deleted_total[6h]) < bool 1) "
+            "and on() ((time() - process_start_time_seconds{job=\"kimistore\"}) > 21600)"
+        ),
         for_="30m",
         severity="warning",
         no_data="NoData",
-        cmp="lt",
-        threshold=1,
-        summary="Retention has deleted nothing for 6 hours, so disk is growing unbounded",
+        cmp="gt",
+        threshold=0,
+        summary="Retention has deleted nothing for 6 hours of uptime, so disk is growing unbounded",
         description=(
             "Retention is the only thing bounding disk, and it is currently the only "
-            "policy (7d age, KIMISTORE_RETENTION_BYTES=-1). If it stops reclaiming, "
-            "nothing else will. Expect pressure on /home within a day or so."
+            "policy (7d age, KIMISTORE_RETENTION_BYTES=-1). Evaluated only after the "
+            "agent has been up longer than the 6h lookback, so a restart does not "
+            "trigger it."
         ),
     ),
     dict(
@@ -140,6 +155,39 @@ RULES = [
             "only. At ~9 GB/day a 7d window projects to ~63 GB against 917 GB total."
         ),
     ),
+    dict(
+        title="Kimistore: partitions owned dropped to zero",
+        expr="kimistore_partitions_owned",
+        for_="5m",
+        severity="critical",
+        no_data="Alerting",
+        cmp="lt",
+        threshold=1,
+        summary="The agent is alive but owns no partitions, so it is refusing every write",
+        description=(
+            "The rule whose absence cost 9h43m on 2026-10-17. A single failed "
+            "ownership renewal -- one transient RustFS error -- fenced the partition "
+            "permanently. The agent stayed live, so agent_live stayed 1, and no "
+            "durable timeouts accrued either, because produces were refused at the "
+            "fence before they ever reached the durable wait. Nothing was visible "
+            "anywhere until someone noticed ingest had stopped. "
+            "Recovery is a restart, which re-seeds the position and re-claims."
+        ),
+    ),
+    dict(
+        title="Kimistore: ownership renewal failed",
+        expr="increase(kimistore_ownership_renewal_failures_total[10m])",
+        for_="0m",
+        severity="warning",
+        no_data="NoData",
+        summary="A partition claim renewal failed -- early warning for an object-store blip",
+        description=(
+            "Fires at the moment of the blip rather than minutes later, which is what "
+            "makes it useful: it is the earliest signal that a claim is at risk. A "
+            "renewal failure does not always mean the claim is lost, so this warns "
+            "rather than pages; if partitions_owned then goes to zero, that rule pages."
+        ),
+    ),
 ]
 
 
@@ -212,38 +260,47 @@ def main():
     user, pw = alertmanager_config(), password()
 
     # Replace any previous run so re-running is idempotent.
-    existing = subprocess.run(
+    listing = subprocess.run(
         ["curl", "-sk", "-u", f"{user}:{pw}", f"{GF}/api/v1/provisioning/alert-rules"],
         capture_output=True, text=True).stdout
     try:
-        for r in json.loads(existing):
-            if r.get("folderUID") == FOLDER:
-                subprocess.run(
-                    ["curl", "-sk", "-u", f"{user}:{pw}", "-X", "DELETE",
-                     f"{GF}/api/v1/provisioning/alert-rules/{r['uid']}"],
-                    capture_output=True)
-                print(f"  removed previous: {r['title']}")
-    except Exception:
-        pass
+        existing = [r for r in json.loads(listing) if r.get("folderUID") == FOLDER]
+    except Exception as e:
+        print(f"  could not list existing rules ({e}); refusing to create duplicates")
+        sys.exit(1)
+    print(f"  removing {len(existing)} existing rule(s) in the {FOLDER} folder")
+    for r in existing:
+        subprocess.run(
+            ["curl", "-sk", "-u", f"{user}:{pw}", "-X", "DELETE",
+             f"{GF}/api/v1/provisioning/alert-rules/{r['uid']}"],
+            capture_output=True)
 
     ok = 0
     for rule in RULES:
         body = build(rule)
+        # The response body is multi-line JSON, so the status code cannot be
+        # recovered by splitting stdout -- an earlier version did that and
+        # reported 0/8 created while the API had returned 202 eight times.
+        # Write the body to a file and take the code from -w alone.
         res = subprocess.run(
             ["curl", "-sk", "-u", f"{user}:{pw}", "-X", "POST",
              "-H", "Content-Type: application/json",
              "--data", json.dumps(body),
-             "-w", "\n%{http_code}",
+             "-o", "/tmp/rule-resp.json",
+             "-w", "%{http_code}",
              f"{GF}/api/v1/provisioning/alert-rules"],
-            capture_output=True, text=True).stdout
-        lines = res.strip().split("\n")
-        code = lines[-1]
-        if code == "202":
+            capture_output=True, text=True).stdout.strip()
+        if res in ("200", "201", "202"):
             print(f"  created  {rule['title']:<48} (for={rule['for_']}, {rule['severity']})")
             ok += 1
         else:
-            print(f"  FAILED   {rule['title']}")
-            print(f"           {lines[0][:200]}")
+            body_txt = ""
+            try:
+                body_txt = open("/tmp/rule-resp.json").read()[:200]
+            except OSError:
+                pass
+            print(f"  FAILED   {rule['title']}  (HTTP {res})")
+            print(f"           {body_txt}")
     print(f"\n  {ok}/{len(RULES)} rules created")
 
 

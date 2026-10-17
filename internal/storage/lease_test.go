@@ -42,8 +42,13 @@ type casStore struct {
 	version map[string]int64
 	putKeys map[string]int // key -> how many times it has been written
 	failPut error
-	listErr error
-	blocks  chan struct{} // when non-nil, every Put waits on it
+	// failPutVersion fails the conditional write only. Ownership claims go
+	// through PutVersion, not Put, so a blip test has to be able to break
+	// that path specifically -- failPut alone models an outage that skips the
+	// claims, which is not what happened on 2026-10-17.
+	failPutVersion error
+	listErr        error
+	blocks         chan struct{} // when non-nil, every Put waits on it
 }
 
 func newCASStore() *casStore {
@@ -143,6 +148,14 @@ func (s *casStore) GetVersion(ctx context.Context, key string) ([]byte, string, 
 
 func (s *casStore) PutVersion(ctx context.Context, key string, data []byte, version string) (string, error) {
 	s.mu.Lock()
+	// Read under the lock. A test that flips this while the ownership renewal
+	// loop is running would otherwise race -- the claim path calls PutVersion
+	// from its own goroutine.
+	if s.failPutVersion != nil {
+		err := s.failPutVersion
+		s.mu.Unlock()
+		return "", err
+	}
 	defer s.mu.Unlock()
 	current, exists := s.version[key]
 	switch {

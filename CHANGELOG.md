@@ -11,6 +11,46 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.27
+
+Recovers a partition that was fenced by a transient object-store error.
+
+### Fixed
+
+- A lost ownership claim is retried in-process, and the log position is
+  re-derived from object storage before the partition serves again
+
+  On 2026-10-17 at 03:09 RustFS returned connection-level failures
+  (`StatusCode: 0`) for about an hour. One ownership renewal failed, the claim
+  aged past its 60s TTL, and the partition was then **permanently** fenced
+  until a human noticed ingest had stopped and restarted the agent at 12:56.
+  Ingest was down for **9h43m**, during which Mimir returned 503 to Alloy and
+  the samples were dropped upstream.
+
+  The old behaviour was deliberate and is documented: re-acquiring a claim gives
+  this agent a newer epoch but not a current view of the log, so writing there
+  could reissue offsets a previous owner had already handed out. That reasoning
+  is sound. The consequence was not — one transient blip cost a restart.
+
+  So the renewal pass now retries a lost partition, and the position is
+  re-derived from object storage before it becomes servable. Object storage is
+  the system of record, which is the same argument startup recovery makes. The
+  ordering is claim-then-recover, because claiming is what makes the epoch
+  comparison meaningful.
+
+  A partition whose position cannot be recovered stays fenced. Holding a claim
+  whose log end nobody can vouch for is worse than holding none, because
+  `Metadata` advertises the partition as ours while our view of it is stale.
+
+  Note the claim is deliberately *not* released when recovery fails: the object
+  store that broke the recovery is the same one a peer would hit, and this pass
+  retries in TTL/3.
+
+### Added
+
+- `OwnershipConfig.OnReacquire`, called after a lost claim is taken again and
+  before the partition is served
+
 ## 1.0.26
 
 Closes three correctness bugs in consumer offset handling, all of which get
