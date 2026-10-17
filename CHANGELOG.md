@@ -11,6 +11,42 @@ carries the breaking changes and the patch number carries the fixes.
 
 Nothing yet.
 
+## 1.0.28
+
+Fixes a bug in 1.0.27 that made the recovery path unrunnable on a real bucket.
+
+### Fixed
+
+- Recovery enumerates segments under its own budget, not the per-operation bound
+
+  On 2026-10-17 at 13:39 the partition was lost again to a RustFS blip and
+  1.0.27's retry took the claim back -- every 60 seconds, epoch climbing from
+  41635 to 41649 -- and then failed the position check every time:
+
+  ```
+  Ownership: took mimir-distributor/0 back at epoch 41649 but could not recover
+  its position (listing segments of mimir-distributor: ... context deadline
+  exceeded); staying fenced and retrying
+  ```
+
+  Enumerating a partition's segments means listing the whole prefix, which has
+  to paginate. knode3's prefix holds over 12,000 objects and RustFS serves about
+  1,000 per four seconds, so the inventory needs roughly a minute. It was running
+  under `DefaultOperationTimeout` (30s), so it could never finish, and the
+  partition stayed fenced for as long as the bucket stayed large -- which is the
+  outage 1.0.27 was supposed to end.
+
+  Staying fenced when the position cannot be vouched for is correct. Running out
+  of budget and never obtaining one is not, so recovery listings now get their
+  own budget. The per-operation bound is unchanged for everything serving
+  traffic: it is what stops one slow request pinning a handler goroutine.
+
+  Startup recovery was never affected, because it treats a failed listing as one
+  recovery path among several and falls back to the partition manifest. The
+  re-acquire path had only one, which is why it could only ever fail closed.
+
+  The longer budget is still cancellable and still stops on shutdown.
+
 ## 1.0.27
 
 Recovers a partition that was fenced by a transient object-store error.

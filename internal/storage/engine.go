@@ -2833,7 +2833,9 @@ func (s *StorageEngine) discoverTopics(ctx context.Context) []string {
 // One LIST per topic, grouped in memory, keeps it to one LIST per topic plus a
 // small read per partition.
 func (s *StorageEngine) objectSegmentsByPartition(ctx context.Context, topic string) (map[int32][]*SegmentMetadata, error) {
-	objects, err := s.objList(ctx, topic+"/")
+	// The recovery budget, not the per-operation one: this enumerates the whole
+	// partition prefix and has to paginate all of it.
+	objects, err := s.objListRecovery(ctx, topic+"/")
 	if err != nil {
 		return nil, err
 	}

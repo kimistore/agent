@@ -116,6 +116,37 @@ func (s *StorageEngine) objList(ctx context.Context, prefix string) ([]ObjectMet
 	return s.objStore.List(c, prefix)
 }
 
+// recoveryListTimeout bounds a LIST issued by recovery.
+//
+// Recovery is the one caller whose work is proportional to the size of the
+// bucket rather than to a single request. objList's per-operation bound is right
+// for serving traffic -- it is what stops one slow request pinning a handler
+// goroutine -- but it is the wrong bound for enumerating every segment of a
+// partition, which has to paginate the whole prefix.
+//
+// On knode3 the prefix held over 12,000 objects and RustFS served about 1000 per
+// four seconds, so the inventory needs roughly a minute. Under the 30s
+// operation bound it could never finish, which is why the v1.0.27 recovery path
+// re-took the claim every renewal and then failed the position check every time:
+// the partition stayed fenced for as long as the bucket stayed large, which is
+// the same outage v1.0.27 was meant to end.
+const recoveryListTimeout = 5 * time.Minute
+
+// objListRecovery is objList under the recovery budget rather than the
+// per-operation one.
+func (s *StorageEngine) objListRecovery(ctx context.Context, prefix string) ([]ObjectMetadata, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c, cancel := context.WithTimeout(ctx, recoveryListTimeout)
+	defer cancel()
+	if s.closedCtx != nil {
+		stop := context.AfterFunc(s.closedCtx, cancel)
+		defer stop()
+	}
+	return s.objStore.List(c, prefix)
+}
+
 // objDelete removes one object under the engine's operation bound.
 func (s *StorageEngine) objDelete(ctx context.Context, key string) error {
 	c, cancel := s.objCtx(ctx)
